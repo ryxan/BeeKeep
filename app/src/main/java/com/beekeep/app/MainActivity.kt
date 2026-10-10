@@ -2602,7 +2602,7 @@ private fun HiveDetailScreen(
                     }
                 }
                 if (showRecentActivity) {
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f))
+                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f))
                     if (events.isEmpty() && inspections.isEmpty()) {
                         Text("No events yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                     } else {

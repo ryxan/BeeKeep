@@ -84,7 +84,7 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -2554,7 +2554,7 @@ private fun HiveDetailScreen(
                     harvests.firstOrNull()?.let { add("Last harvest  ·  ${it.dryHoneyWeight} ${it.weightUnit}") }
                 }
                 if (lastRecordLines.isNotEmpty()) {
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f))
+                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f))
                     lastRecordLines.forEach { line ->
                         Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }

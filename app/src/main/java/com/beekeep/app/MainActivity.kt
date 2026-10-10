@@ -864,7 +864,54 @@ fun BeeKeepApp(
         }
     ) { padding ->
         when (screen) {
-            Screen.HOME -> HomeScreen(hives, apiaries, padding, onScan = { screen = Screen.SCAN })
+            Screen.HOME -> HomeScreen(
+                hives = hives,
+                apiaries = apiaries,
+                padding = padding,
+                scanning = scanning,
+                onCancelScan = { nfc.stop(activity); scanning = false },
+                onScan = {
+                    if (scanning) {
+                        // A second tap cancels the in-place scan.
+                        nfc.stop(activity)
+                        scanning = false
+                    } else {
+                        scanning = true
+                        nfc.startReadAndPrepareForBeeKeep(activity) { result ->
+                            scanning = false
+                            when (result) {
+                                is NfcResult.Read -> {
+                                    result.launchPreparationError?.let { message ->
+                                        scope.launch { snackbarHostState.showSnackbar(message) }
+                                    }
+                                    scope.launch {
+                                        val payloadId = BeeKeepNfcPayload.hiveId(result.text)
+                                        val assignedHive = vm.findHiveByTag(result.uid)
+                                        val payloadHive = payloadId?.let { id -> hives.firstOrNull { it.id == id } }
+                                        val resolvedHive = assignedHive ?: payloadHive
+                                        if (resolvedHive != null) {
+                                            checkHiveLocation(resolvedHive)
+                                            onSpeakHiveNumber(resolvedHive.number)
+                                            vm.openHive(resolvedHive.id)
+                                            selectedHiveOpen = true
+                                            screen = Screen.HOME
+                                            pendingAutoStartVoiceHiveId = resolvedHive.id
+                                            pendingInspectionHiveId = resolvedHive.id
+                                            snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
+                                        } else {
+                                            unassignedTagUid = result.uid
+                                        }
+                                    }
+                                }
+                                is NfcResult.Error -> scope.launch { snackbarHostState.showSnackbar(result.message) }
+                                is NfcResult.Written -> Unit
+                            }
+                        }
+                        // startRead can immediately return an error if NFC is off/unavailable.
+                        scanning = nfc.isScanning()
+                    }
+                }
+            )
             Screen.APIARIES -> ApiariesScreen(
                 apiaries, hives, padding,
                 onAddApiary = { addApiary = true },
@@ -1061,34 +1108,62 @@ private fun HoneycombPattern(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun HoneycombScanButton(onClick: () -> Unit) {
+private fun HoneycombScanButton(scanning: Boolean, onClick: () -> Unit) {
+    val pulse = rememberInfiniteTransition(label = "homeScanPulse")
+    val ringScale by pulse.animateFloat(
+        0.96f, 1.16f,
+        infiniteRepeatable(tween(1100)),
+        label = "homeScanRingScale"
+    )
+    val ringAlpha by pulse.animateFloat(
+        0.58f, 0f,
+        infiniteRepeatable(tween(1100)),
+        label = "homeScanRingAlpha"
+    )
+
     Box(
-        modifier = Modifier
-            .width(208.dp)
-            .height(180.dp)
-            .shadow(8.dp, HoneycombButtonShape)
-            .clip(HoneycombButtonShape)
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(BeeKeepAccent, Color(0xFFD97706))
-                )
-            )
-            .clickable(onClick = onClick),
+        modifier = Modifier.width(208.dp).height(180.dp),
         contentAlignment = Alignment.Center
     ) {
-        HoneycombPattern(Modifier.fillMaxSize())
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            HoneybeeGlyph(Modifier.size(43.dp))
-            Spacer(Modifier.width(14.dp))
-            Text(
-                "SCAN",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.ExtraBold,
-                color = Color(0xFF2A2421)
+        if (scanning) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = ringScale
+                        scaleY = ringScale
+                        alpha = ringAlpha
+                    }
+                    .border(3.dp, BeeKeepAccent, HoneycombButtonShape)
             )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .shadow(8.dp, HoneycombButtonShape)
+                .clip(HoneycombButtonShape)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(BeeKeepAccent, Color(0xFFD97706))
+                    )
+                )
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            HoneycombPattern(Modifier.fillMaxSize())
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                HoneybeeGlyph(Modifier.size(43.dp))
+                Spacer(Modifier.width(14.dp))
+                Text(
+                    if (scanning) "SCANNING…" else "SCAN",
+                    style = if (scanning) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color(0xFF2A2421)
+                )
+            }
         }
     }
 }
@@ -1098,9 +1173,24 @@ private fun HomeScreen(
     hives: List<Hive>,
     apiaries: List<Apiary>,
     padding: androidx.compose.foundation.layout.PaddingValues,
-    onScan: () -> Unit
+    scanning: Boolean,
+    onScan: () -> Unit,
+    onCancelScan: () -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val scanningNow by rememberUpdatedState(scanning)
+    val cancelScanNow by rememberUpdatedState(onCancelScan)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE && scanningNow) cancelScanNow()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (scanningNow) cancelScanNow()
+        }
+    }
     val bannerBitmap = remember(context) {
         runCatching {
             context.assets.open("beekeep_home_banner.webp").use { input ->
@@ -1252,7 +1342,7 @@ private fun HomeScreen(
                 Modifier.fillMaxWidth().padding(top = 48.dp, bottom = 30.dp),
                 horizontalArrangement = Arrangement.Center
             ) {
-                HoneycombScanButton(onClick = onScan)
+                HoneycombScanButton(scanning = scanning, onClick = onScan)
             }
         }
     }

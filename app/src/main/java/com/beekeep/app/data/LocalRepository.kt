@@ -14,8 +14,9 @@ class LocalHiveRepository(context: Context) {
     private val db = BeeKeepRoomDb.get(appContext)
 
     suspend fun initialize() {
+        // Keep real records imported from older BeeKeep versions. Never inject
+        // demo hives into an empty production database; an empty apiary is valid.
         LegacyImporter.importIfNeeded(appContext, db)
-        seedIfEmpty()
     }
 
     fun observeHives(): Flow<List<Hive>> = db.hives().observeAll().map { it.map(::toHive) }
@@ -40,23 +41,6 @@ class LocalHiveRepository(context: Context) {
     }
     suspend fun findHiveByNumberAndApiary(number: String, apiary: String): Hive? = withContext(Dispatchers.IO) {
         db.hives().byNumberAndApiary(number.trim(), apiary.trim()).let { it?.let(::toHive) }
-    }
-
-    private suspend fun seedIfEmpty() = withContext(Dispatchers.IO) {
-        db.withTransaction {
-            if (db.hives().countAll() == 0) {
-                val now = System.currentTimeMillis()
-                val home = ApiaryEntity(100L, "Home Yard", notes = "Main apiary", forageNotes = "Willow + clover", waterNotes = "Stock tank")
-                val out = ApiaryEntity(101L, "Out Yard A", forageNotes = "Canola", waterNotes = "Natural slough")
-                db.apiaries().upsert(home); db.apiaries().upsert(out)
-                db.hives().upsert(HiveEntity(1, "01", "Home Yard", 100, "Laying", queenMarkColor = "White", queenOrigin = "Graft", queenAgeMonths = 18, queenTemperament = 2, strength = 8, mitePercent = .8, tagUid = "BEEKEEP-HIVE-01", statusChangedAt = now))
-                db.hives().upsert(HiveEntity(2, "02", "Home Yard", 100, "Spotted", queenMarkColor = "Yellow", queenOrigin = "Package", queenAgeMonths = 9, queenTemperament = 3, strength = 7, mitePercent = 1.2, tagUid = "BEEKEEP-HIVE-02", statusChangedAt = now))
-                db.hives().upsert(HiveEntity(3, "03", "Out Yard A", 101, "Laying", queenMarkColor = "Red", queenOrigin = "Swarm", queenAgeMonths = 24, queenTemperament = 4, strength = 6, mitePercent = 2.3, tagUid = "BEEKEEP-HIVE-03", statusChangedAt = now))
-                db.nfcTagAssignments().upsert(NfcTagAssignmentEntity(1, "BEEKEEP-HIVE-01", 1, now))
-                db.nfcTagAssignments().upsert(NfcTagAssignmentEntity(2, "BEEKEEP-HIVE-02", 2, now))
-                db.nfcTagAssignments().upsert(NfcTagAssignmentEntity(3, "BEEKEEP-HIVE-03", 3, now))
-            }
-        }
     }
 
     suspend fun saveHive(h: Hive) = withContext(Dispatchers.IO) {

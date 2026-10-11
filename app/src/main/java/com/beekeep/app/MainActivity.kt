@@ -2774,7 +2774,7 @@ private fun InspectionSnapshot(i: Inspection) {
 }
 
 @Composable
-private fun HoneycombPattern(modifier: Modifier = Modifier) {
+private fun InspectionHoneycombBackground(modifier: Modifier = Modifier) {
     val patternColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.06f)
     Canvas(modifier) {
         val radius = 18.dp.toPx()
@@ -3256,7 +3256,7 @@ private fun InspectionScreen(
         Box(
             Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
         ) {
-            HoneycombPattern(Modifier.matchParentSize())
+            InspectionHoneycombBackground(Modifier.matchParentSize())
             LazyColumn(
                 Modifier.fillMaxSize().padding(padding),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),

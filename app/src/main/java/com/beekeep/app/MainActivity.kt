@@ -2392,17 +2392,10 @@ private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit)
                 horizontalAlignment = Alignment.End,
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                Text("STRENGTH", color = Color(0xFFD97706), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                Text(
-                    "${strengthGrade}/5",
-                    fontWeight = FontWeight.ExtraBold,
-                    style = MaterialTheme.typography.titleLarge,
-                    color = if (attention) Color(0xFFB91C1C) else Color(0xFFD97706)
-                )
                 Text(
                     ColonyStrength.labelForGrade(strengthGrade),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
                     color = if (attention) Color(0xFFB91C1C) else Color(0xFFD97706),
                     maxLines = 1
                 )
@@ -2627,7 +2620,17 @@ private fun HiveDetailScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    CompactStatItem("Strength • ${ColonyStrength.labelFromStored(hive.strength)}", "${ColonyStrength.gradeFromStored(hive.strength)}/5", Modifier.weight(1f))
+                    Column(
+                        Modifier.weight(1f),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            ColonyStrength.labelFromStored(hive.strength),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
                     CompactStatItem("Mites", "${String.format(Locale.US, "%.2f", hive.mitePercent)}%", Modifier.weight(1f))
                     CompactStatItem("Inspections", inspections.size.toString(), Modifier.weight(1f))
                 }
@@ -2925,7 +2928,7 @@ private fun addDateToNewInspectionNoteLines(previousNotes: String, updatedNotes:
 private fun InspectionSnapshot(i: Inspection) {
     Card(shape = RoundedCornerShape(16.dp)) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("${ColonyStrength.gradeFromStored(i.strength)}/5 ${ColonyStrength.labelFromStored(i.strength)} strength • ${i.queenStatus}")
+            Text("${ColonyStrength.labelFromStored(i.strength)} • Queen ${i.queenStatus}")
             Text("Mites ${i.miteCount}/${i.sampleSize} = ${String.format(Locale.US, "%.2f", i.mitePercent)}%")
             Text("Brood: eggs ${i.eggs}, open ${i.openBrood}, capped ${i.cappedBrood}")
             Text("Stores: honey ${i.honeyStores}, pollen ${i.pollen}")
@@ -3690,11 +3693,10 @@ private fun ComparisonCounter(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 previous?.let {
-                    val delta = value - it
                     Text(
-                        "Prev $it • ${if (delta >= 0) "+$delta" else delta}",
+                        "Prev: ${ColonyStrength.labelForGrade(it)}",
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (delta < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -3711,10 +3713,13 @@ private fun ComparisonCounter(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(0.dp)
                 ) {
-                    Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    valueLabel?.let {
-                        Text(it, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-                    }
+                    Text(
+                        valueLabel ?: value.toString(),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
                 }
                 IconButton(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
@@ -3791,10 +3796,13 @@ private fun Counter(
                 Text("−", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(value.toString(), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                valueLabel?.let {
-                    Text(it, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-                }
+                Text(
+                    valueLabel ?: value.toString(),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
             }
             IconButton({ onChange((value + 1).coerceIn(range)) }) {
                 Text("+", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)

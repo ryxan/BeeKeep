@@ -684,6 +684,15 @@ fun BeeKeepApp(
                 vm.updateHiveLocation(hiveId, latitude, longitude, onResult)
             },
             onBack = { pendingAutoStartVoiceHiveId = null; inspecting = false },
+            onHome = {
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
+                selectedHiveOpen = false
+                selectedApiaryName = null
+                screen = Screen.HOME
+                vm.clearHive()
+            },
             onSave = { inspection ->
                 val saved = vm.saveInspection(inspection)
                 if (saved) {
@@ -751,6 +760,15 @@ fun BeeKeepApp(
             nfc = nfc,
             activity = activity,
             onBack = { selectedHiveOpen = false; vm.clearHive() },
+            onHome = {
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
+                selectedHiveOpen = false
+                selectedApiaryName = null
+                screen = Screen.HOME
+                vm.clearHive()
+            },
             onInspect = { pendingAutoStartVoiceHiveId = null; inspecting = true },
             onFeed = { logType = HiveLogType.FEED },
             onTreat = { logType = HiveLogType.TREAT },
@@ -2421,6 +2439,7 @@ private fun HiveDetailScreen(
     nfc: NfcController,
     activity: ComponentActivity,
     onBack: () -> Unit,
+    onHome: () -> Unit,
     onInspect: () -> Unit,
     onFeed: () -> Unit,
     onTreat: () -> Unit,
@@ -2470,7 +2489,12 @@ private fun HiveDetailScreen(
                 Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
                 Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
-            HiveStatusPill(hive)
+            if (hive.isDead || hive.queenStatus == "Queenless" || hive.mitePercent >= 3.0) {
+                HiveStatusPill(hive)
+            }
+            IconButton(onClick = onHome) {
+                Icon(Icons.Rounded.Home, contentDescription = "Home")
+            }
         }
 
         if (hive.isDead) {
@@ -2775,8 +2799,9 @@ private fun HiveStatusPill(hive: Hive) {
         return
     }
     val flagged = hive.queenStatus == "Queenless" || hive.mitePercent >= 3.0
-    Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = if (flagged) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer)) {
-        Text(if (flagged) "CHECK" else "OK", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), fontWeight = FontWeight.ExtraBold, color = if (flagged) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer)
+    if (!flagged) return
+    Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+        Text("CHECK", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onErrorContainer)
     }
 }
 
@@ -2930,6 +2955,7 @@ private fun InspectionScreen(
     onVoiceAutoStartConsumed: () -> Unit,
     onSaveHiveLocation: (Long, Double, Double, (String?) -> Unit) -> Unit,
     onBack: () -> Unit,
+    onHome: () -> Unit,
     onSave: suspend (Inspection) -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
@@ -3364,6 +3390,9 @@ private fun InspectionScreen(
                     Column(Modifier.weight(1f)) {
                         Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
                         Text("FIELD INSPECTION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                    }
+                    IconButton(onClick = onHome) {
+                        Icon(Icons.Rounded.Home, contentDescription = "Home")
                     }
                 }
             }

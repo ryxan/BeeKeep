@@ -15,6 +15,7 @@ import androidx.core.content.IntentCompat
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 data class NfcTagInfo(
     val uid: String,
@@ -47,6 +48,8 @@ class NfcController {
     @Volatile private var attachedActivity: Activity? = null
     private val active = AtomicBoolean(false)
     private val passiveReadInFlight = AtomicBoolean(false)
+    // Invalidates passive reads that were already in flight when a manual scan starts.
+    private val passiveReadGeneration = AtomicLong(0L)
     private val passiveLock = Any()
     @Volatile private var activityResumed = false
     @Volatile private var passiveReaderActive = false
@@ -174,7 +177,12 @@ class NfcController {
             return
         }
         // Explicit read/write operations temporarily take ownership from the
-        // passive reader so the one-shot callback cannot compete with it.
+        // passive reader. Invalidate callbacks already in flight so an older passive
+        // read cannot navigate to a second screen after this manual scan succeeds.
+        synchronized(passiveLock) {
+            passiveReadGeneration.incrementAndGet()
+            passiveReadInFlight.set(false)
+        }
         runCatching { nfc.disableReaderMode(activity) }
         passiveReaderActive = false
         val flags = readerFlags()
@@ -231,6 +239,7 @@ class NfcController {
 
         try {
             nfc.enableReaderMode(activity, { tag ->
+                val readGeneration = passiveReadGeneration.get()
                 if (!activityResumed || active.get() ||
                     !passiveReadInFlight.compareAndSet(false, true)) {
                     return@enableReaderMode
@@ -242,21 +251,29 @@ class NfcController {
                     }.getOrNull()
                     if (result is NfcResult.Read) {
                         val shouldDeliver = synchronized(passiveLock) {
-                            val now = System.currentTimeMillis()
-                            if (lastHandledUid == result.uid && now - lastHandledAt < PASSIVE_REPEAT_DELAY_MS) {
-                                // Refresh while the same tag is still present. This prevents a
-                                // held tag from repeatedly reopening the same hive.
-                                lastHandledAt = now
+                            // A manual scan may have started while this passive read was
+                            // connecting to the tag. Discard it rather than dispatching a
+                            // stale second navigation after the manual result is handled.
+                            if (readGeneration != passiveReadGeneration.get()) {
                                 false
                             } else {
-                                lastHandledUid = result.uid
-                                lastHandledAt = now
-                                true
+                                val now = System.currentTimeMillis()
+                                if (lastHandledUid == result.uid && now - lastHandledAt < PASSIVE_REPEAT_DELAY_MS) {
+                                    // Refresh while the same tag is still present. This prevents a
+                                    // held tag from repeatedly reopening the same hive.
+                                    lastHandledAt = now
+                                    false
+                                } else {
+                                    lastHandledUid = result.uid
+                                    lastHandledAt = now
+                                    true
+                                }
                             }
                         }
                         if (shouldDeliver) {
                             activity.runOnUiThread {
-                                if (activityResumed && !active.get() &&
+                                if (readGeneration == passiveReadGeneration.get() &&
+                                    activityResumed && !active.get() &&
                                     !activity.isFinishing && !activity.isDestroyed) {
                                     passiveReadListener?.invoke(result)
                                 }
@@ -264,7 +281,11 @@ class NfcController {
                         }
                     }
                 } finally {
-                    passiveReadInFlight.set(false)
+                    synchronized(passiveLock) {
+                        if (readGeneration == passiveReadGeneration.get()) {
+                            passiveReadInFlight.set(false)
+                        }
+                    }
                 }
             }, readerFlags(), Bundle())
             passiveReaderActive = true

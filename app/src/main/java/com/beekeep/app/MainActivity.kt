@@ -1370,6 +1370,8 @@ private fun ApiariesScreen(
     var query by rememberSaveable { mutableStateOf("") }
     val filtered = apiaries.filter { it.name.contains(query, ignoreCase = true) }
 
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -1382,10 +1384,19 @@ private fun ApiariesScreen(
             value = query,
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Search apiaries") },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
+            label = { Text("Search apiaries", color = Color(0xFF78350F)) },
+            leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Color(0xFF78350F)) },
             singleLine = true,
-            shape = RoundedCornerShape(16.dp)
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surface,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                focusedBorderColor = Color(0xFFD97706),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                cursorColor = Color(0xFFD97706)
+            )
         )
         Spacer(Modifier.height(10.dp))
         if (filtered.isEmpty()) {
@@ -1401,11 +1412,17 @@ private fun ApiariesScreen(
             LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(filtered, key = { it.id }) { apiary ->
                     val count = hives.count { it.apiary.equals(apiary.name, ignoreCase = true) }
-                    Card(onClick = { onOpenApiary(apiary.name) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
+                    Card(
+                        onClick = { onOpenApiary(apiary.name) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(24.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                    ) {
                         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(52.dp)) {
+                            Surface(shape = RoundedCornerShape(16.dp), color = Color(0xFFFFE8C2), modifier = Modifier.size(52.dp)) {
                                 Box(contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Rounded.Yard, "Apiary", tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                                    Icon(Icons.Rounded.Yard, "Apiary", tint = Color(0xFF78350F))
                                 }
                             }
                             Spacer(Modifier.width(12.dp))
@@ -1430,8 +1447,8 @@ private fun ApiariesScreen(
             }
         }
     }
+    }
 }
-
 
 @Composable
 private fun ApiaryMapScreen(
@@ -2244,6 +2261,8 @@ private fun ApiaryHivesScreen(
     var query by rememberSaveable(apiaryName) { mutableStateOf("") }
     val filtered = hives.filter { it.number.contains(query, ignoreCase = true) }
 
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(padding).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBack, "Back to apiaries") }
@@ -2257,10 +2276,19 @@ private fun ApiaryHivesScreen(
             value = query,
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Search hive number") },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
+            label = { Text("Search hive number", color = Color(0xFF78350F)) },
+            leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Color(0xFF78350F)) },
             singleLine = true,
-            shape = RoundedCornerShape(16.dp)
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surface,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                focusedBorderColor = Color(0xFFD97706),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                cursorColor = Color(0xFFD97706)
+            )
         )
         Spacer(Modifier.height(10.dp))
         if (filtered.isEmpty()) {
@@ -2280,13 +2308,24 @@ private fun ApiaryHivesScreen(
             }
         }
     }
+    }
 }
 
 @Composable
 private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit) {
     // The Apiaries hive list now highlights the colony's strength rather than mite percentage.
     val attention = hive.queenStatus == "Queenless" || hive.strength <= 3
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), border = if (attention) androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = .35f)) else null) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        border = BorderStroke(
+            1.dp,
+            if (attention) MaterialTheme.colorScheme.error.copy(alpha = 0.45f)
+            else MaterialTheme.colorScheme.outline
+        ),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text("Hive ${hive.number}", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
@@ -2294,10 +2333,21 @@ private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit)
                 Text("Queen ${hive.queenStatus}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 supporting?.let { Text(it, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
             }
-            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("STRENGTH", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                Text("${hive.strength}/10", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleLarge, color = if (hive.strength <= 3 || hive.queenStatus == "Queenless") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-                Icon(Icons.Rounded.ChevronRight, "Open hive", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Column(
+                Modifier.clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFFFFF1D6))
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text("STRENGTH", color = Color(0xFFD97706), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                Text(
+                    "${hive.strength}/10",
+                    fontWeight = FontWeight.ExtraBold,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = if (hive.strength <= 3 || hive.queenStatus == "Queenless") Color(0xFFB91C1C) else Color(0xFFD97706)
+                )
+                Icon(Icons.Rounded.ChevronRight, "Open hive", tint = Color(0xFF78350F))
             }
         }
     }
@@ -2408,6 +2458,8 @@ private fun HiveDetailScreen(
         )
     }
 
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -2437,8 +2489,20 @@ private fun HiveDetailScreen(
         if (!hive.isDead) {
             Button(
                 onClick = onInspect,
-                modifier = Modifier.fillMaxWidth().height(68.dp),
+                modifier = Modifier.fillMaxWidth().height(68.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(Color(0xFFD97706), Color(0xFFF59E0B))
+                        )
+                    ),
                 shape = RoundedCornerShape(20.dp),
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = Color.White,
+                    disabledContainerColor = Color.Transparent,
+                    disabledContentColor = Color.White.copy(alpha = 0.72f)
+                ),
                 contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
             ) {
                 Icon(Icons.Rounded.TaskAlt, null, modifier = Modifier.size(25.dp))
@@ -2456,25 +2520,44 @@ private fun HiveDetailScreen(
                 OutlinedButton(
                     onClick = onFeed,
                     modifier = Modifier.weight(1f).height(46.dp),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = CircleShape,
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFF78350F)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFB45309)),
                     contentPadding = PaddingValues(horizontal = 4.dp)
                 ) { Text("FEED", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
                 OutlinedButton(
                     onClick = onTreat,
                     modifier = Modifier.weight(1f).height(46.dp),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = CircleShape,
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFF78350F)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFB45309)),
                     contentPadding = PaddingValues(horizontal = 4.dp)
                 ) { Text("TREAT", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
                 OutlinedButton(
                     onClick = onHarvest,
                     modifier = Modifier.weight(1f).height(46.dp),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = CircleShape,
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFF78350F)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFB45309)),
                     contentPadding = PaddingValues(horizontal = 4.dp)
                 ) { Text("HARVEST", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+        ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     Modifier.fillMaxWidth(),
@@ -2501,7 +2584,8 @@ private fun HiveDetailScreen(
 
         Card(
             shape = RoundedCornerShape(18.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.34f))
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
         ) {
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2513,21 +2597,21 @@ private fun HiveDetailScreen(
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Column(
-                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surface.copy(alpha = 0.75f)).padding(horizontal = 9.dp, vertical = 9.dp),
+                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 9.dp, vertical = 9.dp),
                         verticalArrangement = Arrangement.spacedBy(1.dp)
                     ) {
                         Text(feedings.size.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
                         Text("FEEDINGS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                     }
                     Column(
-                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surface.copy(alpha = 0.75f)).padding(horizontal = 9.dp, vertical = 9.dp),
+                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 9.dp, vertical = 9.dp),
                         verticalArrangement = Arrangement.spacedBy(1.dp)
                     ) {
                         Text(treatments.size.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
                         Text("TREATMENTS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                     }
                     Column(
-                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surface.copy(alpha = 0.75f)).padding(horizontal = 9.dp, vertical = 9.dp),
+                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 9.dp, vertical = 9.dp),
                         verticalArrangement = Arrangement.spacedBy(1.dp)
                     ) {
                         Text(harvests.size.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
@@ -2550,18 +2634,46 @@ private fun HiveDetailScreen(
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (hive.isDead) {
                     OutlinedButton(onClick = onRestore, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("RESTORE COLONY", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
                 } else {
-                    OutlinedButton(onClick = { confirmDead = true }, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("MARK COLONY DEAD", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium) }
+                    OutlinedButton(
+                        onClick = { confirmDead = true },
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surface,
+                            contentColor = Color(0xFFB91C1C)
+                        ),
+                        border = BorderStroke(1.dp, Color(0xFFD9A7A0))
+                    ) { Text("MARK COLONY DEAD", fontWeight = FontWeight.Bold, color = Color(0xFFB91C1C), style = MaterialTheme.typography.labelMedium) }
                 }
-                TextButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth().height(36.dp)) { Text("DELETE HIVE PERMANENTLY", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
+                OutlinedButton(
+                    onClick = { confirmDelete = true },
+                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFFB91C1C)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFD9A7A0))
+                ) {
+                    Text("DELETE HIVE PERMANENTLY", color = Color(0xFFB91C1C), style = MaterialTheme.typography.labelSmall)
+                }
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     Modifier.fillMaxWidth().clickable { showRecentActivity = !showRecentActivity }.padding(vertical = 3.dp),
@@ -2599,7 +2711,11 @@ private fun HiveDetailScreen(
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("NFC hive tag", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
                 if (hive.isDead) {
@@ -2646,6 +2762,7 @@ private fun HiveDetailScreen(
         }
 
         Spacer(Modifier.height(6.dp))
+    }
     }
 }
 

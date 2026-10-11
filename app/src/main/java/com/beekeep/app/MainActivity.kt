@@ -675,7 +675,7 @@ fun BeeKeepApp(
     }
 
     if (addHive) {
-        AddHiveScreen(apiaries, selectedApiaryName, { addHive = false }) { number, apiary, queen, strength ->
+        AddHiveScreen(apiaries, selectedApiaryName, { addHive = false; pendingTagUid = null }) { number, apiary, queen, strength ->
             vm.createHive(number, apiary, queen, strength, tagUid = pendingTagUid) { success, error ->
                 scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${number.trim()} created") }
                 if (success) { addHive = false; pendingTagUid = null }
@@ -871,7 +871,7 @@ fun BeeKeepApp(
                                     snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
                                 } else {
                                     unassignedTagOrigin = Screen.HOME
-            unassignedTagUid = result.uid
+                                    unassignedTagUid = result.uid
                                 }
                             }
                         }
@@ -957,7 +957,7 @@ fun BeeKeepApp(
                                             snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
                                         } else {
                                             unassignedTagOrigin = Screen.HOME
-            unassignedTagUid = result.uid
+                                            unassignedTagUid = result.uid
                                         }
                                     }
                                 }

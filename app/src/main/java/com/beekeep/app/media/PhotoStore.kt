@@ -17,9 +17,10 @@ class PhotoStore(private val context: Context) {
     data class PendingPhoto(val file: File, val uri: android.net.Uri)
 
     fun createInspectionPhoto(hiveId: Long): PendingPhoto {
-        val dir = File(context.filesDir, "inspection_photos").apply { mkdirs() }
+        // Each hive gets its own app-private photo album folder.
+        val dir = File(context.filesDir, "hive_photo_albums/hive_${hiveId}").apply { mkdirs() }
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val file = File(dir, "hive_${hiveId}_${stamp}_${UUID.randomUUID().toString().take(8)}.jpg")
+        val file = File(dir, "photo_${stamp}_${UUID.randomUUID().toString().take(8)}.jpg")
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         return PendingPhoto(file, uri)
     }

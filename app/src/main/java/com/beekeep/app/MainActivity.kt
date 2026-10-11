@@ -146,6 +146,7 @@ import com.beekeep.app.data.Apiary
 import com.beekeep.app.data.Harvest
 import com.beekeep.app.data.Hive
 import com.beekeep.app.data.Inspection
+import com.beekeep.app.data.PhotoEntity
 import com.beekeep.app.data.LocalHiveRepository
 import com.beekeep.app.data.Treatment
 import com.beekeep.app.cloud.CloudResult
@@ -451,6 +452,7 @@ fun BeeKeepApp(
     val apiaries by vm.apiaries.collectAsStateWithLifecycle()
     val selected by vm.selected.collectAsStateWithLifecycle()
     val inspections by vm.inspections.collectAsStateWithLifecycle()
+    val photos by vm.photos.collectAsStateWithLifecycle()
     val events by vm.events.collectAsStateWithLifecycle()
     val feedings by vm.feedings.collectAsStateWithLifecycle()
     val treatments by vm.treatments.collectAsStateWithLifecycle()
@@ -694,7 +696,11 @@ fun BeeKeepApp(
                 vm.clearHive()
             },
             onSave = { inspection ->
-                val saved = vm.saveInspection(inspection)
+                val missingPhoto = inspection.photoPaths.firstOrNull { path ->
+                    val file = File(path)
+                    !file.isFile || file.length() <= 0L
+                }
+                val saved = missingPhoto == null && vm.saveInspection(inspection)
                 if (saved) {
                     // Keep the full note log (including an intentional empty value) available for the next Inspect session.
                     activity.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
@@ -705,7 +711,12 @@ fun BeeKeepApp(
                     inspecting = false
                     scope.launch { snackbarHostState.showSnackbar("Inspection saved") }
                 } else {
-                    scope.launch { snackbarHostState.showSnackbar("Could not save inspection. Your field screen is still open; try again.") }
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (missingPhoto != null) "A captured photo is missing. Retake it before saving the inspection."
+                            else "Could not save inspection. Your field screen is still open; try again."
+                        )
+                    }
                 }
             }
         )
@@ -753,6 +764,7 @@ fun BeeKeepApp(
         HiveDetailScreen(
             hive = hiveForDetail,
             inspections = inspections,
+            photos = photos,
             events = events,
             feedings = feedings,
             treatments = treatments,
@@ -2432,6 +2444,7 @@ private fun CompactStatItem(label: String, value: String, modifier: Modifier = M
 private fun HiveDetailScreen(
     hive: Hive,
     inspections: List<Inspection>,
+    photos: List<PhotoEntity>,
     events: List<ActivityEvent>,
     feedings: List<com.beekeep.app.data.Feeding>,
     treatments: List<Treatment>,
@@ -2455,8 +2468,10 @@ private fun HiveDetailScreen(
     var showRecentActivity by rememberSaveable(hive.id) { mutableStateOf(false) }
     var confirmDead by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
-    BackHandler { onBack() }
-    val photoInspections = inspections.filter { !it.photoPath.isNullOrBlank() }.take(6)
+    var selectedAlbumPhotoPath by rememberSaveable(hive.id) { mutableStateOf<String?>(null) }
+    BackHandler {
+        if (selectedAlbumPhotoPath != null) selectedAlbumPhotoPath = null else onBack()
+    }
 
     if (confirmDead) {
         AlertDialog(
@@ -2474,6 +2489,26 @@ private fun HiveDetailScreen(
             text = { Text("This removes the hive and all of its associated history. This cannot be undone. To preserve history, mark the colony dead instead.") },
             confirmButton = { TextButton(onClick = { confirmDelete = false; onDelete() }) { Text("DELETE PERMANENTLY", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.error) } },
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("CANCEL") } }
+        )
+    }
+    selectedAlbumPhotoPath?.let { path ->
+        AlertDialog(
+            onDismissRequest = { selectedAlbumPhotoPath = null },
+            title = { Text("Hive ${hive.number} photo") },
+            text = {
+                val bitmap = rememberPhotoBitmap(path, 1400)
+                if (bitmap != null) {
+                    Image(
+                        bitmap.asImageBitmap(),
+                        "Hive ${hive.number} photo",
+                        Modifier.fillMaxWidth().heightIn(max = 420.dp),
+                        contentScale = ContentScale.Fit
+                    )
+                } else {
+                    Text("This photo could not be opened.")
+                }
+            },
+            confirmButton = { TextButton(onClick = { selectedAlbumPhotoPath = null }) { Text("CLOSE") } }
         )
     }
 
@@ -2595,12 +2630,46 @@ private fun HiveDetailScreen(
             }
         }
 
-        if (photoInspections.isNotEmpty()) {
-            Text("Recent photos", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                photoInspections.forEach { inspection ->
-                    rememberPhotoBitmap(inspection.photoPath, 480)?.let { bitmap ->
-                        Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.size(90.dp).clip(RoundedCornerShape(16.dp)))
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("Photo album", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            "${photos.size} saved ${if (photos.size == 1) "photo" else "photos"} • stored for this hive",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Icon(Icons.Rounded.CameraAlt, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(25.dp))
+                }
+                if (photos.isEmpty()) {
+                    Text(
+                        "No photos yet. Take one or more photos during an inspection and save it to build this hive's album.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        photos.sortedByDescending { it.createdAt }.forEach { photo ->
+                            rememberPhotoBitmap(photo.localPath, 480)?.let { bitmap ->
+                                Image(
+                                    bitmap.asImageBitmap(),
+                                    "Open hive ${hive.number} photo",
+                                    Modifier.size(96.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .clickable { selectedAlbumPhotoPath = photo.localPath },
+                                    contentScale = ContentScale.Crop
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -3049,11 +3118,27 @@ private fun InspectionScreen(
     }
     var lat by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.latitude) }
     var lon by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.longitude) }
-    var photoPath by rememberSaveable(hive.id) {
-        val savedPath = photoDraftPrefs.getString(photoDraftKey, null)
-            ?.takeIf { File(it).isFile && File(it).length() > 0L }
-        if (savedPath == null) photoDraftPrefs.edit { remove(photoDraftKey) }
-        mutableStateOf(savedPath)
+    var photoPaths by rememberSaveable(hive.id) {
+        val stored = photoDraftPrefs.getString(photoDraftKey, null)
+        val candidates = when {
+            stored.isNullOrBlank() -> emptyList()
+            stored.trimStart().startsWith("[") -> runCatching {
+                val array = JSONArray(stored)
+                (0 until array.length()).mapNotNull { index ->
+                    array.optString(index).takeIf { it.isNotBlank() }
+                }
+            }.getOrDefault(emptyList())
+            else -> listOf(stored) // Migrate a previous build's single-photo draft.
+        }
+        val validPaths = candidates.filter { path ->
+            File(path).let { it.isFile && it.length() > 0L }
+        }.distinct()
+        if (validPaths.isEmpty()) {
+            photoDraftPrefs.edit { remove(photoDraftKey) }
+        } else {
+            photoDraftPrefs.edit { putString(photoDraftKey, JSONArray(validPaths).toString()) }
+        }
+        mutableStateOf(validPaths)
     }
     var cameraOpen by rememberSaveable { mutableStateOf(false) }
     var locationStatus by rememberSaveable(hive.id) { mutableStateOf("No GPS captured") }
@@ -3327,7 +3412,7 @@ private fun InspectionScreen(
             pendingPhotoPath = null
             cameraOpen = false
         } else {
-            pendingPhotoPath?.takeIf { it != photoPath }?.let { File(it).delete() }
+            pendingPhotoPath?.takeIf { it !in photoPaths }?.let { File(it).delete() }
             // Keep a captured photo with its unfinished inspection if the user leaves
             // and returns before saving the inspection.
             onBack()
@@ -3339,12 +3424,9 @@ private fun InspectionScreen(
         CameraCaptureView(
             outputFile = pendingFile,
             onCaptured = {
-                val previousPhoto = photoPath
-                photoPath = pendingFile.absolutePath
-                photoDraftPrefs.edit { putString(photoDraftKey, pendingFile.absolutePath) }
-                if (!previousPhoto.isNullOrBlank() && previousPhoto != pendingFile.absolutePath) {
-                    File(previousPhoto).delete()
-                }
+                // Keep every shot; taking another photo must never delete an earlier one.
+                photoPaths = (photoPaths + pendingFile.absolutePath).distinct()
+                photoDraftPrefs.edit { putString(photoDraftKey, JSONArray(photoPaths).toString()) }
                 photoCaptured = true
                 photoProcessing = true
                 cameraOpen = false
@@ -3469,9 +3551,10 @@ private fun InspectionScreen(
                                         val now = System.currentTimeMillis()
                                         val inspection = Inspection(
                                             IdGenerator.nextLong(), hive.id, now, strength, queen, mites,
-                                            sample.coerceAtLeast(1), notes.trim(), photoPath, lat, lon,
+                                            sample.coerceAtLeast(1), notes.trim(), photoPaths.firstOrNull(), lat, lon,
                                             emergency, supercedure, swarm, eggs, openBrood, cappedBrood,
-                                            honey, pollen, emptyComb, diseasesCsv
+                                            honey, pollen, emptyComb, diseasesCsv,
+                                            photoPaths = photoPaths
                                         )
                                         scope.launch {
                                             onSave(inspection)
@@ -3681,19 +3764,27 @@ private fun InspectionScreen(
 
 
             item {
-                photoPath?.let { path ->
+                if (photoPaths.isNotEmpty() || cameraStatus.isNotBlank()) {
                     Card(
-                        shape = RoundedCornerShape(24.dp),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        shape = RoundedCornerShape(16.dp),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
                     ) {
-                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("INSPECTION PHOTO", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSecondaryContainer)
-                            rememberPhotoBitmap(path, 1200)?.let { bitmap ->
-                                Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 280.dp).clip(RoundedCornerShape(16.dp)))
+                        Row(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(9.dp)
+                        ) {
+                            Icon(Icons.Rounded.CameraAlt, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                if (photoPaths.isNotEmpty()) {
+                                    Text(
+                                        "${photoPaths.size} ${if (photoPaths.size == 1) "photo" else "photos"} ready for this hive's album",
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                if (photoProcessing) Text("Preparing photo…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                if (cameraStatus.isNotBlank()) Text(cameraStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            if (photoProcessing) Text("Preparing photo…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            if (cameraStatus.isNotBlank()) Text(cameraStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }

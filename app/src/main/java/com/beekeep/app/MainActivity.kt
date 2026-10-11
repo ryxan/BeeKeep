@@ -177,6 +177,7 @@ import org.json.JSONObject
 private const val PREFS = "beekeep_prefs"
 private const val INSPECTION_NOTE_DRAFTS = "beekeep_inspection_note_drafts"
 private const val INSPECTION_FORM_DRAFTS = "beekeep_inspection_form_drafts"
+private const val INSPECTION_PHOTO_DRAFTS = "beekeep_inspection_photo_drafts"
 
 private data class InspectionFormDraft(
     val strength: Int,
@@ -193,7 +194,9 @@ private data class InspectionFormDraft(
     val supercedureCells: Int,
     val swarmCells: Int,
     val diseaseFlags: String,
-    val updatedAt: Long
+    val updatedAt: Long,
+    val latitude: Double? = null,
+    val longitude: Double? = null
 )
 
 private fun readInspectionFormDraft(
@@ -218,7 +221,9 @@ private fun readInspectionFormDraft(
             supercedureCells = json.optInt("supercedureCells", 0),
             swarmCells = json.optInt("swarmCells", 0),
             diseaseFlags = json.optString("diseaseFlags", ""),
-            updatedAt = json.optLong("updatedAt", 0L)
+            updatedAt = json.optLong("updatedAt", 0L),
+            latitude = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude") else null,
+            longitude = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null
         )
     }.getOrNull()
 }
@@ -244,6 +249,8 @@ private fun saveInspectionFormDraft(
         .put("swarmCells", draft.swarmCells.coerceAtLeast(0))
         .put("diseaseFlags", draft.diseaseFlags)
         .put("updatedAt", System.currentTimeMillis())
+        .put("latitude", draft.latitude ?: JSONObject.NULL)
+        .put("longitude", draft.longitude ?: JSONObject.NULL)
     prefs.edit { putString("hive_$hiveId", json.toString()) }
 }
 
@@ -683,6 +690,8 @@ fun BeeKeepApp(
                     // Keep the full note log (including an intentional empty value) available for the next Inspect session.
                     activity.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
                         .edit { putString("hive_${inspection.hiveId}", inspection.notes) }
+                    activity.getSharedPreferences(INSPECTION_PHOTO_DRAFTS, android.content.Context.MODE_PRIVATE)
+                        .edit { remove("hive_${inspection.hiveId}") }
                     pendingAutoStartVoiceHiveId = null
                     inspecting = false
                     scope.launch { snackbarHostState.showSnackbar("Inspection saved") }
@@ -2378,7 +2387,6 @@ private fun HiveDetailScreen(
     var confirmDead by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
     BackHandler { onBack() }
-    val recent = inspections.take(6).reversed()
     val photoInspections = inspections.filter { !it.photoPath.isNullOrBlank() }.take(6)
 
     if (confirmDead) {
@@ -2476,28 +2484,6 @@ private fun HiveDetailScreen(
                     CompactStatItem("Strength", "${hive.strength}/10", Modifier.weight(1f))
                     CompactStatItem("Mites", "${String.format(Locale.US, "%.2f", hive.mitePercent)}%", Modifier.weight(1f))
                     CompactStatItem("Inspections", inspections.size.toString(), Modifier.weight(1f))
-                }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Strength & mite trend", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                if (recent.isEmpty()) {
-                    Text("Complete a few inspections to see trends.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                } else {
-                    Row(Modifier.fillMaxWidth().height(80.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        recent.forEach { item ->
-                            val height = (16 + item.strength.coerceIn(0, 10) * 5).dp
-                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
-                                Text("${item.strength}", style = MaterialTheme.typography.labelSmall)
-                                Box(Modifier.width(20.dp).height(height).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp)))
-                                Text(DateFormat.getDateInstance(DateFormat.SHORT).format(Date(item.createdAt)), style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                    }
-                    val latestMite = recent.last().mitePercent
-                    Text("Latest mite rate ${String.format(Locale.US, "%.2f", latestMite)}%", style = MaterialTheme.typography.bodySmall, color = if (latestMite >= 3.0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -2809,7 +2795,11 @@ private fun InspectionScreen(
     val formDraftPrefs = remember(context) {
         context.getSharedPreferences(INSPECTION_FORM_DRAFTS, android.content.Context.MODE_PRIVATE)
     }
+    val photoDraftPrefs = remember(context) {
+        context.getSharedPreferences(INSPECTION_PHOTO_DRAFTS, android.content.Context.MODE_PRIVATE)
+    }
     val noteDraftKey = remember(hive.id) { "hive_${hive.id}" }
+    val photoDraftKey = remember(hive.id) { "hive_${hive.id}" }
     val noteDraftTimestampKey = remember(hive.id) { "${noteDraftKey}_recorded_at" }
     // The inspection list may briefly still contain the previous hive while NFC
     // switches the selected hive. Never let another hive's latest inspection seed this form.
@@ -2885,10 +2875,15 @@ private fun InspectionScreen(
     var diseasesCsv by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.diseaseFlags ?: lastInspection?.diseaseFlags.orEmpty())
     }
-    var photoPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var lat by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.latitude) }
+    var lon by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.longitude) }
+    var photoPath by rememberSaveable(hive.id) {
+        val savedPath = photoDraftPrefs.getString(photoDraftKey, null)
+            ?.takeIf { File(it).isFile && File(it).length() > 0L }
+        if (savedPath == null) photoDraftPrefs.edit { remove(photoDraftKey) }
+        mutableStateOf(savedPath)
+    }
     var cameraOpen by rememberSaveable { mutableStateOf(false) }
-    var lat by rememberSaveable(hive.id) { mutableStateOf<Double?>(null) }
-    var lon by rememberSaveable(hive.id) { mutableStateOf<Double?>(null) }
     var locationStatus by rememberSaveable(hive.id) { mutableStateOf("No GPS captured") }
     var pendingGpsHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var voiceStatus by rememberSaveable { mutableStateOf("") }
@@ -2915,7 +2910,9 @@ private fun InspectionScreen(
         supercedureCells = supercedure,
         swarmCells = swarm,
         diseaseFlags = diseasesCsv,
-        updatedAt = formStateKey
+        updatedAt = formStateKey,
+        latitude = lat,
+        longitude = lon
     )
     // Keep a separate latest-draft state per hive. A single rememberUpdatedState
     // here was shared while the screen stayed open during NFC cycling, allowing the
@@ -2927,7 +2924,7 @@ private fun InspectionScreen(
 
     androidx.compose.runtime.LaunchedEffect(
         hive.id, strength, queen, mites, sample, eggs, openBrood, cappedBrood,
-        honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv
+        honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv, lat, lon
     ) {
         saveInspectionFormDraft(formDraftPrefs, hive.id, currentFormDraft)
     }
@@ -3158,8 +3155,9 @@ private fun InspectionScreen(
             pendingPhotoPath = null
             cameraOpen = false
         } else {
-            photoPath?.let { File(it).delete() }
-            pendingPhotoPath?.let { File(it).delete() }
+            pendingPhotoPath?.takeIf { it != photoPath }?.let { File(it).delete() }
+            // Keep a captured photo with its unfinished inspection if the user leaves
+            // and returns before saving the inspection.
             onBack()
         }
     }
@@ -3171,6 +3169,7 @@ private fun InspectionScreen(
             onCaptured = {
                 val previousPhoto = photoPath
                 photoPath = pendingFile.absolutePath
+                photoDraftPrefs.edit { putString(photoDraftKey, pendingFile.absolutePath) }
                 if (!previousPhoto.isNullOrBlank() && previousPhoto != pendingFile.absolutePath) {
                     File(previousPhoto).delete()
                 }
@@ -3207,8 +3206,9 @@ private fun InspectionScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            Surface(shadowElevation = 2.dp) {
+            Surface(color = MaterialTheme.colorScheme.primaryContainer, shadowElevation = 2.dp) {
                 Row(
                     Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 8.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -3217,7 +3217,7 @@ private fun InspectionScreen(
                     IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
                     Column(Modifier.weight(1f)) {
                         Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                        Text("FIELD INSPECTION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("FIELD INSPECTION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
                     }
                 }
             }
@@ -3230,7 +3230,10 @@ private fun InspectionScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
-                Card(shape = RoundedCornerShape(18.dp)) {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                ) {
                     Column(
                         Modifier.fillMaxWidth().padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -3330,14 +3333,26 @@ private fun InspectionScreen(
             }
 
             item {
-                Card(shape = RoundedCornerShape(24.dp)) {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                ) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("FIELD NOTES", fontWeight = FontWeight.ExtraBold)
+                        Text("FIELD NOTES", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.primary)
                         OutlinedTextField(
                             value = notes,
                             onValueChange = {
-                                notes = addDateToNewInspectionNoteLines(notes, it)
-                                noteSaveStatus = if (it.isBlank()) "" else "Saving note…"
+                                val updatedNotes = addDateToNewInspectionNoteLines(notes, it)
+                                notes = updatedNotes
+                                noteDraftPrefs.edit {
+                                    putString(noteDraftKey, updatedNotes)
+                                    if (updatedNotes.isBlank()) {
+                                        remove(noteDraftTimestampKey)
+                                    } else if (!noteDraftPrefs.contains(noteDraftTimestampKey)) {
+                                        putLong(noteDraftTimestampKey, System.currentTimeMillis())
+                                    }
+                                }
+                                noteSaveStatus = if (updatedNotes.isBlank()) "" else "Saving note…"
                             },
                             modifier = Modifier.fillMaxWidth().height(124.dp),
                             label = { Text("What did you see?") }
@@ -3451,9 +3466,12 @@ private fun InspectionScreen(
 
             item {
                 photoPath?.let { path ->
-                    Card(shape = RoundedCornerShape(24.dp)) {
+                    Card(
+                        shape = RoundedCornerShape(24.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.72f))
+                    ) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("PHOTO", fontWeight = FontWeight.ExtraBold)
+                            Text("INSPECTION PHOTO", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSecondaryContainer)
                             rememberPhotoBitmap(path, 1200)?.let { bitmap ->
                                 Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 280.dp).clip(RoundedCornerShape(16.dp)))
                             }

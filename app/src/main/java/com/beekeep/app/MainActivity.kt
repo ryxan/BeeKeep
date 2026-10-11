@@ -115,6 +115,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -3737,13 +3738,16 @@ private fun NumberField(
     mod: Modifier,
     onChange: (Int) -> Unit
 ) {
-    // Keep the in-progress text separately so the user can clear a field
-    // before entering 0 or a replacement value. The previous Int-only field
-    // immediately restored the old value whenever the text was temporarily blank.
+    // Preserve intermediate typing so the field can be cleared before entering
+    // zero or a replacement number. An empty value is treated as zero rather
+    // than leaving the previous number silently stored behind the blank field.
     var inputText by remember(label) { mutableStateOf(value.toString()) }
+    var isFocused by remember(label) { mutableStateOf(false) }
 
-    androidx.compose.runtime.LaunchedEffect(value) {
-        if (inputText.toIntOrNull() != value) {
+    androidx.compose.runtime.LaunchedEffect(value, isFocused) {
+        // Don't overwrite a blank editing buffer while the user is typing.
+        // Once focus leaves, show the actual normalized value again.
+        if (!isFocused && inputText.toIntOrNull() != value) {
             inputText = value.toString()
         }
     }
@@ -3753,9 +3757,9 @@ private fun NumberField(
         onValueChange = { entered ->
             val digits = entered.filter(Char::isDigit)
             inputText = digits
-            digits.toIntOrNull()?.let(onChange)
+            onChange(digits.toIntOrNull() ?: 0)
         },
-        modifier = mod,
+        modifier = mod.onFocusChanged { isFocused = it.isFocused },
         label = { Text(label) },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         singleLine = true

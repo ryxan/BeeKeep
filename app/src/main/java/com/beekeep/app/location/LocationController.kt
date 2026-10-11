@@ -37,13 +37,13 @@ class LocationController(context: Context) {
             client.lastLocation
                 .addOnSuccessListener { cached ->
                     val ageNanos = cached?.let { SystemClock.elapsedRealtimeNanos() - it.elapsedRealtimeNanos }
-                    val freshEnough = cached != null &&
-                        ageNanos != null &&
-                        ageNanos in 0..MAX_CACHED_AGE_NANOS &&
-                        isAccurateEnough(cached)
+                    val cachedResult = cached?.toValidatedResult()
 
-                    if (freshEnough && cached != null) {
-                        onResult(cached.toValidatedResult())
+                    if (ageNanos != null &&
+                        ageNanos in 0..MAX_CACHED_AGE_NANOS &&
+                        cachedResult != null
+                    ) {
+                        onResult(cachedResult)
                         return@addOnSuccessListener
                     }
 

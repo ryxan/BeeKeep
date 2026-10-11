@@ -32,8 +32,6 @@ interface HiveDao {
     suspend fun byTag(tag: String): HiveEntity?
     @Query("SELECT * FROM hives WHERE number = :number COLLATE NOCASE AND apiary = :apiary AND deleted = 0 AND status = 'ACTIVE' LIMIT 1")
     suspend fun byNumberAndApiary(number: String, apiary: String): HiveEntity?
-    @Query("SELECT COUNT(*) FROM hives")
-    suspend fun countAll(): Int
     @Query("SELECT EXISTS(SELECT 1 FROM hives WHERE id = :id)")
     suspend fun exists(id: Long): Boolean
     @Query("DELETE FROM hives WHERE id = :id")

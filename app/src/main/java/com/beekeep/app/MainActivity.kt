@@ -3760,7 +3760,7 @@ private fun NumberField(
     androidx.compose.runtime.LaunchedEffect(value, isFocused) {
         // Don't overwrite a blank editing buffer while the user is typing.
         // Once focus leaves, show the actual normalized value again.
-        if (!isFocused && inputText.toIntOrNull() != value) {
+        if (!isFocused && inputText != value.toString()) {
             inputText = value.toString()
         }
     }

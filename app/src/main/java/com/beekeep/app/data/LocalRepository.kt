@@ -8,7 +8,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
 
 class LocalHiveRepository(context: Context) {
     private val appContext = context.applicationContext
@@ -218,42 +217,21 @@ class LocalHiveRepository(context: Context) {
     }
 
     suspend fun saveInspection(i: Inspection) = withContext(Dispatchers.IO) {
-        val photoPaths = (i.photoPaths + listOfNotNull(i.photoPath))
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-            .distinct()
-        photoPaths.forEach { path ->
-            val photoFile = File(path)
-            require(photoFile.isFile && photoFile.length() > 0L) {
-                "A captured photo is missing or empty. Retake it before saving the inspection."
-            }
-        }
         db.withTransaction {
             val safeSample = i.sampleSize.coerceAtLeast(1)
             val safeMites = i.miteCount.coerceIn(0, safeSample)
             val entity = InspectionEntity(
                 id = i.id, hiveId = i.hiveId, createdAt = i.createdAt, strength = i.strength.coerceIn(0, 10),
                 queenStatus = i.queenStatus.trim().ifBlank { "Laying" }, miteCount = safeMites, sampleSize = safeSample,
-                notes = i.notes.trim(), photoPath = photoPaths.firstOrNull(), latitude = i.latitude, longitude = i.longitude,
+                notes = i.notes.trim(), photoPath = i.photoPath?.trim()?.takeIf { it.isNotBlank() }, latitude = i.latitude, longitude = i.longitude,
                 emergencyCells = i.emergencyCells.coerceAtLeast(0), supercedureCells = i.supercedureCells.coerceAtLeast(0), swarmCells = i.swarmCells.coerceAtLeast(0),
                 eggs = i.eggs.coerceAtLeast(0), openBrood = i.openBrood.coerceAtLeast(0), cappedBrood = i.cappedBrood.coerceAtLeast(0),
                 honeyStores = i.honeyStores.coerceAtLeast(0), pollen = i.pollen.coerceAtLeast(0), emptyDrawnComb = i.emptyDrawnComb.coerceAtLeast(0),
                 diseaseFlags = i.diseaseFlags.trim(), updatedAt = i.createdAt
             )
             db.inspections().upsert(entity)
-            // One table row per image lets the hive album hold multiple photos per inspection.
-            photoPaths.forEach { path ->
-                db.photos().upsert(
-                    PhotoEntity(
-                        id = IdGenerator.nextLong(),
-                        hiveId = i.hiveId,
-                        inspectionId = i.id,
-                        localPath = path,
-                        cloudPath = null,
-                        createdAt = i.createdAt,
-                        syncState = "pending"
-                    )
-                )
+            if (!i.photoPath.isNullOrBlank()) {
+                db.photos().upsert(PhotoEntity(i.id, i.hiveId, i.id, i.photoPath, null, i.createdAt, "pending"))
             }
             db.hives().get(i.hiveId)?.let {
                 // The inspection timestamp describes the observation, not when the hive record was edited.

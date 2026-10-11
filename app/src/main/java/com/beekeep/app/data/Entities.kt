@@ -248,9 +248,7 @@ data class Inspection(
     val honeyStores: Int = 0,
     val pollen: Int = 0,
     val emptyDrawnComb: Int = 0,
-    val diseaseFlags: String = "",
-    // All images captured during this inspection. photoPath remains the first-photo compatibility field.
-    val photoPaths: List<String> = emptyList()
+    val diseaseFlags: String = ""
 ) {
     val mitePercent: Double get() = if (sampleSize > 0) miteCount * 100.0 / sampleSize else 0.0
 }

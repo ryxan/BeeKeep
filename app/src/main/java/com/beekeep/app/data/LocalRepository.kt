@@ -1,5 +1,7 @@
 package com.beekeep.app.data
 
+import com.beekeep.app.ColonyStrength
+
 import android.content.Context
 import androidx.room.withTransaction
 import com.beekeep.app.cloud.CloudDocumentRow
@@ -222,7 +224,7 @@ class LocalHiveRepository(context: Context) {
                 // Use wall-clock update time so backfilled inspections cannot make the hive look stale during sync.
                 db.hives().upsert(it.copy(strength = entity.strength, queenStatus = entity.queenStatus, mitePercent = entity.mitePercent, updatedAt = System.currentTimeMillis()))
             }
-            val event = ActivityEventEntity(i.id, i.hiveId, i.createdAt, "inspection", "Inspection", "Strength ${entity.strength}/10 • Mites ${String.format(java.util.Locale.US, "%.2f", entity.mitePercent)}%")
+            val event = ActivityEventEntity(i.id, i.hiveId, i.createdAt, "inspection", "Inspection", "Strength ${ColonyStrength.gradeFromStored(entity.strength)}/5 • ${ColonyStrength.labelFromStored(entity.strength)} • Mites ${String.format(java.util.Locale.US, "%.2f", entity.mitePercent)}%")
             db.events().upsert(event)
             enqueue("inspection", i.id, "upsert", inspectionPayload(entity))
             val updatedHive = db.hives().get(i.hiveId) ?: return@withTransaction

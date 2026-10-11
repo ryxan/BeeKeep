@@ -228,7 +228,7 @@ private fun saveInspectionFormDraft(
     draft: InspectionFormDraft
 ) {
     val json = JSONObject()
-        .put("strength", draft.strength.coerceIn(0, 10))
+        .put("strength", ColonyStrength.storedFromGrade(draft.strength))
         .put("queenStatus", draft.queenStatus)
         .put("miteCount", draft.miteCount.coerceAtLeast(0))
         .put("sampleSize", draft.sampleSize.coerceAtLeast(1))
@@ -2365,7 +2365,8 @@ private fun ApiaryHivesScreen(
 @Composable
 private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit) {
     // The Apiaries hive list now highlights the colony's strength rather than mite percentage.
-    val attention = hive.queenStatus == "Queenless" || hive.strength <= 3
+    val strengthGrade = ColonyStrength.gradeFromStored(hive.strength)
+    val attention = hive.queenStatus == "Queenless" || strengthGrade <= 2
     Card(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
@@ -2393,10 +2394,17 @@ private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit)
             ) {
                 Text("STRENGTH", color = Color(0xFFD97706), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                 Text(
-                    "${hive.strength}/10",
+                    "${strengthGrade}/5",
                     fontWeight = FontWeight.ExtraBold,
                     style = MaterialTheme.typography.titleLarge,
-                    color = if (hive.strength <= 3 || hive.queenStatus == "Queenless") Color(0xFFB91C1C) else Color(0xFFD97706)
+                    color = if (attention) Color(0xFFB91C1C) else Color(0xFFD97706)
+                )
+                Text(
+                    ColonyStrength.labelForGrade(strengthGrade),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = if (attention) Color(0xFFB91C1C) else Color(0xFFD97706),
+                    maxLines = 1
                 )
                 Icon(Icons.Rounded.ChevronRight, "Open hive", tint = Color(0xFF78350F))
             }
@@ -2619,7 +2627,7 @@ private fun HiveDetailScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    CompactStatItem("Strength", "${hive.strength}/10", Modifier.weight(1f))
+                    CompactStatItem("Strength • ${ColonyStrength.labelFromStored(hive.strength)}", "${ColonyStrength.gradeFromStored(hive.strength)}/5", Modifier.weight(1f))
                     CompactStatItem("Mites", "${String.format(Locale.US, "%.2f", hive.mitePercent)}%", Modifier.weight(1f))
                     CompactStatItem("Inspections", inspections.size.toString(), Modifier.weight(1f))
                 }
@@ -2917,7 +2925,7 @@ private fun addDateToNewInspectionNoteLines(previousNotes: String, updatedNotes:
 private fun InspectionSnapshot(i: Inspection) {
     Card(shape = RoundedCornerShape(16.dp)) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("${i.strength}/10 strength • ${i.queenStatus}")
+            Text("${ColonyStrength.gradeFromStored(i.strength)}/5 ${ColonyStrength.labelFromStored(i.strength)} strength • ${i.queenStatus}")
             Text("Mites ${i.miteCount}/${i.sampleSize} = ${String.format(Locale.US, "%.2f", i.mitePercent)}%")
             Text("Brood: eggs ${i.eggs}, open ${i.openBrood}, capped ${i.cappedBrood}")
             Text("Stores: honey ${i.honeyStores}, pollen ${i.pollen}")
@@ -3017,7 +3025,7 @@ private fun InspectionScreen(
     }
 
     var strength by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.strength ?: lastInspection?.strength ?: hive.strength)
+        mutableIntStateOf(ColonyStrength.gradeFromStored(formDraft?.strength ?: lastInspection?.strength ?: hive.strength))
     }
     var queen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.queenStatus ?: lastInspection?.queenStatus ?: hive.queenStatus)
@@ -3402,7 +3410,7 @@ private fun InspectionScreen(
                                         saving = true
                                         val now = System.currentTimeMillis()
                                         val inspection = Inspection(
-                                            IdGenerator.nextLong(), hive.id, now, strength, queen, mites,
+                                            IdGenerator.nextLong(), hive.id, now, ColonyStrength.storedFromGrade(strength), queen, mites,
                                             sample.coerceAtLeast(1), notes.trim(), null, lat, lon,
                                             emergency, supercedure, swarm, eggs, openBrood, cappedBrood,
                                             honey, pollen, emptyComb, diseasesCsv
@@ -3513,7 +3521,14 @@ private fun InspectionScreen(
             }
 
             item {
-                ComparisonCounter("Colony strength", strength, previousForComparison?.strength, 0..10, haptic) { strength = it }
+                ComparisonCounter(
+                    "Colony strength",
+                    strength,
+                    previousForComparison?.strength?.let { ColonyStrength.gradeFromStored(it) },
+                    1..5,
+                    haptic,
+                    valueLabel = ColonyStrength.labelForGrade(strength)
+                ) { strength = it }
             }
             item {
                 Card(
@@ -3660,6 +3675,7 @@ private fun ComparisonCounter(
     previous: Int?,
     range: IntRange,
     haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
+    valueLabel: String? = null,
     onChange: (Int) -> Unit
 ) {
     Card(
@@ -3691,7 +3707,15 @@ private fun ComparisonCounter(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
                     modifier = Modifier.size(36.dp)
                 ) { Text("−", style = MaterialTheme.typography.titleMedium) }
-                Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(0.dp)
+                ) {
+                    Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    valueLabel?.let {
+                        Text(it, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                }
                 IconButton(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
                     modifier = Modifier.size(36.dp)
@@ -3742,7 +3766,43 @@ private fun CompactCounter(
     }
 }
 
-@Composable private fun Counter(label:String,value:Int,range:IntRange,onChange:(Int)->Unit){Card(shape=RoundedCornerShape(16.dp), border=BorderStroke(1.dp,MaterialTheme.colorScheme.outline), colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface)){Row(Modifier.fillMaxWidth().padding(10.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Text(label,fontWeight=FontWeight.Bold,color=MaterialTheme.colorScheme.onSurfaceVariant)};IconButton({onChange((value-1).coerceIn(range))}){Text("−",style=MaterialTheme.typography.headlineMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)};Text(value.toString(),style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold,color=MaterialTheme.colorScheme.onSurfaceVariant);IconButton({onChange((value+1).coerceIn(range))}){Text("+",style=MaterialTheme.typography.headlineMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}}
+@Composable
+private fun Counter(
+    label: String,
+    value: Int,
+    range: IntRange,
+    valueLabel: String? = null,
+    onChange: (Int) -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(label, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            IconButton({ onChange((value - 1).coerceIn(range)) }) {
+                Text("−", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(value.toString(), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                valueLabel?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                }
+            }
+            IconButton({ onChange((value + 1).coerceIn(range)) }) {
+                Text("+", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
 @Composable
 private fun NumberField(
     label: String,
@@ -3778,7 +3838,56 @@ private fun NumberField(
     )
 }
 
-@Composable private fun AddHiveScreen(apiaries:List<Apiary>, initialApiary: String?, onBack:()->Unit, onCreate:(String,String,String,Int)->Unit){BackHandler{onBack()};var number by rememberSaveable{mutableStateOf("")};var apiary by rememberSaveable(initialApiary) { mutableStateOf(initialApiary ?: apiaries.firstOrNull()?.name ?: "Home Yard") };var queen by rememberSaveable{mutableStateOf("Laying")};var strength by rememberSaveable{mutableIntStateOf(5)};Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){Row(verticalAlignment=Alignment.CenterVertically){IconButton(onBack){Icon(Icons.Rounded.ArrowBack,"Back")};Text("Add Hive",style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold)};OutlinedTextField(number,{number=it},Modifier.fillMaxWidth(),label={Text("Hive number")},singleLine=true);OutlinedTextField(apiary,{ if (initialApiary == null) apiary=it },Modifier.fillMaxWidth(),label={Text("Apiary / Yard")},singleLine=true,readOnly=initialApiary != null);Text("Queen status",fontWeight=FontWeight.Bold);Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){for(status in listOf("Laying","Spotted","Unspotted","Queenless","Virgin")){FilterChip(queen==status,{queen=status},{Text(status)})}};Counter("Starting strength",strength,0..10){strength=it};Button({onCreate(number,apiary,queen,strength)},Modifier.fillMaxWidth().height(60.dp),enabled=number.isNotBlank(),shape=RoundedCornerShape(24.dp)){Text("CREATE HIVE",fontWeight=FontWeight.ExtraBold)}}}
+@Composable
+private fun AddHiveScreen(
+    apiaries: List<Apiary>,
+    initialApiary: String?,
+    onBack: () -> Unit,
+    onCreate: (String, String, String, Int) -> Unit
+) {
+    BackHandler { onBack() }
+    var number by rememberSaveable { mutableStateOf("") }
+    var apiary by rememberSaveable(initialApiary) { mutableStateOf(initialApiary ?: apiaries.firstOrNull()?.name ?: "Home Yard") }
+    var queen by rememberSaveable { mutableStateOf("Laying") }
+    var strength by rememberSaveable { mutableIntStateOf(3) }
+
+    Column(
+        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
+            Text("Add Hive", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+        }
+        OutlinedTextField(number, { number = it }, Modifier.fillMaxWidth(), label = { Text("Hive number") }, singleLine = true)
+        OutlinedTextField(
+            apiary,
+            { if (initialApiary == null) apiary = it },
+            Modifier.fillMaxWidth(),
+            label = { Text("Apiary / Yard") },
+            singleLine = true,
+            readOnly = initialApiary != null
+        )
+        Text("Queen status", fontWeight = FontWeight.Bold)
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (status in listOf("Laying", "Spotted", "Unspotted", "Queenless", "Virgin")) {
+                FilterChip(queen == status, { queen = status }, { Text(status) })
+            }
+        }
+        Counter(
+            "Starting strength",
+            strength,
+            1..5,
+            valueLabel = ColonyStrength.labelForGrade(strength)
+        ) { strength = it }
+        Button(
+            { onCreate(number, apiary, queen, ColonyStrength.storedFromGrade(strength)) },
+            Modifier.fillMaxWidth().height(60.dp),
+            enabled = number.isNotBlank(),
+            shape = RoundedCornerShape(24.dp)
+        ) { Text("CREATE HIVE", fontWeight = FontWeight.ExtraBold) }
+    }
+}
 
 @Composable
 private fun AddApiaryScreen(

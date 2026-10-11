@@ -428,6 +428,8 @@ fun BeeKeepApp(
     var addApiary by rememberSaveable { mutableStateOf(false) }
     var editingApiary by remember { mutableStateOf<Apiary?>(null) }
     var unassignedTagUid by rememberSaveable { mutableStateOf<String?>(null) }
+    var unassignedTagOrigin by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var tagManagerReturnScreen by rememberSaveable { mutableStateOf(Screen.MORE) }
     var pendingTagUid by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingInspectionHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var pendingAutoStartVoiceHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
@@ -569,6 +571,7 @@ fun BeeKeepApp(
             if (!alreadyOpen) scope.launch { snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready") }
         } else {
             screen = Screen.SCAN
+            unassignedTagOrigin = Screen.HOME
             unassignedTagUid = result.uid
         }
         (activity as? MainActivity)?.pendingNfcResult?.value = null
@@ -582,7 +585,7 @@ fun BeeKeepApp(
                 unassignedTagUid = null
                 nfc.stop(activity)
                 scanning = false
-                screen = Screen.HOME
+                if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
             },
             properties = DialogProperties(dismissOnClickOutside = false),
             title = { Text("Unassigned NFC tag", fontWeight = FontWeight.ExtraBold) },
@@ -597,6 +600,9 @@ fun BeeKeepApp(
                         onClick = {
                             unassignedTagUid = null
                             pendingTagUid = uid
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) {
+                                tagManagerReturnScreen = unassignedTagOrigin
+                            }
                             screen = Screen.TAG_MANAGER
                         },
                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
@@ -607,6 +613,8 @@ fun BeeKeepApp(
                         onClick = {
                             unassignedTagUid = null
                             pendingTagUid = uid
+                            // Return to Home after creating a hive from the scanner prompt.
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
                             addHive = true
                         },
                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
@@ -618,7 +626,7 @@ fun BeeKeepApp(
                             unassignedTagUid = null
                             nfc.stop(activity)
                             scanning = false
-                            screen = Screen.HOME
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
                         },
                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
                     ) {
@@ -862,7 +870,8 @@ fun BeeKeepApp(
                                     pendingInspectionHiveId = resolvedHive.id
                                     snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
                                 } else {
-                                    unassignedTagUid = result.uid
+                                    unassignedTagOrigin = Screen.HOME
+            unassignedTagUid = result.uid
                                 }
                             }
                         }
@@ -947,7 +956,8 @@ fun BeeKeepApp(
                                             pendingInspectionHiveId = resolvedHive.id
                                             snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
                                         } else {
-                                            unassignedTagUid = result.uid
+                                            unassignedTagOrigin = Screen.HOME
+            unassignedTagUid = result.uid
                                         }
                                     }
                                 }
@@ -978,7 +988,7 @@ fun BeeKeepApp(
                 locationController = locationController,
                 onBack = { screen = mapOrigin; mapFocusApiaryId = null }
             )
-            Screen.MORE -> MoreScreen(padding, darkMode, onDarkModeChange, onTagManager = { screen = Screen.TAG_MANAGER }, onColonyHistory = { screen = Screen.COLONY_HISTORY }, deadCount = deadHives.size, activity, cloud)
+            Screen.MORE -> MoreScreen(padding, darkMode, onDarkModeChange, onTagManager = { tagManagerReturnScreen = Screen.MORE; screen = Screen.TAG_MANAGER }, onColonyHistory = { screen = Screen.COLONY_HISTORY }, deadCount = deadHives.size, activity, cloud)
             Screen.TAG_MANAGER -> TagManagementScreen(
                 padding = padding,
                 hives = hives,
@@ -986,7 +996,7 @@ fun BeeKeepApp(
                 activity = activity,
                 pendingUid = pendingTagUid,
                 onPendingUidConsumed = { pendingTagUid = null },
-                onBack = { screen = Screen.MORE },
+                onBack = { screen = tagManagerReturnScreen },
                 onOpenHive = { vm.openHive(it); selectedHiveOpen = true; screen = Screen.HOME },
                 onScanOpenHive = { hiveId ->
                     onSpeakHiveNumber(hives.firstOrNull { it.id == hiveId }?.number.orEmpty())
@@ -998,7 +1008,10 @@ fun BeeKeepApp(
                 },
                 onAssignTag = { hiveId, uid, reassign, onResult -> vm.assignTagToHive(hiveId, uid, reassign, onResult) },
                 onClearTag = { hiveId -> vm.clearTagForHive(hiveId) },
-                onUnassignedTag = { uid -> unassignedTagUid = uid }
+                onUnassignedTag = { uid ->
+                    unassignedTagOrigin = Screen.TAG_MANAGER
+                    unassignedTagUid = uid
+                }
             )
             Screen.COLONY_HISTORY -> ColonyHistoryScreen(
                 deadHives = deadHives,

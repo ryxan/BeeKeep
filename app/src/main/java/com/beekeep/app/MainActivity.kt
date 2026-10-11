@@ -2774,6 +2774,35 @@ private fun InspectionSnapshot(i: Inspection) {
 }
 
 @Composable
+private fun HoneycombPattern(modifier: Modifier = Modifier) {
+    val patternColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.06f)
+    Canvas(modifier) {
+        val radius = 18.dp.toPx()
+        val horizontalStep = radius * 1.5f
+        val verticalStep = radius * kotlin.math.sqrt(3f)
+        val honeycomb = Path()
+        var row = 0
+        var centerY = -radius
+        while (centerY <= size.height + radius) {
+            var centerX = (if (row % 2 == 0) 0f else horizontalStep / 2f) - radius
+            while (centerX <= size.width + radius) {
+                for (vertex in 0..5) {
+                    val angle = Math.PI * vertex / 3.0
+                    val x = centerX + radius * Math.cos(angle).toFloat()
+                    val y = centerY + radius * Math.sin(angle).toFloat()
+                    if (vertex == 0) honeycomb.moveTo(x, y) else honeycomb.lineTo(x, y)
+                }
+                honeycomb.close()
+                centerX += horizontalStep
+            }
+            centerY += verticalStep
+            row++
+        }
+        drawPath(honeycomb, patternColor, style = Stroke(width = 1.dp.toPx()))
+    }
+}
+
+@Composable
 private fun InspectionScreen(
     activity: ComponentActivity,
     photoStore: PhotoStore,
@@ -3224,14 +3253,19 @@ private fun InspectionScreen(
         },
 
     ) { padding ->
-        LazyColumn(
-            Modifier.fillMaxSize().padding(padding),
+        Box(
+            Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+        ) {
+            HoneycombPattern(Modifier.matchParentSize())
+            LazyColumn(
+                Modifier.fillMaxSize().padding(padding),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
                 Card(
                     shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
                 ) {
                     Column(
@@ -3302,6 +3336,12 @@ private fun InspectionScreen(
                                 enabled = !saving && !photoProcessing,
                                 modifier = Modifier.weight(1f).height(54.dp),
                                 shape = RoundedCornerShape(16.dp),
+                                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFD97706),
+                                    contentColor = Color.White,
+                                    disabledContainerColor = Color(0xFFD97706).copy(alpha = 0.45f),
+                                    disabledContentColor = Color.White.copy(alpha = 0.75f)
+                                ),
                                 contentPadding = PaddingValues(horizontal = 8.dp)
                             ) {
                                 Icon(Icons.Rounded.Check, null)
@@ -3326,7 +3366,17 @@ private fun InspectionScreen(
                                 queen = option
                                 haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
                             },
-                            label = { Text(option) }
+                            label = { Text(option) },
+                            colors = androidx.compose.material3.FilterChipDefaults.filterChipColors(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                selectedContainerColor = Color(0xFFD97706),
+                                selectedLabelColor = Color.White
+                            ),
+                            border = BorderStroke(
+                                1.dp,
+                                if (queen == option) Color(0xFFD97706) else MaterialTheme.colorScheme.outline
+                            )
                         )
                     }
                 }
@@ -3335,10 +3385,16 @@ private fun InspectionScreen(
             item {
                 Card(
                     shape = RoundedCornerShape(24.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
                 ) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("FIELD NOTES", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.primary)
+                        Text(
+                            "FIELD NOTES",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
                         OutlinedTextField(
                             value = notes,
                             onValueChange = {
@@ -3383,11 +3439,15 @@ private fun InspectionScreen(
                 ComparisonCounter("Colony strength", strength, previousForComparison?.strength, 0..10, haptic) { strength = it }
             }
             item {
-                Card(shape = RoundedCornerShape(24.dp)) {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
                     Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                Text("Mite wash", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
+                                Text("Mite wash", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text("${mites} / ${sample} bees", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Text(String.format(Locale.US, "%.2f%%", miteRate), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
@@ -3456,7 +3516,17 @@ private fun InspectionScreen(
                                 diseasesCsv = current.joinToString(", ")
                                 haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
                             },
-                            label = { Text(flag) }
+                            label = { Text(flag) },
+                            colors = androidx.compose.material3.FilterChipDefaults.filterChipColors(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                selectedContainerColor = Color(0xFFD97706),
+                                selectedLabelColor = Color.White
+                            ),
+                            border = BorderStroke(
+                                1.dp,
+                                if (active) Color(0xFFD97706) else MaterialTheme.colorScheme.outline
+                            )
                         )
                     }
                 }
@@ -3468,7 +3538,8 @@ private fun InspectionScreen(
                 photoPath?.let { path ->
                     Card(
                         shape = RoundedCornerShape(24.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.72f))
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
                     ) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text("INSPECTION PHOTO", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSecondaryContainer)
@@ -3482,6 +3553,7 @@ private fun InspectionScreen(
                 }
             }
 
+            }
         }
     }
 }
@@ -3497,6 +3569,11 @@ private fun FieldActionButton(
         onClick = onClick,
         modifier = modifier.height(54.dp),
         shape = RoundedCornerShape(16.dp),
+        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp)
     ) {
         Icon(icon, contentDescription = label)
@@ -3507,7 +3584,13 @@ private fun FieldActionButton(
 
 @Composable
 private fun SectionHeader(title: String) {
-    Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 2.dp, vertical = 2.dp))
+    Text(
+        title,
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.ExtraBold,
+        color = MaterialTheme.colorScheme.onBackground,
+        modifier = Modifier.padding(horizontal = 2.dp, vertical = 2.dp)
+    )
 }
 
 @Composable
@@ -3519,13 +3602,17 @@ private fun ComparisonCounter(
     haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
     onChange: (Int) -> Unit
 ) {
-    Card(shape = RoundedCornerShape(16.dp)) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Column(
             Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(1.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
+                Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 previous?.let {
                     val delta = value - it
                     Text(
@@ -3544,7 +3631,7 @@ private fun ComparisonCounter(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
                     modifier = Modifier.size(36.dp)
                 ) { Text("−", style = MaterialTheme.typography.titleMedium) }
-                Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 IconButton(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
                     modifier = Modifier.size(36.dp)
@@ -3563,7 +3650,12 @@ private fun CompactCounter(
     modifier: Modifier = Modifier,
     onChange: (Int) -> Unit
 ) {
-    Card(modifier = modifier, shape = RoundedCornerShape(12.dp)) {
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 5.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -3574,13 +3666,14 @@ private fun CompactCounter(
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1
             )
             IconButton(
                 onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
                 modifier = Modifier.size(32.dp)
             ) { Text("−", style = MaterialTheme.typography.bodyMedium) }
-            Text(value.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
+            Text(value.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
             IconButton(
                 onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
                 modifier = Modifier.size(32.dp)
@@ -3598,7 +3691,7 @@ private fun rememberPhotoBitmap(path: String?, maxDimension: Int): Bitmap? {
     }.value
 }
 
-@Composable private fun Counter(label:String,value:Int,range:IntRange,onChange:(Int)->Unit){Card(shape=RoundedCornerShape(16.dp)){Row(Modifier.fillMaxWidth().padding(10.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Text(label,fontWeight=FontWeight.Bold)};IconButton({onChange((value-1).coerceIn(range))}){Text("−",style=MaterialTheme.typography.headlineMedium)};Text(value.toString(),style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold);IconButton({onChange((value+1).coerceIn(range))}){Text("+",style=MaterialTheme.typography.headlineMedium)}}}}
+@Composable private fun Counter(label:String,value:Int,range:IntRange,onChange:(Int)->Unit){Card(shape=RoundedCornerShape(16.dp), border=BorderStroke(1.dp,MaterialTheme.colorScheme.outline), colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface)){Row(Modifier.fillMaxWidth().padding(10.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Text(label,fontWeight=FontWeight.Bold,color=MaterialTheme.colorScheme.onSurfaceVariant)};IconButton({onChange((value-1).coerceIn(range))}){Text("−",style=MaterialTheme.typography.headlineMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)};Text(value.toString(),style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold,color=MaterialTheme.colorScheme.onSurfaceVariant);IconButton({onChange((value+1).coerceIn(range))}){Text("+",style=MaterialTheme.typography.headlineMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}}
 @Composable private fun NumberField(label:String,value:Int,mod:Modifier,onChange:(Int)->Unit){OutlinedTextField(value.toString(),{it.filter(Char::isDigit).toIntOrNull()?.let(onChange)},mod,label={Text(label)},keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number),singleLine=true)}
 
 @Composable private fun AddHiveScreen(apiaries:List<Apiary>, initialApiary: String?, onBack:()->Unit, onCreate:(String,String,String,Int)->Unit){BackHandler{onBack()};var number by rememberSaveable{mutableStateOf("")};var apiary by rememberSaveable(initialApiary) { mutableStateOf(initialApiary ?: apiaries.firstOrNull()?.name ?: "Home Yard") };var queen by rememberSaveable{mutableStateOf("Laying")};var strength by rememberSaveable{mutableIntStateOf(5)};Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){Row(verticalAlignment=Alignment.CenterVertically){IconButton(onBack){Icon(Icons.Rounded.ArrowBack,"Back")};Text("Add Hive",style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold)};OutlinedTextField(number,{number=it},Modifier.fillMaxWidth(),label={Text("Hive number")},singleLine=true);OutlinedTextField(apiary,{ if (initialApiary == null) apiary=it },Modifier.fillMaxWidth(),label={Text("Apiary / Yard")},singleLine=true,readOnly=initialApiary != null);Text("Queen status",fontWeight=FontWeight.Bold);Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){for(status in listOf("Laying","Spotted","Unspotted","Queenless","Virgin")){FilterChip(queen==status,{queen=status},{Text(status)})}};Counter("Starting strength",strength,0..10){strength=it};Button({onCreate(number,apiary,queen,strength)},Modifier.fillMaxWidth().height(60.dp),enabled=number.isNotBlank(),shape=RoundedCornerShape(24.dp)){Text("CREATE HIVE",fontWeight=FontWeight.ExtraBold)}}}

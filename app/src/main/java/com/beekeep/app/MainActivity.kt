@@ -2366,6 +2366,13 @@ private fun ApiaryHivesScreen(
 private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit) {
     // The Apiaries hive list now highlights the colony's strength rather than mite percentage.
     val strengthGrade = ColonyStrength.gradeFromStored(hive.strength)
+    val strengthColor = when (strengthGrade) {
+        1 -> Color(0xFFB91C1C) // Very Weak: red
+        2 -> Color(0xFFEA580C) // Weak: orange
+        3 -> Color(0xFFCA8A04) // Moderate: yellow
+        4 -> Color(0xFF65A30D) // Strong: light green
+        else -> Color(0xFF166534) // Very strong: dark green
+    }
     val attention = hive.queenStatus == "Queenless" || strengthGrade <= 2
     Card(
         onClick = onClick,
@@ -2396,7 +2403,7 @@ private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit)
                     ColonyStrength.labelForGrade(strengthGrade),
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.ExtraBold,
-                    color = if (attention) Color(0xFFB91C1C) else Color(0xFFD97706),
+                    color = strengthColor,
                     maxLines = 1
                 )
                 Icon(Icons.Rounded.ChevronRight, "Open hive", tint = Color(0xFF78350F))

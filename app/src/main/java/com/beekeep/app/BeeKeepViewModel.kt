@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.beekeep.app.data.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.time.ZoneId
@@ -43,6 +44,9 @@ class BeeKeepViewModel(
     init {
         viewModelScope.launch {
             repo.initialize()
+            // Hydrate active and inactive UID assignments before NFC auto-write is permitted.
+            _hives.value = repo.observeHives().first()
+            _deadHives.value = repo.observeDeadHives().first()
             _ready.value = true
             launch { repo.observeHives().collect { _hives.value = it } }
             launch { repo.observeDeadHives().collect { _deadHives.value = it } }
@@ -91,6 +95,22 @@ class BeeKeepViewModel(
                 }
                 onResult(true, tagError)
             }.onFailure { onResult(false, it.message ?: "Could not create the hive.") }
+        }
+    }
+
+    fun updateHiveLocation(
+        hiveId: Long,
+        latitude: Double,
+        longitude: Double,
+        onResult: (String?) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            runCatching { repo.updateHiveLocation(hiveId, latitude, longitude) }
+                .onSuccess {
+                    if (_selected.value?.id == hiveId) _selected.value = repo.getHive(hiveId)
+                    onResult(null)
+                }
+                .onFailure { onResult(it.message ?: "Could not save this hive's GPS location.") }
         }
     }
 

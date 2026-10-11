@@ -4,9 +4,17 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.view.View
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,10 +25,12 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,7 +41,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -39,21 +48,24 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.LocationOn
+import androidx.compose.material.icons.rounded.MyLocation
+import androidx.compose.material.icons.rounded.Map
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Nfc
 import androidx.compose.material.icons.rounded.Search
@@ -66,9 +78,11 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -94,27 +108,32 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.compose.runtime.produceState
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.withContext
-import java.io.File
 import com.beekeep.app.data.IdGenerator
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
@@ -130,14 +149,11 @@ import com.beekeep.app.cloud.CloudResult
 import com.beekeep.app.cloud.CloudSyncScheduler
 import com.beekeep.app.cloud.SupabaseGateway
 import com.beekeep.app.location.LocationController
-import com.beekeep.app.media.PhotoStore
 import com.beekeep.app.nfc.NfcController
 import com.beekeep.app.nfc.BeeKeepNfcPayload
 import com.beekeep.app.nfc.NfcResult
-import com.beekeep.app.ui.camera.CameraCaptureView
 import com.beekeep.app.ui.theme.BeeKeepTheme
-import com.beekeep.app.ui.theme.LandscapeDay
-import com.beekeep.app.ui.theme.LandscapeDusk
+import com.beekeep.app.ui.theme.BeeKeepAccent
 import com.beekeep.app.ui.theme.NavBarDark
 import com.beekeep.app.ui.theme.NavBarLight
 import com.beekeep.app.ui.theme.NavIndicator
@@ -150,6 +166,7 @@ import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONArray
 import org.json.JSONObject
 
 private const val PREFS = "beekeep_prefs"
@@ -171,7 +188,9 @@ private data class InspectionFormDraft(
     val supercedureCells: Int,
     val swarmCells: Int,
     val diseaseFlags: String,
-    val updatedAt: Long
+    val updatedAt: Long,
+    val latitude: Double? = null,
+    val longitude: Double? = null
 )
 
 private fun readInspectionFormDraft(
@@ -196,7 +215,9 @@ private fun readInspectionFormDraft(
             supercedureCells = json.optInt("supercedureCells", 0),
             swarmCells = json.optInt("swarmCells", 0),
             diseaseFlags = json.optString("diseaseFlags", ""),
-            updatedAt = json.optLong("updatedAt", 0L)
+            updatedAt = json.optLong("updatedAt", 0L),
+            latitude = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude") else null,
+            longitude = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null
         )
     }.getOrNull()
 }
@@ -207,7 +228,7 @@ private fun saveInspectionFormDraft(
     draft: InspectionFormDraft
 ) {
     val json = JSONObject()
-        .put("strength", draft.strength.coerceIn(0, 10))
+        .put("strength", ColonyStrength.storedFromGrade(draft.strength))
         .put("queenStatus", draft.queenStatus)
         .put("miteCount", draft.miteCount.coerceAtLeast(0))
         .put("sampleSize", draft.sampleSize.coerceAtLeast(1))
@@ -222,6 +243,8 @@ private fun saveInspectionFormDraft(
         .put("swarmCells", draft.swarmCells.coerceAtLeast(0))
         .put("diseaseFlags", draft.diseaseFlags)
         .put("updatedAt", System.currentTimeMillis())
+        .put("latitude", draft.latitude ?: JSONObject.NULL)
+        .put("longitude", draft.longitude ?: JSONObject.NULL)
     prefs.edit { putString("hive_$hiveId", json.toString()) }
 }
 
@@ -231,7 +254,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var speechEngine: TextToSpeech? = null
     private var speechReady = false
     private var pendingSpeech: String? = null
-    private lateinit var photoStore: PhotoStore
     private lateinit var locationController: LocationController
     private lateinit var cloudGateway: SupabaseGateway
 
@@ -241,7 +263,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         speechEngine = TextToSpeech(this, this)
         nfc.attach(this)
         handleNfcIntent(intent)
-        photoStore = PhotoStore(this)
         locationController = LocationController(this)
         val repository = LocalHiveRepository(applicationContext)
         // Keep NFC in foreground-reader mode while BeeKeep is visible. This takes
@@ -251,8 +272,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
                     val assignedHive = repository.findHiveByNfc(result.uid)
-                    val payloadHive = BeeKeepNfcPayload.hiveId(result.text)?.let { repository.getHive(it) }
-                    if (assignedHive != null || payloadHive != null) {
+                    val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
+                    val payloadHive = payloadHiveId?.let { repository.getHive(it) }
+                    if (assignedHive != null || payloadHive != null || payloadHiveId != null ||
+                        BeeKeepNfcPayload.isUnassignedPayload(result.text) || result.launchPreparationError != null) {
                         pendingNfcResult.value = result
                     }
                 }
@@ -274,7 +297,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 }
                 val incomingNfc by pendingNfcResult.collectAsStateWithLifecycle()
                 BeeKeepApp(
-                    vm, nfc, this, photoStore, locationController, cloud, darkMode, incomingNfc,
+                    vm, nfc, this, locationController, cloud, darkMode, incomingNfc,
                     onSpeakHiveNumber = ::speakHiveNumber
                 ) { value ->
                     darkMode = value
@@ -366,6 +389,7 @@ enum class Screen {
     HOME,
     APIARIES,
     APIARY_HIVES,
+    MAP,
     SCAN,
     MORE,
     TAG_MANAGER,
@@ -385,7 +409,6 @@ fun BeeKeepApp(
     vm: BeeKeepViewModel,
     nfc: NfcController,
     activity: ComponentActivity,
-    photoStore: PhotoStore,
     locationController: LocationController,
     cloud: SupabaseGateway,
     darkMode: Boolean,
@@ -396,13 +419,19 @@ fun BeeKeepApp(
     var screen by rememberSaveable { mutableStateOf(Screen.HOME) }
     var selectedHiveOpen by rememberSaveable { mutableStateOf(false) }
     var selectedApiaryName by rememberSaveable { mutableStateOf<String?>(null) }
+    var mapOrigin by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var mapFocusApiaryId by rememberSaveable { mutableStateOf<Long?>(null) }
     var inspecting by rememberSaveable { mutableStateOf(false) }
     var addHive by rememberSaveable { mutableStateOf(false) }
     var logType by rememberSaveable { mutableStateOf<HiveLogType?>(null) }
     var addApiary by rememberSaveable { mutableStateOf(false) }
     var editingApiary by remember { mutableStateOf<Apiary?>(null) }
     var unassignedTagUid by rememberSaveable { mutableStateOf<String?>(null) }
+    var unassignedTagOrigin by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var tagManagerReturnScreen by rememberSaveable { mutableStateOf(Screen.MORE) }
     var pendingTagUid by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingInspectionHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var pendingAutoStartVoiceHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var scanning by remember { mutableStateOf(false) }
     var pendingLocationHive by remember { mutableStateOf<Hive?>(null) }
     var pendingApiaryMove by remember { mutableStateOf<Pair<Hive, Apiary>?>(null) }
@@ -420,6 +449,24 @@ fun BeeKeepApp(
     val treatments by vm.treatments.collectAsStateWithLifecycle()
     val harvests by vm.harvests.collectAsStateWithLifecycle()
     val ready by vm.ready.collectAsStateWithLifecycle()
+
+    // Wait until the ViewModel has loaded the scanned hive before presenting Inspect.
+    androidx.compose.runtime.LaunchedEffect(selected?.id, pendingInspectionHiveId) {
+        val targetHiveId = pendingInspectionHiveId ?: return@LaunchedEffect
+        if (selected?.id == targetHiveId) {
+            inspecting = true
+            pendingInspectionHiveId = null
+        }
+    }
+
+    // Keep the NFC writer's UID protection synchronized with the fully-loaded local hive list.
+    androidx.compose.runtime.LaunchedEffect(ready, hives, deadHives) {
+        // Include inactive colonies too; their saved NFC UIDs must never be treated as blank tags.
+        val assignments = (hives + deadHives).mapNotNull { hive ->
+            hive.tagUid?.trim()?.takeIf { it.isNotBlank() }?.let { it to hive.id }
+        }.toMap()
+        nfc.updateKnownHiveTags(assignments, ready)
+    }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -486,6 +533,9 @@ fun BeeKeepApp(
     androidx.compose.runtime.LaunchedEffect(ready, incomingNfc?.uid, screen) {
         val result = incomingNfc ?: return@LaunchedEffect
         if (!ready) return@LaunchedEffect
+        result.launchPreparationError?.let { message ->
+            scope.launch { snackbarHostState.showSnackbar(message) }
+        }
 
         // Manual NFC management and scan screens own their tag reads. Ignore
         // passive-reader notifications there, otherwise a just-assigned tag can
@@ -503,17 +553,24 @@ fun BeeKeepApp(
             checkHiveLocation(resolvedHive)
             // Announce every accepted tag read, even when this hive is already open.
             onSpeakHiveNumber(resolvedHive.number)
-            // A tag may be seen repeatedly while held near the phone. Do not
-            // reload the same hive detail screen if it is already open.
+            // Field NFC scans go directly to Inspect so the beekeeper can keep gloves on.
             val alreadyOpen = selectedHiveOpen && selected?.id == resolvedHive.id
+            val alreadyInspectingThisHive = inspecting && selected?.id == resolvedHive.id
+            if (!alreadyInspectingThisHive) pendingAutoStartVoiceHiveId = resolvedHive.id
             if (!alreadyOpen) {
                 vm.openHive(resolvedHive.id)
                 selectedHiveOpen = true
-                screen = Screen.HOME
-                scope.launch { snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized") }
             }
+            screen = Screen.HOME
+            if (selected?.id == resolvedHive.id) {
+                inspecting = true
+            } else {
+                pendingInspectionHiveId = resolvedHive.id
+            }
+            if (!alreadyOpen) scope.launch { snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready") }
         } else {
             screen = Screen.SCAN
+            unassignedTagOrigin = Screen.HOME
             unassignedTagUid = result.uid
         }
         (activity as? MainActivity)?.pendingNfcResult?.value = null
@@ -521,26 +578,62 @@ fun BeeKeepApp(
 
     unassignedTagUid?.let { uid ->
         AlertDialog(
-            onDismissRequest = { unassignedTagUid = null },
+            // Keep outside taps from dismissing this dialog and revealing the
+            // scan screen underneath. Back and the explicit Cancel action exit safely.
+            onDismissRequest = {
+                unassignedTagUid = null
+                nfc.stop(activity)
+                scanning = false
+                if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
+            },
+            properties = DialogProperties(dismissOnClickOutside = false),
             title = { Text("Unassigned NFC tag", fontWeight = FontWeight.ExtraBold) },
             text = { Text("Tag $uid is not assigned to a colony. What would you like to do with it?") },
             confirmButton = {
-                TextButton(onClick = {
-                    unassignedTagUid = null
-                    pendingTagUid = uid
-                    screen = Screen.TAG_MANAGER
-                }) { Text("ASSIGN TO EXISTING HIVE", fontWeight = FontWeight.ExtraBold) }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = {
-                        unassignedTagUid = null
-                        pendingTagUid = uid
-                        addHive = true
-                    }) { Text("CREATE NEW HIVE") }
-                    TextButton(onClick = { unassignedTagUid = null }) { Text("CANCEL") }
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            pendingTagUid = uid
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) {
+                                tagManagerReturnScreen = unassignedTagOrigin
+                            }
+                            screen = Screen.TAG_MANAGER
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("ASSIGN TO EXISTING HIVE", fontWeight = FontWeight.ExtraBold)
+                    }
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            pendingTagUid = uid
+                            // Return to Home after creating a hive from the scanner prompt.
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
+                            addHive = true
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("CREATE NEW HIVE", fontWeight = FontWeight.ExtraBold)
+                    }
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            nfc.stop(activity)
+                            scanning = false
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("CANCEL", fontWeight = FontWeight.ExtraBold)
+                    }
                 }
-            }
+            },
+            dismissButton = {}
         )
     }
 
@@ -581,7 +674,7 @@ fun BeeKeepApp(
     }
 
     if (addHive) {
-        AddHiveScreen(apiaries, selectedApiaryName, { addHive = false }) { number, apiary, queen, strength ->
+        AddHiveScreen(apiaries, selectedApiaryName, { addHive = false; pendingTagUid = null }) { number, apiary, queen, strength ->
             vm.createHive(number, apiary, queen, strength, tagUid = pendingTagUid) { success, error ->
                 scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${number.trim()} created") }
                 if (success) { addHive = false; pendingTagUid = null }
@@ -611,15 +704,32 @@ fun BeeKeepApp(
     if (inspecting) {
         val hiveForInspection = selected ?: run { inspecting = false; return }
         InspectionScreen(
-            activity, photoStore, locationController, hiveForInspection,
+            activity, locationController, hiveForInspection,
             priorInspections = inspections,
-            onBack = { inspecting = false },
+            autoStartVoice = pendingAutoStartVoiceHiveId == hiveForInspection.id,
+            onVoiceAutoStartConsumed = {
+                if (pendingAutoStartVoiceHiveId == hiveForInspection.id) pendingAutoStartVoiceHiveId = null
+            },
+            onSaveHiveLocation = { hiveId, latitude, longitude, onResult ->
+                vm.updateHiveLocation(hiveId, latitude, longitude, onResult)
+            },
+            onBack = { pendingAutoStartVoiceHiveId = null; inspecting = false },
+            onHome = {
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
+                selectedHiveOpen = false
+                selectedApiaryName = null
+                screen = Screen.HOME
+                vm.clearHive()
+            },
             onSave = { inspection ->
                 val saved = vm.saveInspection(inspection)
                 if (saved) {
                     // Keep the full note log (including an intentional empty value) available for the next Inspect session.
                     activity.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
                         .edit { putString("hive_${inspection.hiveId}", inspection.notes) }
+                    pendingAutoStartVoiceHiveId = null
                     inspecting = false
                     scope.launch { snackbarHostState.showSnackbar("Inspection saved") }
                 } else {
@@ -678,7 +788,16 @@ fun BeeKeepApp(
             nfc = nfc,
             activity = activity,
             onBack = { selectedHiveOpen = false; vm.clearHive() },
-            onInspect = { inspecting = true },
+            onHome = {
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
+                selectedHiveOpen = false
+                selectedApiaryName = null
+                screen = Screen.HOME
+                vm.clearHive()
+            },
+            onInspect = { pendingAutoStartVoiceHiveId = null; inspecting = true },
             onFeed = { logType = HiveLogType.FEED },
             onTreat = { logType = HiveLogType.TREAT },
             onHarvest = { logType = HiveLogType.HARVEST },
@@ -702,7 +821,6 @@ fun BeeKeepApp(
                     }
                 }
             },
-            onEditQueen = { status, mark, origin, age, temperament -> vm.updateQueenProfile(status, mark, origin, age, temperament) },
             onMarkDead = {
                 vm.markHiveDead(hiveForDetail.id) { _, error ->
                     scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${hiveForDetail.number} marked dead. History preserved.") }
@@ -729,10 +847,13 @@ fun BeeKeepApp(
             onBack = { nfc.stop(activity); scanning = false; screen = Screen.HOME },
             onCancelScan = { nfc.stop(activity); scanning = false },
             onScan = {
-                nfc.startRead(activity) { result ->
+                nfc.startReadAndPrepareForBeeKeep(activity) { result ->
                     scanning = false
                     when (result) {
                         is NfcResult.Read -> {
+                            result.launchPreparationError?.let { message ->
+                                scope.launch { snackbarHostState.showSnackbar(message) }
+                            }
                             scope.launch {
                                 val payloadId = BeeKeepNfcPayload.hiveId(result.text)
                                 val assignedHive = vm.findHiveByTag(result.uid)
@@ -744,8 +865,11 @@ fun BeeKeepApp(
                                     vm.openHive(resolvedHive.id)
                                     selectedHiveOpen = true
                                     screen = Screen.HOME
-                                    snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized")
+                                    pendingAutoStartVoiceHiveId = resolvedHive.id
+                                    pendingInspectionHiveId = resolvedHive.id
+                                    snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
                                 } else {
+                                    unassignedTagOrigin = Screen.HOME
                                     unassignedTagUid = result.uid
                                 }
                             }
@@ -778,18 +902,92 @@ fun BeeKeepApp(
     Scaffold(
         snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
         bottomBar = {
-            NavigationBar(containerColor = if (darkMode) NavBarDark else NavBarLight, contentColor = OnNavBar, tonalElevation = 0.dp) {
+            NavigationBar(
+                modifier = Modifier.clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)),
+                containerColor = if (darkMode) NavBarDark else NavBarLight,
+                contentColor = OnNavBar,
+                tonalElevation = 0.dp
+            ) {
                 NavItem("Home", Icons.Rounded.Home, screen == Screen.HOME) { screen = Screen.HOME }
                 NavItem("Apiaries", Icons.Rounded.Yard, screen == Screen.APIARIES || screen == Screen.APIARY_HIVES) { selectedApiaryName = null; screen = Screen.APIARIES }
-                NavItem("Scan", Icons.Rounded.Nfc, screen == Screen.SCAN) { screen = Screen.SCAN }
+                NavItem("Map", Icons.Rounded.Map, screen == Screen.MAP) {
+                    mapOrigin = Screen.HOME
+                    mapFocusApiaryId = null
+                    screen = Screen.MAP
+                }
                 NavItem("More", Icons.Rounded.Settings, screen == Screen.MORE) { screen = Screen.MORE }
             }
         }
     ) { padding ->
         when (screen) {
-            Screen.HOME -> HomeScreen(hives, padding, onScan = { screen = Screen.SCAN })
-            Screen.APIARIES -> ApiariesScreen(apiaries, hives, padding, onAddApiary = { addApiary = true }, onEditApiary = { editingApiary = it }, onOpenApiary = { selectedApiaryName = it; screen = Screen.APIARY_HIVES })
-            Screen.MORE -> MoreScreen(padding, darkMode, onDarkModeChange, onTagManager = { screen = Screen.TAG_MANAGER }, onColonyHistory = { screen = Screen.COLONY_HISTORY }, deadCount = deadHives.size, activity, cloud)
+            Screen.HOME -> HomeScreen(
+                hives = hives,
+                apiaries = apiaries,
+                padding = padding,
+                scanning = scanning,
+                onCancelScan = { nfc.stop(activity); scanning = false },
+                onScan = {
+                    if (scanning) {
+                        // A second tap cancels the in-place scan.
+                        nfc.stop(activity)
+                        scanning = false
+                    } else {
+                        scanning = true
+                        nfc.startReadAndPrepareForBeeKeep(activity) { result ->
+                            scanning = false
+                            when (result) {
+                                is NfcResult.Read -> {
+                                    result.launchPreparationError?.let { message ->
+                                        scope.launch { snackbarHostState.showSnackbar(message) }
+                                    }
+                                    scope.launch {
+                                        val payloadId = BeeKeepNfcPayload.hiveId(result.text)
+                                        val assignedHive = vm.findHiveByTag(result.uid)
+                                        val payloadHive = payloadId?.let { id -> hives.firstOrNull { it.id == id } }
+                                        val resolvedHive = assignedHive ?: payloadHive
+                                        if (resolvedHive != null) {
+                                            checkHiveLocation(resolvedHive)
+                                            onSpeakHiveNumber(resolvedHive.number)
+                                            vm.openHive(resolvedHive.id)
+                                            selectedHiveOpen = true
+                                            screen = Screen.HOME
+                                            pendingAutoStartVoiceHiveId = resolvedHive.id
+                                            pendingInspectionHiveId = resolvedHive.id
+                                            snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized • inspection ready")
+                                        } else {
+                                            unassignedTagOrigin = Screen.HOME
+                                            unassignedTagUid = result.uid
+                                        }
+                                    }
+                                }
+                                is NfcResult.Error -> scope.launch { snackbarHostState.showSnackbar(result.message) }
+                                is NfcResult.Written -> Unit
+                            }
+                        }
+                        // startRead can immediately return an error if NFC is off/unavailable.
+                        scanning = nfc.isScanning()
+                    }
+                }
+            )
+            Screen.APIARIES -> ApiariesScreen(
+                apiaries, hives, padding,
+                onAddApiary = { addApiary = true },
+                onEditApiary = { editingApiary = it },
+                onOpenMap = { apiary ->
+                    mapOrigin = Screen.APIARIES
+                    mapFocusApiaryId = apiary.id
+                    screen = Screen.MAP
+                },
+                onOpenApiary = { selectedApiaryName = it; screen = Screen.APIARY_HIVES }
+            )
+            Screen.MAP -> ApiaryMapScreen(
+                apiaries = apiaries,
+                padding = padding,
+                initialFocusApiaryId = mapFocusApiaryId,
+                locationController = locationController,
+                onBack = { screen = mapOrigin; mapFocusApiaryId = null }
+            )
+            Screen.MORE -> MoreScreen(padding, darkMode, onDarkModeChange, onTagManager = { tagManagerReturnScreen = Screen.MORE; screen = Screen.TAG_MANAGER }, onColonyHistory = { screen = Screen.COLONY_HISTORY }, deadCount = deadHives.size, activity, cloud)
             Screen.TAG_MANAGER -> TagManagementScreen(
                 padding = padding,
                 hives = hives,
@@ -797,10 +995,22 @@ fun BeeKeepApp(
                 activity = activity,
                 pendingUid = pendingTagUid,
                 onPendingUidConsumed = { pendingTagUid = null },
-                onBack = { screen = Screen.MORE },
+                onBack = { screen = tagManagerReturnScreen },
                 onOpenHive = { vm.openHive(it); selectedHiveOpen = true; screen = Screen.HOME },
+                onScanOpenHive = { hiveId ->
+                    onSpeakHiveNumber(hives.firstOrNull { it.id == hiveId }?.number.orEmpty())
+                    vm.openHive(hiveId)
+                    selectedHiveOpen = true
+                    screen = Screen.HOME
+                    pendingAutoStartVoiceHiveId = hiveId
+                    pendingInspectionHiveId = hiveId
+                },
                 onAssignTag = { hiveId, uid, reassign, onResult -> vm.assignTagToHive(hiveId, uid, reassign, onResult) },
-                onClearTag = { hiveId -> vm.clearTagForHive(hiveId) }
+                onClearTag = { hiveId -> vm.clearTagForHive(hiveId) },
+                onUnassignedTag = { uid ->
+                    unassignedTagOrigin = Screen.TAG_MANAGER
+                    unassignedTagUid = uid
+                }
             )
             Screen.COLONY_HISTORY -> ColonyHistoryScreen(
                 deadHives = deadHives,
@@ -832,57 +1042,188 @@ private fun androidx.compose.foundation.layout.RowScope.NavItem(label: String, i
 
 @Composable
 private fun MetricCard(title: String, value: String, modifier: Modifier = Modifier, supporting: String? = null) {
-    Card(
+    ElevatedCard(
         modifier = modifier,
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+        ),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)
     ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
-            Text(title, color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.labelLarge)
-            supporting?.let { Text(it, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .75f), style = MaterialTheme.typography.bodySmall) }
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                value,
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                maxLines = 1
+            )
+            Text(
+                title,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            supporting?.let {
+                Text(it, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f), style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
 }
 
 @Composable
-private fun LandscapeCanvas(modifier: Modifier, palette: com.beekeep.app.ui.theme.LandscapePalette) {
+private fun HoneybeeGlyph(modifier: Modifier = Modifier) {
     Canvas(modifier) {
-        val w = size.width
-        val h = size.height
-        drawRect(palette.sky)
-        drawCircle(palette.sun, radius = h * 0.15f, center = Offset(w * 0.80f, h * 0.26f))
-        drawPath(Path().apply {
-            moveTo(0f, h * 0.60f)
-            cubicTo(w * 0.16f, h * 0.42f, w * 0.30f, h * 0.54f, w * 0.44f, h * 0.38f)
-            cubicTo(w * 0.60f, h * 0.22f, w * 0.74f, h * 0.46f, w, h * 0.34f)
-            lineTo(w, h); lineTo(0f, h); close()
-        }, palette.hillBack)
-        drawPath(Path().apply {
-            moveTo(0f, h * 0.76f)
-            cubicTo(w * 0.22f, h * 0.58f, w * 0.38f, h * 0.72f, w * 0.55f, h * 0.56f)
-            cubicTo(w * 0.74f, h * 0.42f, w * 0.86f, h * 0.64f, w, h * 0.54f)
-            lineTo(w, h); lineTo(0f, h); close()
-        }, palette.hillMid)
-        drawPath(Path().apply {
-            moveTo(0f, h * 0.90f)
-            cubicTo(w * 0.25f, h * 0.76f, w * 0.45f, h * 0.94f, w * 0.68f, h * 0.80f)
-            cubicTo(w * 0.84f, h * 0.72f, w * 0.94f, h * 0.84f, w, h * 0.78f)
-            lineTo(w, h); lineTo(0f, h); close()
-        }, palette.hillFront)
-        listOf(w * 0.62f to h * 0.88f, w * 0.72f to h * 0.82f, w * 0.90f to h * 0.80f).forEach { (cx, base) ->
-            val ph = h * 0.30f
-            for (tier in 0..2) {
-                val top = base - ph + tier * ph * 0.26f
-                val half = ph * 0.16f * (0.6f + tier * 0.4f)
-                drawPath(Path().apply {
-                    moveTo(cx, top)
-                    lineTo(cx + half, top + ph * 0.45f)
-                    lineTo(cx - half, top + ph * 0.45f)
+        val unit = minOf(size.width, size.height) / 48f
+        val startX = (size.width - 48f * unit) / 2f
+        val startY = (size.height - 48f * unit) / 2f
+        fun at(x: Float, y: Float) = Offset(startX + x * unit, startY + y * unit)
+
+        val beeDark = Color(0xFF26190B)
+        val beeGold = Color(0xFFF1B63F)
+        val beeWing = Color(0xFFFFF0C7)
+
+        rotate(-27f, pivot = Offset(size.width / 2f, size.height / 2f)) {
+            // Two clean, flat wings give the scan action its own small 2D bee mark.
+            drawOval(beeWing, topLeft = at(12f, 9f), size = Size(15f * unit, 8f * unit))
+            drawOval(beeWing.copy(alpha = 0.94f), topLeft = at(20f, 10f), size = Size(12f * unit, 7f * unit))
+
+            // Rounded, striped abdomen with a dark outline.
+            drawOval(beeDark, topLeft = at(7f, 19f), size = Size(28f * unit, 15f * unit))
+            drawOval(beeGold, topLeft = at(8.5f, 20.5f), size = Size(25f * unit, 12f * unit))
+            drawLine(beeDark, at(16f, 21f), at(16f, 32f), strokeWidth = 3.1f * unit)
+            drawLine(beeDark, at(23f, 20.5f), at(23f, 32.5f), strokeWidth = 3.1f * unit)
+            drawLine(beeDark, at(29f, 22f), at(29f, 30.5f), strokeWidth = 2.7f * unit)
+
+            // Head, eye, and antennae.
+            drawCircle(beeDark, radius = 6.2f * unit, center = at(34f, 24.5f))
+            drawCircle(beeGold, radius = 1.35f * unit, center = at(35.5f, 23f))
+            drawLine(beeDark, at(32.5f, 19.5f), at(35.5f, 14f), strokeWidth = 1.8f * unit)
+            drawLine(beeDark, at(36f, 20f), at(41f, 17.5f), strokeWidth = 1.8f * unit)
+            drawCircle(beeGold, radius = 1.4f * unit, center = at(35.5f, 14f))
+            drawCircle(beeGold, radius = 1.4f * unit, center = at(41f, 17.5f))
+
+            // Tiny legs, kept simple so the symbol stays crisp at phone sizes.
+            drawLine(beeDark, at(17f, 32f), at(15f, 36f), strokeWidth = 1.8f * unit)
+            drawLine(beeDark, at(24f, 32f), at(23f, 36f), strokeWidth = 1.8f * unit)
+            drawLine(beeDark, at(29f, 31f), at(31f, 34f), strokeWidth = 1.8f * unit)
+        }
+    }
+}
+
+private val HoneycombButtonShape = GenericShape { size, _ ->
+    moveTo(size.width * 0.25f, 0f)
+    lineTo(size.width * 0.75f, 0f)
+    lineTo(size.width, size.height * 0.5f)
+    lineTo(size.width * 0.75f, size.height)
+    lineTo(size.width * 0.25f, size.height)
+    lineTo(0f, size.height * 0.5f)
+    close()
+}
+
+@Composable
+private fun HoneycombPattern(modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val radius = size.height / 6.0f
+        val halfHeight = radius * 0.8660254f
+        val columnStep = radius * 1.7320508f
+        val rowStep = radius * 1.5f
+        val lineColor = Color(0xFFB45309).copy(alpha = 0.34f)
+        val lineWidth = 1.25.dp.toPx()
+
+        var row = -2
+        while (row * rowStep < size.height + radius) {
+            val cy = radius + row * rowStep
+            val offset = if (row % 2 == 0) 0f else columnStep / 2f
+            var col = -2
+            while (col * columnStep + offset < size.width + columnStep) {
+                val cx = col * columnStep + offset
+                val cell = Path().apply {
+                    moveTo(cx + radius, cy)
+                    lineTo(cx + radius / 2f, cy + halfHeight)
+                    lineTo(cx - radius / 2f, cy + halfHeight)
+                    lineTo(cx - radius, cy)
+                    lineTo(cx - radius / 2f, cy - halfHeight)
+                    lineTo(cx + radius / 2f, cy - halfHeight)
                     close()
-                }, palette.tree)
+                }
+                drawPath(cell, lineColor, style = Stroke(width = lineWidth))
+                col++
             }
-            drawRect(palette.tree, Offset(cx - w * 0.005f, base - ph * 0.08f), Size(w * 0.010f, ph * 0.10f))
+            row++
+        }
+        val edge = Path().apply {
+            moveTo(size.width * 0.25f, 1f)
+            lineTo(size.width * 0.75f, 1f)
+            lineTo(size.width - 1f, size.height / 2f)
+            lineTo(size.width * 0.75f, size.height - 1f)
+            lineTo(size.width * 0.25f, size.height - 1f)
+            lineTo(1f, size.height / 2f)
+            close()
+        }
+        drawPath(edge, BeeKeepAccent.copy(alpha = 0.82f), style = Stroke(width = 1.5.dp.toPx()))
+    }
+}
+
+@Composable
+private fun HoneycombScanButton(scanning: Boolean, onClick: () -> Unit) {
+    val pulse = rememberInfiniteTransition(label = "homeScanPulse")
+    val ringScale by pulse.animateFloat(
+        0.96f, 1.16f,
+        infiniteRepeatable(tween(1100)),
+        label = "homeScanRingScale"
+    )
+    val ringAlpha by pulse.animateFloat(
+        0.58f, 0f,
+        infiniteRepeatable(tween(1100)),
+        label = "homeScanRingAlpha"
+    )
+
+    Box(
+        modifier = Modifier.width(208.dp).height(180.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        if (scanning) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = ringScale
+                        scaleY = ringScale
+                        alpha = ringAlpha
+                    }
+                    .border(3.dp, BeeKeepAccent, HoneycombButtonShape)
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .shadow(8.dp, HoneycombButtonShape)
+                .clip(HoneycombButtonShape)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(BeeKeepAccent, Color(0xFFD97706))
+                    )
+                )
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            HoneycombPattern(Modifier.fillMaxSize())
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                HoneybeeGlyph(Modifier.size(43.dp))
+                Spacer(Modifier.width(14.dp))
+                Text(
+                    if (scanning) "SCANNING…" else "SCAN",
+                    style = if (scanning) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color(0xFF2A2421)
+                )
+            }
         }
     }
 }
@@ -890,53 +1231,178 @@ private fun LandscapeCanvas(modifier: Modifier, palette: com.beekeep.app.ui.them
 @Composable
 private fun HomeScreen(
     hives: List<Hive>,
+    apiaries: List<Apiary>,
     padding: androidx.compose.foundation.layout.PaddingValues,
-    onScan: () -> Unit
+    scanning: Boolean,
+    onScan: () -> Unit,
+    onCancelScan: () -> Unit
 ) {
-    val flagged = hives.count { it.mitePercent >= 3.0 || it.queenStatus == "Queenless" }
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val scanningNow by rememberUpdatedState(scanning)
+    val cancelScanNow by rememberUpdatedState(onCancelScan)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE && scanningNow) cancelScanNow()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (scanningNow) cancelScanNow()
+        }
+    }
+    val bannerBitmap = remember(context) {
+        runCatching {
+            context.assets.open("beekeep_home_banner.webp").use { input ->
+                BitmapFactory.decodeStream(input)
+            }
+        }.getOrNull()
+    }
+    // Crop to the inner logo mark and key out the near-black tile so the cream
+    // screen background remains visible through the transparent parts.
+    val bannerLogoBitmap = remember(bannerBitmap) {
+        bannerBitmap?.let { bitmap ->
+            runCatching {
+                val cropped = Bitmap.createBitmap(bitmap, 467, 38, 220, 238)
+                val pixels = IntArray(cropped.width * cropped.height)
+                cropped.getPixels(pixels, 0, cropped.width, 0, 0, cropped.width, cropped.height)
+                for (index in pixels.indices) {
+                    val pixel = pixels[index]
+                    val red = (pixel ushr 16) and 0xFF
+                    val green = (pixel ushr 8) and 0xFF
+                    val blue = pixel and 0xFF
+                    if (maxOf(red, green, blue) <= 22 && maxOf(red, green, blue) - minOf(red, green, blue) <= 12) {
+                        pixels[index] = 0x00000000
+                    }
+                }
+                Bitmap.createBitmap(pixels, cropped.width, cropped.height, Bitmap.Config.ARGB_8888)
+            }.getOrNull()
+        }
+    }
+
     LazyColumn(
-        Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 16.dp, bottom = 28.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(padding),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+            start = 16.dp,
+            top = 16.dp,
+            end = 16.dp,
+            bottom = 28.dp
+        ),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            val landscape = if (MaterialTheme.colorScheme.background.luminance() < 0.35f) LandscapeDusk else LandscapeDay
-            Box(Modifier.fillMaxWidth().height(176.dp).clip(RoundedCornerShape(24.dp))) {
-                LandscapeCanvas(Modifier.fillMaxSize(), landscape)
-                Column(Modifier.align(Alignment.TopStart).padding(horizontal = 20.dp, vertical = 16.dp)) {
-                    Text("GOOD FIELD DAY", style = MaterialTheme.typography.labelLarge, color = landscape.ink.copy(alpha = .8f))
-                    Text("BeeKeep", style = MaterialTheme.typography.headlineLarge, color = landscape.ink)
-                    Text("Your operation at a glance", color = landscape.ink.copy(alpha = .72f))
+            // Integrated header: the cream background stays visible, with an ambient
+            // amber glow and barely-there honeycomb watermark for depth.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(142.dp)
+            ) {
+                Canvas(Modifier.fillMaxSize()) {
+                    val w = size.width
+                    val h = size.height
+                    drawRect(
+                        Brush.radialGradient(
+                            colors = listOf(
+                                BeeKeepAccent.copy(alpha = 0.14f),
+                                BeeKeepAccent.copy(alpha = 0.055f),
+                                Color.Transparent
+                            ),
+                            center = Offset(w * 0.78f, h * 0.46f),
+                            radius = w * 0.56f
+                        )
+                    )
+
+                    // Fine outline cells are deliberately faint, acting as a watermark.
+                    val radius = 12.dp.toPx()
+                    val halfHeight = radius * 0.8660254f
+                    val columnStep = radius * 1.7320508f
+                    val rowStep = radius * 1.5f
+                    val lineColor = BeeKeepAccent.copy(alpha = 0.055f)
+                    var row = -1
+                    while (row * rowStep < h + radius) {
+                        val cy = radius + row * rowStep
+                        val offset = if (row % 2 == 0) 0f else columnStep / 2f
+                        var col = 5
+                        while (col * columnStep + offset < w + radius) {
+                            val cx = col * columnStep + offset
+                            val hex = Path().apply {
+                                moveTo(cx + radius, cy)
+                                lineTo(cx + radius / 2f, cy + halfHeight)
+                                lineTo(cx - radius / 2f, cy + halfHeight)
+                                lineTo(cx - radius, cy)
+                                lineTo(cx - radius / 2f, cy - halfHeight)
+                                lineTo(cx + radius / 2f, cy - halfHeight)
+                                close()
+                            }
+                            drawPath(hex, lineColor, style = Stroke(width = 1.dp.toPx()))
+                            col++
+                        }
+                        row++
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Text(
+                            text = "BeeKeep",
+                            style = MaterialTheme.typography.headlineLarge,
+                            color = BeeKeepAccent,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                        Text(
+                            text = "APIARY DASHBOARD",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color(0xFF524B45),
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 1.25.sp,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    if (bannerLogoBitmap != null) {
+                        Image(
+                            bitmap = bannerLogoBitmap.asImageBitmap(),
+                            contentDescription = "BeeKeep bee logo",
+                            contentScale = ContentScale.Fit,
+                            colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(BeeKeepAccent),
+                            modifier = Modifier.size(width = 82.dp, height = 98.dp)
+                        )
+                    } else {
+                        HoneybeeGlyph(Modifier.size(72.dp))
+                    }
                 }
             }
         }
         item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 MetricCard("Hives", hives.size.toString(), Modifier.weight(1f))
-                MetricCard("Watch", flagged.toString(), Modifier.weight(1f))
+                MetricCard("Apiaries", apiaries.size.toString(), Modifier.weight(1f))
             }
         }
         item {
-            Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary)) {
-                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text("Fast field scan", color = MaterialTheme.colorScheme.onPrimary, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-                        Text("Tap a hive tag and jump straight to its record.", color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .88f))
-                    }
-                    Button(onClick = onScan, shape = RoundedCornerShape(16.dp), colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onPrimary)) {
-                        Icon(Icons.Rounded.Nfc, null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(6.dp))
-                        Text("SCAN", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.ExtraBold)
-                    }
-                }
-            }
-        }
-        item {
-            Card(shape = RoundedCornerShape(24.dp)) {
-                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Hive lists are organized by apiary", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-                    Text("Open Apiaries to choose a yard, then see only the hives belonging to that apiary.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 48.dp, bottom = 30.dp),
+                horizontalArrangement = Arrangement.Center
+            ) {
+                HoneycombScanButton(scanning = scanning, onClick = onScan)
             }
         }
     }
@@ -949,12 +1415,14 @@ private fun ApiariesScreen(
     padding: androidx.compose.foundation.layout.PaddingValues,
     onAddApiary: () -> Unit,
     onEditApiary: (Apiary) -> Unit,
+    onOpenMap: (Apiary) -> Unit,
     onOpenApiary: (String) -> Unit
 ) {
-    val context = LocalContext.current
     var query by rememberSaveable { mutableStateOf("") }
     val filtered = apiaries.filter { it.name.contains(query, ignoreCase = true) }
 
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -967,10 +1435,19 @@ private fun ApiariesScreen(
             value = query,
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Search apiaries") },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
+            label = { Text("Search apiaries", color = Color(0xFF78350F)) },
+            leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Color(0xFF78350F)) },
             singleLine = true,
-            shape = RoundedCornerShape(16.dp)
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surface,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                focusedBorderColor = Color(0xFFD97706),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                cursorColor = Color(0xFFD97706)
+            )
         )
         Spacer(Modifier.height(10.dp))
         if (filtered.isEmpty()) {
@@ -986,11 +1463,17 @@ private fun ApiariesScreen(
             LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(filtered, key = { it.id }) { apiary ->
                     val count = hives.count { it.apiary.equals(apiary.name, ignoreCase = true) }
-                    Card(onClick = { onOpenApiary(apiary.name) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
+                    Card(
+                        onClick = { onOpenApiary(apiary.name) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(24.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                    ) {
                         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(52.dp)) {
+                            Surface(shape = RoundedCornerShape(16.dp), color = Color(0xFFFFE8C2), modifier = Modifier.size(52.dp)) {
                                 Box(contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Rounded.Yard, "Apiary", tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                                    Icon(Icons.Rounded.Yard, "Apiary", tint = Color(0xFF78350F))
                                 }
                             }
                             Spacer(Modifier.width(12.dp))
@@ -1002,10 +1485,9 @@ private fun ApiariesScreen(
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 IconButton(onClick = { onEditApiary(apiary) }) { Icon(Icons.Rounded.Edit, "Edit apiary ${apiary.name}") }
                                 if (apiary.latitude != null && apiary.longitude != null) {
-                                    IconButton(onClick = {
-                                        val uri = android.net.Uri.parse("geo:${apiary.latitude},${apiary.longitude}?q=${apiary.latitude},${apiary.longitude}(${android.net.Uri.encode(apiary.name)})")
-                                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
-                                    }) { Icon(Icons.Rounded.LocationOn, "Open apiary location in maps") }
+                                    IconButton(onClick = { onOpenMap(apiary) }) {
+                                        Icon(Icons.Rounded.LocationOn, "View ${apiary.name} on satellite map")
+                                    }
                                 } else {
                                     Icon(Icons.Rounded.ChevronRight, "Open apiary", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(12.dp))
                                 }
@@ -1016,8 +1498,807 @@ private fun ApiariesScreen(
             }
         }
     }
+    }
 }
 
+@Composable
+private fun ApiaryMapScreen(
+    apiaries: List<Apiary>,
+    padding: PaddingValues,
+    initialFocusApiaryId: Long?,
+    locationController: LocationController,
+    onBack: () -> Unit
+) {
+    BackHandler { onBack() }
+    var focusedApiaryId by rememberSaveable(initialFocusApiaryId) {
+        mutableStateOf(initialFocusApiaryId)
+    }
+    var currentLocation by remember { mutableStateOf<LocationController.Result?>(null) }
+    var locationMessage by remember { mutableStateOf<String?>(null) }
+
+    fun applyCurrentLocation(location: LocationController.Result?) {
+        if (location == null) {
+            currentLocation = null
+            locationMessage = "Couldn't get your location. Make sure Location is enabled and try again."
+        } else {
+            currentLocation = location
+            focusedApiaryId = null
+            locationMessage = null
+        }
+    }
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val granted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            result[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (granted) {
+            locationController.current { location -> applyCurrentLocation(location) }
+        } else {
+            locationMessage = "Location permission is needed to show your current position."
+        }
+    }
+
+    fun showMyLocation() {
+        locationMessage = "Finding your location…"
+        if (locationController.hasPermission()) {
+            locationController.current { location -> applyCurrentLocation(location) }
+        } else {
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    val locatedApiaries = apiaries.filter { it.latitude != null && it.longitude != null }
+    val focusedId = focusedApiaryId?.takeIf { id -> locatedApiaries.any { it.id == id } }
+
+    // The map is the full screen content layer. Controls are overlays, not rows
+    // that take height away from the actual AndroidView/WebView canvas.
+    Box(
+        Modifier
+            .fillMaxSize()
+            .padding(padding)
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        ApiarySatelliteMap(
+            apiaries = locatedApiaries,
+            focusedApiaryId = focusedId,
+            currentLocation = currentLocation,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(4.dp)
+                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(22.dp))
+        )
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+            tonalElevation = 4.dp,
+            shadowElevation = 3.dp
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 4.dp, end = 8.dp, top = 2.dp, bottom = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.Rounded.ArrowBack, "Back")
+                }
+                Column(
+                    Modifier.weight(1f).padding(vertical = 5.dp),
+                    verticalArrangement = Arrangement.spacedBy(1.dp)
+                ) {
+                    Text(
+                        "Apiary Map",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        "${locatedApiaries.size} of ${apiaries.size} apiaries have GPS pins",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = {
+                    focusedApiaryId = null
+                    currentLocation = null
+                    locationMessage = null
+                }) {
+                    Icon(Icons.Rounded.GpsFixed, "Show all saved apiary locations")
+                }
+            }
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 14.dp),
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            tonalElevation = 5.dp,
+            shadowElevation = 4.dp,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+        ) {
+            IconButton(
+                onClick = { showMyLocation() },
+                modifier = Modifier.size(52.dp)
+            ) {
+                Icon(
+                    Icons.Rounded.MyLocation,
+                    contentDescription = "My location",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(25.dp)
+                )
+            }
+        }
+
+        if (locationMessage != null) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 150.dp, start = 16.dp, end = 16.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+                tonalElevation = 4.dp
+            ) {
+                Text(
+                    locationMessage.orEmpty(),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+
+        if (locatedApiaries.isEmpty()) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                tonalElevation = 4.dp,
+                shadowElevation = 3.dp
+            ) {
+                Column(
+                    Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Text("No saved GPS pins yet", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Edit an apiary and capture its current GPS to place it on the map.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .fillMaxWidth()
+                    // Place apiary cards immediately below the floating title bar so
+                    // they never cover MapLibre's bottom attribution control.
+                    .padding(start = 10.dp, end = 10.dp, top = 82.dp, bottom = 8.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                locatedApiaries.forEach { apiary ->
+                    val isFocused = focusedId == apiary.id
+                    Surface(
+                        modifier = Modifier
+                            .width(174.dp)
+                            .clickable {
+                                currentLocation = null
+                                locationMessage = null
+                                focusedApiaryId = apiary.id
+                            },
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (isFocused) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.97f)
+                        } else {
+                            MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+                        },
+                        border = if (isFocused) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+                        tonalElevation = 3.dp,
+                        shadowElevation = 2.dp
+                    ) {
+                        Column(
+                            Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                apiary.name,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.labelLarge,
+                                maxLines = 1
+                            )
+                            Text(
+                                "${"%.4f".format(Locale.US, apiary.latitude)}, ${"%.4f".format(Locale.US, apiary.longitude)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private data class ApiaryMapWebViewState(
+    val htmlHash: Int,
+    val currentLocation: LocationController.Result?
+)
+
+@Composable
+private fun ApiarySatelliteMap(
+    apiaries: List<Apiary>,
+    focusedApiaryId: Long?,
+    currentLocation: LocationController.Result?,
+    modifier: Modifier = Modifier
+) {
+    // Keep the WebView and MapLibre map alive when only the GPS position changes.
+    // The location button should move the existing map, not reload the entire page.
+    val html = remember(apiaries, focusedApiaryId) {
+        createApiaryMapHtml(apiaries, focusedApiaryId)
+    }
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = false
+                settings.allowFileAccess = false
+                settings.javaScriptCanOpenWindowsAutomatically = false
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String?) {
+                        super.onPageFinished(view, url)
+                        // Re-apply the latest GPS after any map HTML refresh. The JS
+                        // function queues the location if MapLibre has not loaded yet.
+                        val location = (view.tag as? ApiaryMapWebViewState)?.currentLocation
+                        if (location != null) {
+                            view.evaluateJavascript(
+                                "window.beekeepQueueLocation && window.beekeepQueueLocation(${location.latitude}, ${location.longitude});",
+                                null
+                            )
+                        }
+                    }
+                }
+                setBackgroundColor(android.graphics.Color.rgb(231, 232, 228))
+                isVerticalScrollBarEnabled = false
+                isHorizontalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                tag = ApiaryMapWebViewState(html.hashCode(), currentLocation)
+                // Compose can resize AndroidView without firing a browser window resize.
+                // Notify MapLibre whenever the native WebView viewport changes size.
+                addOnLayoutChangeListener { view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                    if ((right - left) != (oldRight - oldLeft) ||
+                        (bottom - top) != (oldBottom - oldTop)
+                    ) {
+                        view.post {
+                            (view as? WebView)?.evaluateJavascript(
+                                "window.beekeepResizeMap && window.beekeepResizeMap();",
+                                null
+                            )
+                        }
+                    }
+                }
+                loadDataWithBaseURL("https://beekeep.local/map/", html, "text/html", "UTF-8", null)
+            }
+        },
+        update = { webView ->
+            val htmlHash = html.hashCode()
+            val previous = webView.tag as? ApiaryMapWebViewState
+            if (previous == null || previous.htmlHash != htmlHash) {
+                // A changed apiary list or selected apiary requires fresh map content.
+                // Store the latest GPS so onPageFinished can restore it after loading.
+                webView.tag = ApiaryMapWebViewState(htmlHash, currentLocation)
+                webView.loadDataWithBaseURL("https://beekeep.local/map/", html, "text/html", "UTF-8", null)
+            } else if (previous.currentLocation != currentLocation) {
+                webView.tag = ApiaryMapWebViewState(htmlHash, currentLocation)
+                if (currentLocation != null) {
+                    webView.evaluateJavascript(
+                        "window.beekeepQueueLocation && window.beekeepQueueLocation(${currentLocation.latitude}, ${currentLocation.longitude});",
+                        null
+                    )
+                } else {
+                    webView.evaluateJavascript(
+                        "window.beekeepClearCurrentLocation && window.beekeepClearCurrentLocation();",
+                        null
+                    )
+                }
+            }
+        }
+    )
+}
+
+private fun createApiaryMapHtml(
+    apiaries: List<Apiary>,
+    focusedApiaryId: Long?
+): String {
+    val located = apiaries.filter { it.latitude != null && it.longitude != null }
+    val markers = JSONArray()
+    located.forEach { apiary ->
+        markers.put(
+            JSONObject()
+                .put("id", apiary.id.toString())
+                .put("name", apiary.name)
+                .put("lat", apiary.latitude)
+                .put("lon", apiary.longitude)
+        )
+    }
+    val focus = located.firstOrNull { it.id == focusedApiaryId }
+    val centerLat = focus?.latitude
+        ?: if (located.isNotEmpty()) located.mapNotNull { it.latitude }.average() else 20.0
+    val centerLon = focus?.longitude
+        ?: if (located.isNotEmpty()) located.mapNotNull { it.longitude }.average() else 0.0
+    val initialZoom = when {
+        focus != null -> 17
+        located.size == 1 -> 16
+        located.size > 1 -> 5
+        else -> 2
+    }
+    val focusIdJson = focusedApiaryId?.takeIf { id -> located.any { it.id == id } }
+        ?.let { JSONObject.quote(it.toString()) } ?: "null"
+
+    return """
+        <!doctype html>
+        <html lang="en">
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+            <meta charset="utf-8">
+            <link rel="stylesheet"
+                  href="https://unpkg.com/maplibre-gl@5.12.0/dist/maplibre-gl.css"
+                  onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/maplibre-gl@5.12.0/dist/maplibre-gl.css';">
+            <style>
+                /*
+                 * Use the standard full-viewport sizing expected by MapLibre GL JS.
+                 * The native AndroidView already sizes this WebView to the map box;
+                 * a fixed child anchored to the WebView viewport then fills that box.
+                 */
+                html, body {
+                    width: 100%; height: 100%;
+                    padding: 0; margin: 0; overflow: hidden;
+                }
+                body { font-family: Arial, sans-serif; }
+                #map-shell {
+                    position: fixed; left: 0; top: 0; right: 0; bottom: 0;
+                    display: block; width: 100%; height: 100%;
+                    padding: 0; margin: 0;
+                    background: #e7e8e4; border-radius: 22px; overflow: hidden;
+                }
+                /* MapLibre requires its target container to have no child elements. */
+                #map {
+                    position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+                    display: block; width: 100%; height: 100%;
+                    padding: 0; margin: 0; background: #e7e8e4; overflow: hidden;
+                }
+                .map-error {
+                    position: absolute; inset: 0; z-index: 20;
+                    display: flex; padding: 24px; box-sizing: border-box;
+                    align-items: center; justify-content: center;
+                    text-align: center; color: #2d332d; background: #f2f1eb;
+                    font-size: 14px; line-height: 1.5;
+                }
+                .apiary-marker { position: relative; width: 36px; height: 42px; cursor: pointer; }
+                .apiary-ping {
+                    position: absolute; left: 5px; top: 2px; width: 26px; height: 26px;
+                    border: 2px solid #d97706; border-radius: 50%; box-sizing: border-box;
+                    animation: apiaryPing 1.8s ease-out infinite; pointer-events: none;
+                }
+                .apiary-pin {
+                    position: absolute; left: 7px; top: 4px; width: 22px; height: 22px;
+                    border-radius: 50% 50% 50% 0; transform: rotate(-45deg);
+                    background: #f59e0b; border: 3px solid #fff;
+                    box-shadow: 0 2px 7px rgba(0,0,0,.55); box-sizing: border-box;
+                }
+                .apiary-pin:after {
+                    content: ''; position: absolute; width: 7px; height: 7px;
+                    top: 4px; left: 4px; background: #fff; border-radius: 50%;
+                }
+                @keyframes apiaryPing {
+                    0% { transform: scale(.65); opacity: .95; }
+                    100% { transform: scale(1.9); opacity: 0; }
+                }
+                .apiary-popup-title { font-weight: 700; margin-bottom: 4px; }
+                .apiary-popup-coords { color: #60645e; font-size: 12px; }
+                .maplibregl-ctrl-attrib { font-size: 10px !important; }
+            </style>
+        </head>
+        <body>
+            <div id="map-shell">
+                <div id="map"></div>
+                <div id="map-error" class="map-error" role="status">
+                    Connecting to OpenFreeMap…
+                </div>
+            </div>
+            <script>
+                (function () {
+                    const apiaries = $markers;
+                    const focusedId = $focusIdJson;
+                    const errorPanel = document.getElementById('map-error');
+                    let mapReady = false;
+                    let tileErrors = 0;
+                    window.beekeepPendingLocation = null;
+
+                    // This entry point is available even while MapLibre's library/style is
+                    // still loading. The camera move is applied as soon as the map is ready.
+                    window.beekeepQueueLocation = function (latitude, longitude) {
+                        const lat = Number(latitude);
+                        const lon = Number(longitude);
+                        if (!Number.isFinite(lat) || !Number.isFinite(lon) ||
+                            lat < -85.051129 || lat > 85.051129 || lon < -180 || lon > 180) return;
+                        window.beekeepPendingLocation = { lat: lat, lon: lon };
+                        if (typeof window.beekeepApplyCurrentLocation === 'function') {
+                            window.beekeepApplyCurrentLocation(window.beekeepPendingLocation, true);
+                        }
+                    };
+                    window.beekeepClearCurrentLocation = function () {
+                        window.beekeepPendingLocation = null;
+                        if (typeof window.beekeepRemoveCurrentLocation === 'function') {
+                            window.beekeepRemoveCurrentLocation();
+                        }
+                    };
+
+                    function showMapError(message) {
+                        errorPanel.textContent = message;
+                        errorPanel.style.display = 'flex';
+                    }
+
+                    function initializeMap() {
+                        if (!window.maplibregl) {
+                            showMapError('The map controls could not be loaded. Check your internet connection and reopen this map.');
+                            return;
+                        }
+                        if (typeof window.maplibregl.supported === 'function' && !window.maplibregl.supported()) {
+                            showMapError('This device does not support the graphics features needed for the map. Please update Android System WebView and try again.');
+                            return;
+                        }
+
+                        try {
+                            const map = new maplibregl.Map({
+                                container: 'map',
+                                style: 'https://tiles.openfreemap.org/styles/liberty',
+                                center: [$centerLon, $centerLat],
+                                zoom: $initialZoom,
+                                attributionControl: true,
+                                fadeDuration: 0,
+                                // Let MapLibre use the device pixel ratio and its default
+                                // 4096px canvas safety limit; a smaller fixed backing canvas
+                                // can leave part of the viewport unrendered on some devices.
+                                maxCanvasSize: [4096, 4096],
+                                trackResize: true
+                            });
+                            // Keep apiary coordinates in a single GeoJSON source. Pins are
+                            // rendered by MapLibre's WebGL layers rather than separate DOM
+                            // elements, preventing marker/canvas drift during zoom animations.
+                            const points = [];
+                            const apiaryFeatures = apiaries.map(function (apiary) {
+                                const longitude = Number(apiary.lon);
+                                const latitude = Number(apiary.lat);
+                                if (!Number.isFinite(longitude) || !Number.isFinite(latitude) ||
+                                    longitude < -180 || longitude > 180 ||
+                                    latitude < -85.051129 || latitude > 85.051129) return null;
+                                const point = [longitude, latitude];
+                                points.push(point);
+                                return {
+                                    type: 'Feature',
+                                    properties: {
+                                        id: String(apiary.id),
+                                        name: String(apiary.name || '')
+                                    },
+                                    geometry: {
+                                        type: 'Point',
+                                        coordinates: point
+                                    }
+                                };
+                            }).filter(Boolean);
+
+                            function createApiaryPopup(name, longitude, latitude) {
+                                const popupContent = document.createElement('div');
+                                const title = document.createElement('div');
+                                title.className = 'apiary-popup-title';
+                                title.textContent = name;
+                                const coordinates = document.createElement('div');
+                                coordinates.className = 'apiary-popup-coords';
+                                coordinates.textContent = latitude.toFixed(5) + ', ' + longitude.toFixed(5);
+                                popupContent.appendChild(title);
+                                popupContent.appendChild(coordinates);
+                                return popupContent;
+                            }
+
+                            map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+
+                            function resizeMapViewport() {
+                                // Wait for Android/Compose, CSS layout, and the WebGL canvas
+                                // to settle, then remeasure the entire available map viewport.
+                                window.requestAnimationFrame(function () {
+                                    const container = map.getContainer();
+                                    // Let MapLibre size its internal canvas from the measured
+                                    // container. Manually setting its wrapper can prevent style
+                                    // reloads and responsive sizing from recovering correctly.
+                                    if (container && container.clientWidth > 0 && container.clientHeight > 0) {
+                                        map.resize();
+                                    }
+                                    window.requestAnimationFrame(function () {
+                                        map.resize();
+                                    });
+                                });
+                            }
+                            window.beekeepResizeMap = resizeMapViewport;
+
+                            function applyCurrentLocation(location, animate) {
+                                if (!location) return;
+                                const longitude = Number(location.lon);
+                                const latitude = Number(location.lat);
+                                if (!Number.isFinite(longitude) || !Number.isFinite(latitude) ||
+                                    longitude < -180 || longitude > 180 ||
+                                    latitude < -85.051129 || latitude > 85.051129) return;
+
+                                const userPoint = [longitude, latitude];
+                                const locationData = {
+                                    type: 'Feature',
+                                    properties: {},
+                                    geometry: { type: 'Point', coordinates: userPoint }
+                                };
+                                const locationSource = map.getSource('beekeep-current-location');
+                                if (locationSource) {
+                                    locationSource.setData(locationData);
+                                } else {
+                                    map.addSource('beekeep-current-location', {
+                                        type: 'geojson',
+                                        data: locationData
+                                    });
+                                    map.addLayer({
+                                        id: 'beekeep-current-location-halo',
+                                        type: 'circle',
+                                        source: 'beekeep-current-location',
+                                        paint: {
+                                            'circle-radius': 15,
+                                            'circle-color': '#2563EB',
+                                            'circle-opacity': 0.20
+                                        }
+                                    });
+                                    map.addLayer({
+                                        id: 'beekeep-current-location-dot',
+                                        type: 'circle',
+                                        source: 'beekeep-current-location',
+                                        paint: {
+                                            'circle-radius': 7,
+                                            'circle-color': '#2563EB',
+                                            'circle-stroke-color': '#FFFFFF',
+                                            'circle-stroke-width': 2.5
+                                        }
+                                    });
+                                }
+
+                                window.beekeepPendingLocation = { lat: latitude, lon: longitude };
+                                if (animate) {
+                                    map.flyTo({ center: userPoint, zoom: 15, duration: 650 });
+                                } else {
+                                    map.jumpTo({ center: userPoint, zoom: 15 });
+                                }
+                            }
+                            window.beekeepApplyCurrentLocation = function (location, animate) {
+                                if (!mapReady) {
+                                    window.beekeepPendingLocation = location;
+                                    return;
+                                }
+                                applyCurrentLocation(location, animate);
+                            };
+                            window.beekeepRemoveCurrentLocation = function () {
+                                if (!mapReady) return;
+                                if (map.getLayer('beekeep-current-location-dot')) {
+                                    map.removeLayer('beekeep-current-location-dot');
+                                }
+                                if (map.getLayer('beekeep-current-location-halo')) {
+                                    map.removeLayer('beekeep-current-location-halo');
+                                }
+                                if (map.getSource('beekeep-current-location')) {
+                                    map.removeSource('beekeep-current-location');
+                                }
+                            };
+
+                            if (window.ResizeObserver) {
+                                const resizeObserver = new ResizeObserver(resizeMapViewport);
+                                resizeObserver.observe(document.getElementById('map-shell'));
+                                resizeObserver.observe(document.getElementById('map'));
+                            }
+
+                            map.on('load', function () {
+                                mapReady = true;
+                                errorPanel.style.display = 'none';
+                                resizeMapViewport();
+                                window.setTimeout(resizeMapViewport, 80);
+                                window.setTimeout(resizeMapViewport, 250);
+                                window.setTimeout(resizeMapViewport, 600);
+
+                                // Draw pins in the map's own projection/render loop so they
+                                // remain attached to their real geographic coordinates at all zooms.
+                                const pinCanvas = document.createElement('canvas');
+                                pinCanvas.width = 72;
+                                pinCanvas.height = 84;
+                                const ctx = pinCanvas.getContext('2d');
+                                if (ctx) {
+                                    ctx.lineJoin = 'round';
+                                    ctx.lineCap = 'round';
+                                    ctx.beginPath();
+                                    ctx.moveTo(36, 82);
+                                    ctx.bezierCurveTo(29, 70, 7, 48, 7, 30);
+                                    ctx.arc(36, 30, 28, Math.PI, 0, false);
+                                    ctx.bezierCurveTo(65, 48, 43, 70, 36, 82);
+                                    ctx.closePath();
+                                    ctx.fillStyle = '#F59E0B';
+                                    ctx.fill();
+                                    ctx.lineWidth = 5;
+                                    ctx.strokeStyle = '#FFFFFF';
+                                    ctx.stroke();
+                                    ctx.beginPath();
+                                    ctx.arc(36, 30, 8, 0, Math.PI * 2);
+                                    ctx.fillStyle = '#FFFFFF';
+                                    ctx.fill();
+                                }
+                                if (!map.hasImage('beekeep-apiary-pin')) {
+                                    // MapLibre's addImage accepts ImageData (not a raw canvas).
+                                    map.addImage(
+                                        'beekeep-apiary-pin',
+                                        ctx.getImageData(0, 0, pinCanvas.width, pinCanvas.height),
+                                        { pixelRatio: 2 }
+                                    );
+                                }
+
+                                map.addSource('beekeep-apiaries', {
+                                    type: 'geojson',
+                                    data: {
+                                        type: 'FeatureCollection',
+                                        features: apiaryFeatures
+                                    }
+                                });
+                                map.addLayer({
+                                    id: 'beekeep-apiary-halos',
+                                    type: 'circle',
+                                    source: 'beekeep-apiaries',
+                                    paint: {
+                                        'circle-radius': 15,
+                                        'circle-color': '#F59E0B',
+                                        'circle-opacity': 0.22
+                                    }
+                                });
+                                map.addLayer({
+                                    id: 'beekeep-apiary-pins',
+                                    type: 'symbol',
+                                    source: 'beekeep-apiaries',
+                                    layout: {
+                                        'icon-image': 'beekeep-apiary-pin',
+                                        'icon-anchor': 'bottom',
+                                        'icon-size': 1,
+                                        'icon-allow-overlap': true,
+                                        'icon-ignore-placement': true
+                                    }
+                                });
+
+                                map.on('click', 'beekeep-apiary-pins', function (event) {
+                                    const feature = event.features && event.features[0];
+                                    if (!feature || !feature.geometry || feature.geometry.type !== 'Point') return;
+                                    const coordinates = feature.geometry.coordinates.slice();
+                                    const properties = feature.properties || {};
+                                    const longitude = Number(coordinates[0]);
+                                    const latitude = Number(coordinates[1]);
+                                    new maplibregl.Popup({ offset: 36 })
+                                        .setLngLat(coordinates)
+                                        .setDOMContent(createApiaryPopup(
+                                            String(properties.name || 'Apiary'),
+                                            longitude,
+                                            latitude
+                                        ))
+                                        .addTo(map);
+                                });
+                                map.on('mouseenter', 'beekeep-apiary-pins', function () {
+                                    map.getCanvas().style.cursor = 'pointer';
+                                });
+                                map.on('mouseleave', 'beekeep-apiary-pins', function () {
+                                    map.getCanvas().style.cursor = '';
+                                });
+
+                                const focused = focusedId === null ? null : apiaries.find(function (a) {
+                                    return String(a.id) === String(focusedId);
+                                });
+                                if (window.beekeepPendingLocation) {
+                                    // A GPS request can arrive before the style finishes loading;
+                                    // consume the queued position now and move the camera last.
+                                    applyCurrentLocation(window.beekeepPendingLocation, false);
+                                } else if (focused && Number.isFinite(Number(focused.lon)) && Number.isFinite(Number(focused.lat))) {
+                                    const focusedCoordinates = [Number(focused.lon), Number(focused.lat)];
+                                    map.flyTo({
+                                        center: focusedCoordinates,
+                                        zoom: 17,
+                                        duration: 450
+                                    });
+                                    new maplibregl.Popup({ offset: 36 })
+                                        .setLngLat(focusedCoordinates)
+                                        .setDOMContent(createApiaryPopup(
+                                            String(focused.name || 'Apiary'),
+                                            focusedCoordinates[0],
+                                            focusedCoordinates[1]
+                                        ))
+                                        .addTo(map);
+                                } else if (points.length === 1) {
+                                    map.jumpTo({ center: points[0], zoom: 16 });
+                                } else if (points.length > 1) {
+                                    const bounds = new maplibregl.LngLatBounds();
+                                    points.forEach(function (point) { bounds.extend(point); });
+                                    map.fitBounds(bounds, { padding: 44, maxZoom: 15, duration: 400 });
+                                }
+                            });
+
+                            map.on('error', function (event) {
+                                const detail = event && event.error && event.error.message
+                                    ? event.error.message : 'Unknown map loading error';
+                                console.warn('BeeKeep OpenFreeMap error: ' + detail);
+                                if (!mapReady) {
+                                    tileErrors += 1;
+                                    if (tileErrors >= 3) {
+                                        showMapError('OpenFreeMap could not load its map style or tiles. Check your internet connection, then reopen the map. Details: ' + detail);
+                                    }
+                                }
+                            });
+
+                            window.setTimeout(function () {
+                                if (!mapReady) {
+                                    showMapError('OpenFreeMap is taking too long to load. Check your internet connection and try again.');
+                                }
+                            }, 15000);
+                            window.addEventListener('resize', resizeMapViewport);
+                            window.addEventListener('orientationchange', function () {
+                                window.setTimeout(resizeMapViewport, 100);
+                                window.setTimeout(resizeMapViewport, 450);
+                            });
+                            window.setTimeout(resizeMapViewport, 100);
+                            window.setTimeout(resizeMapViewport, 300);
+                            window.setTimeout(resizeMapViewport, 800);
+                        } catch (error) {
+                            console.error('BeeKeep could not initialize the map', error);
+                            showMapError('The map could not be started on this device. Update Android System WebView and try again.');
+                        }
+                    }
+
+                    function loadMapLibrary(index) {
+                        const sources = [
+                            'https://unpkg.com/maplibre-gl@5.12.0/dist/maplibre-gl.js',
+                            'https://cdn.jsdelivr.net/npm/maplibre-gl@5.12.0/dist/maplibre-gl.js'
+                        ];
+                        if (index >= sources.length) {
+                            showMapError('The map library could not be downloaded. Check your internet connection and reopen this map.');
+                            return;
+                        }
+                        const script = document.createElement('script');
+                        script.src = sources[index];
+                        script.onload = function () {
+                            if (window.maplibregl) initializeMap();
+                            else loadMapLibrary(index + 1);
+                        };
+                        script.onerror = function () { loadMapLibrary(index + 1); };
+                        document.head.appendChild(script);
+                    }
+
+                    loadMapLibrary(0);
+                })();
+            </script>
+        </body>
+        </html>
+    """.trimIndent()
+}
 @Composable
 private fun ApiaryHivesScreen(
     apiaryName: String,
@@ -1031,6 +2312,8 @@ private fun ApiaryHivesScreen(
     var query by rememberSaveable(apiaryName) { mutableStateOf("") }
     val filtered = hives.filter { it.number.contains(query, ignoreCase = true) }
 
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(padding).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBack, "Back to apiaries") }
@@ -1044,10 +2327,19 @@ private fun ApiaryHivesScreen(
             value = query,
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Search hive number") },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
+            label = { Text("Search hive number", color = Color(0xFF78350F)) },
+            leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Color(0xFF78350F)) },
             singleLine = true,
-            shape = RoundedCornerShape(16.dp)
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surface,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                focusedBorderColor = Color(0xFFD97706),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                cursorColor = Color(0xFFD97706)
+            )
         )
         Spacer(Modifier.height(10.dp))
         if (filtered.isEmpty()) {
@@ -1067,22 +2359,54 @@ private fun ApiaryHivesScreen(
             }
         }
     }
+    }
 }
 
 @Composable
 private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit) {
-    val attention = hive.mitePercent >= 3.0 || hive.queenStatus == "Queenless"
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), border = if (attention) androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = .35f)) else null) {
+    // The Apiaries hive list now highlights the colony's strength rather than mite percentage.
+    val strengthGrade = ColonyStrength.gradeFromStored(hive.strength)
+    val strengthColor = when (strengthGrade) {
+        1 -> Color(0xFFB91C1C) // Very Weak: red
+        2 -> Color(0xFFEA580C) // Weak: orange
+        3 -> Color(0xFFCA8A04) // Moderate: yellow
+        4 -> Color(0xFF65A30D) // Strong: light green
+        else -> Color(0xFF166534) // Very strong: dark green
+    }
+    val attention = hive.queenStatus == "Queenless" || strengthGrade <= 2
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        border = BorderStroke(
+            1.dp,
+            if (attention) MaterialTheme.colorScheme.error.copy(alpha = 0.45f)
+            else MaterialTheme.colorScheme.outline
+        ),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text("Hive ${hive.number}", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
                 Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("Queen ${hive.queenStatus} • Strength ${hive.strength}/10", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                Text("Queen ${hive.queenStatus}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 supporting?.let { Text(it, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
             }
-            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("${String.format(Locale.US, "%.1f", hive.mitePercent)}%", fontWeight = FontWeight.ExtraBold, color = if (attention) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-                Icon(Icons.Rounded.ChevronRight, "Open hive", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Column(
+                Modifier.clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFFFFF1D6))
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    ColonyStrength.labelForGrade(strengthGrade),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = strengthColor,
+                    maxLines = 1
+                )
+                Icon(Icons.Rounded.ChevronRight, "Open hive", tint = Color(0xFF78350F))
             }
         }
     }
@@ -1156,6 +2480,7 @@ private fun HiveDetailScreen(
     nfc: NfcController,
     activity: ComponentActivity,
     onBack: () -> Unit,
+    onHome: () -> Unit,
     onInspect: () -> Unit,
     onFeed: () -> Unit,
     onTreat: () -> Unit,
@@ -1163,30 +2488,15 @@ private fun HiveDetailScreen(
     onTag: (String, (Boolean, String?) -> Unit) -> Unit,
     onClearTag: () -> Unit,
     onVerifyTag: () -> Unit,
-    onEditQueen: (String, String, String, Int?, Int) -> Unit,
     onMarkDead: () -> Unit,
     onRestore: () -> Unit,
     onDelete: () -> Unit
 ) {
     var writeStatus by rememberSaveable { mutableStateOf("") }
-    var editQueen by rememberSaveable { mutableStateOf(false) }
+    var showRecentActivity by rememberSaveable(hive.id) { mutableStateOf(false) }
     var confirmDead by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
     BackHandler { onBack() }
-    val recent = inspections.take(6).reversed()
-    val photoInspections = inspections.filter { !it.photoPath.isNullOrBlank() }.take(6)
-
-    if (editQueen) {
-        QueenProfileDialog(
-            hive = hive,
-            onDismiss = { editQueen = false },
-            onSave = { status, mark, origin, age, temperament ->
-                onEditQueen(status, mark, origin, age, temperament)
-                editQueen = false
-            }
-        )
-        return
-    }
 
     if (confirmDead) {
         AlertDialog(
@@ -1206,7 +2516,8 @@ private fun HiveDetailScreen(
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("CANCEL") } }
         )
     }
-
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -1217,7 +2528,12 @@ private fun HiveDetailScreen(
                 Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
                 Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
-            HiveStatusPill(hive)
+            if (hive.isDead || hive.queenStatus == "Queenless" || hive.mitePercent >= 3.0) {
+                HiveStatusPill(hive)
+            }
+            IconButton(onClick = onHome) {
+                Icon(Icons.Rounded.Home, contentDescription = "Home")
+            }
         }
 
         if (hive.isDead) {
@@ -1234,124 +2550,234 @@ private fun HiveDetailScreen(
         }
 
         if (!hive.isDead) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Button(
-                    onClick = onInspect,
-                    modifier = Modifier.weight(1.3f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(horizontal = 6.dp)
+            Button(
+                onClick = onInspect,
+                modifier = Modifier.fillMaxWidth().height(68.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(Color(0xFFD97706), Color(0xFFF59E0B))
+                        )
+                    ),
+                shape = RoundedCornerShape(20.dp),
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = Color.White,
+                    disabledContainerColor = Color.Transparent,
+                    disabledContentColor = Color.White.copy(alpha = 0.72f)
+                ),
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
+            ) {
+                Icon(Icons.Rounded.TaskAlt, null, modifier = Modifier.size(25.dp))
+                Spacer(Modifier.width(10.dp))
+                Column(
+                    Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    Icon(Icons.Rounded.TaskAlt, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("INSPECT", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                    Text("INSPECT HIVE", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
+                    Text("Open a new inspection", style = MaterialTheme.typography.bodySmall)
                 }
+                Icon(Icons.Rounded.ChevronRight, null, modifier = Modifier.size(22.dp))
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = onFeed,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("FEED", style = MaterialTheme.typography.labelMedium) }
+                    modifier = Modifier.weight(1f).height(46.dp),
+                    shape = CircleShape,
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFF78350F)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFB45309)),
+                    contentPadding = PaddingValues(horizontal = 4.dp)
+                ) { Text("FEED", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
                 OutlinedButton(
                     onClick = onTreat,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("TREAT", style = MaterialTheme.typography.labelMedium) }
+                    modifier = Modifier.weight(1f).height(46.dp),
+                    shape = CircleShape,
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFF78350F)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFB45309)),
+                    contentPadding = PaddingValues(horizontal = 4.dp)
+                ) { Text("TREAT", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
                 OutlinedButton(
                     onClick = onHarvest,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("HARVEST", style = MaterialTheme.typography.labelMedium) }
+                    modifier = Modifier.weight(1f).height(46.dp),
+                    shape = CircleShape,
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFF78350F)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFB45309)),
+                    contentPadding = PaddingValues(horizontal = 4.dp)
+                ) { Text("HARVEST", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+        ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    CompactStatItem("Strength", "${hive.strength}/10", Modifier.weight(1f))
+                    Column(
+                        Modifier.weight(1f),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            ColonyStrength.labelFromStored(hive.strength),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
                     CompactStatItem("Mites", "${String.format(Locale.US, "%.2f", hive.mitePercent)}%", Modifier.weight(1f))
                     CompactStatItem("Inspections", inspections.size.toString(), Modifier.weight(1f))
                 }
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("Queen profile", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                        Text("• ${hive.queenStatus}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("Records", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
+                        Text("Feeding, treatment and harvest history", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text(
-                        "${hive.queenMarkColor.ifBlank { "No mark" }} • ${hive.queenOrigin.ifBlank { "Origin n/a" }} • ${hive.queenAgeMonths?.let { "${it}mo" } ?: "Age n/a"} • Temp ${hive.queenTemperament}/5",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Icon(Icons.Rounded.History, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(
+                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 9.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp)
+                    ) {
+                        Text(feedings.size.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                        Text("FEEDINGS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                    Column(
+                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 9.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp)
+                    ) {
+                        Text(treatments.size.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                        Text("TREATMENTS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                    Column(
+                        Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 9.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp)
+                    ) {
+                        Text(harvests.size.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                        Text("HARVESTS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                }
+                val lastRecordLines = buildList {
+                    feedings.firstOrNull()?.let { add("Last feed  ·  ${it.amount} ${it.unit} • ${it.feedType}") }
+                    treatments.firstOrNull()?.let { add("Last treatment  ·  ${it.product}") }
+                    harvests.firstOrNull()?.let { add("Last harvest  ·  ${it.dryHoneyWeight} ${it.weightUnit}") }
+                }
+                if (lastRecordLines.isNotEmpty()) {
+                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f))
+                    lastRecordLines.forEach { line ->
+                        Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                } else {
+                    Text("No feeding, treatment or harvest records yet.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (hive.isDead) {
+                    OutlinedButton(onClick = onRestore, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("RESTORE COLONY", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
+                } else {
+                    OutlinedButton(
+                        onClick = { confirmDead = true },
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surface,
+                            contentColor = Color(0xFFB91C1C)
+                        ),
+                        border = BorderStroke(1.dp, Color(0xFFD9A7A0))
+                    ) { Text("MARK COLONY DEAD", fontWeight = FontWeight.Bold, color = Color(0xFFB91C1C), style = MaterialTheme.typography.labelMedium) }
                 }
                 OutlinedButton(
-                    onClick = { editQueen = true },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                    modifier = Modifier.height(32.dp),
-                    shape = RoundedCornerShape(12.dp)
+                    onClick = { confirmDelete = true },
+                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        contentColor = Color(0xFFB91C1C)
+                    ),
+                    border = BorderStroke(1.dp, Color(0xFFD9A7A0))
                 ) {
-                    Text("EDIT", style = MaterialTheme.typography.labelSmall)
+                    Text("DELETE HIVE PERMANENTLY", color = Color(0xFFB91C1C), style = MaterialTheme.typography.labelSmall)
                 }
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Strength & mite trend", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                if (recent.isEmpty()) {
-                    Text("Complete a few inspections to see trends.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                } else {
-                    Row(Modifier.fillMaxWidth().height(80.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        recent.forEach { item ->
-                            val height = (16 + item.strength.coerceIn(0, 10) * 5).dp
-                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
-                                Text("${item.strength}", style = MaterialTheme.typography.labelSmall)
-                                Box(Modifier.width(20.dp).height(height).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp)))
-                                Text(DateFormat.getDateInstance(DateFormat.SHORT).format(Date(item.createdAt)), style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().clickable { showRecentActivity = !showRecentActivity }.padding(vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("Recent Activity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            if (events.isEmpty() && inspections.isEmpty()) "No activity recorded yet" else "${events.size} events • ${inspections.size} inspections",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
-                    val latestMite = recent.last().mitePercent
-                    Text("Latest mite rate ${String.format(Locale.US, "%.2f", latestMite)}%", style = MaterialTheme.typography.bodySmall, color = if (latestMite >= 3.0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                    TextButton(
+                        onClick = { showRecentActivity = !showRecentActivity },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(if (showRecentActivity) "HIDE" else "SHOW", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                        Icon(
+                            Icons.Rounded.ChevronRight,
+                            contentDescription = if (showRecentActivity) "Hide recent activity" else "Show recent activity",
+                            modifier = Modifier.size(18.dp).graphicsLayer { rotationZ = if (showRecentActivity) 90f else 0f }
+                        )
+                    }
                 }
-            }
-        }
-
-        if (photoInspections.isNotEmpty()) {
-            Text("Recent photos", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                photoInspections.forEach { inspection ->
-                    rememberPhotoBitmap(inspection.photoPath, 480)?.let { bitmap ->
-                        Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.size(90.dp).clip(RoundedCornerShape(16.dp)))
+                if (showRecentActivity) {
+                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f))
+                    if (events.isEmpty() && inspections.isEmpty()) {
+                        Text("No events yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        events.take(15).forEach { event -> EventCard(event) }
+                        inspections.firstOrNull()?.let { InspectionSnapshot(it) }
                     }
                 }
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Records", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                Text("Feedings: ${feedings.size} • Treatments: ${treatments.size} • Harvests: ${harvests.size}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                feedings.firstOrNull()?.let { Text("Last feed: ${it.amount} ${it.unit} • ${it.feedType}", style = MaterialTheme.typography.bodySmall) }
-                treatments.firstOrNull()?.let { Text("Last treatment: ${it.product}", style = MaterialTheme.typography.bodySmall) }
-                harvests.firstOrNull()?.let { Text("Last dry harvest: ${it.dryHoneyWeight} ${it.weightUnit}", style = MaterialTheme.typography.bodySmall) }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("NFC hive tag", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
                 if (hive.isDead) {
@@ -1397,22 +2823,8 @@ private fun HiveDetailScreen(
             }
         }
 
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Colony lifecycle", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                if (hive.isDead) {
-                    OutlinedButton(onClick = onRestore, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("RESTORE COLONY", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
-                } else {
-                    OutlinedButton(onClick = { confirmDead = true }, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("MARK COLONY DEAD", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium) }
-                }
-                TextButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth().height(36.dp)) { Text("DELETE HIVE PERMANENTLY", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
-            }
-        }
-
-        Text("Recent activity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        if (events.isEmpty()) Text("No events yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-        for (event in events.take(15)) { EventCard(event) }
-        inspections.firstOrNull()?.let { InspectionSnapshot(it) }
+        Spacer(Modifier.height(6.dp))
+    }
     }
 }
 
@@ -1425,8 +2837,9 @@ private fun HiveStatusPill(hive: Hive) {
         return
     }
     val flagged = hive.queenStatus == "Queenless" || hive.mitePercent >= 3.0
-    Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = if (flagged) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer)) {
-        Text(if (flagged) "CHECK" else "OK", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), fontWeight = FontWeight.ExtraBold, color = if (flagged) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer)
+    if (!flagged) return
+    Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+        Text("CHECK", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onErrorContainer)
     }
 }
 
@@ -1465,11 +2878,64 @@ private fun QueenProfileDialog(
 }
 
 @Composable private fun EventCard(event:ActivityEvent){Card(shape=RoundedCornerShape(16.dp)){Row(Modifier.fillMaxWidth().padding(14.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)){Icon(Icons.Rounded.Yard,null);Column{Text(event.title,fontWeight=FontWeight.Bold);Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM,DateFormat.SHORT).format(Date(event.createdAt)),color=MaterialTheme.colorScheme.onSurfaceVariant);if(event.detail.isNotBlank())Text(event.detail)}}}}
+private fun inspectionNoteDatePrefix(timestamp: Long): String =
+    "${DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(timestamp))} — "
+
+private fun hasInlineInspectionNoteDate(notes: String): Boolean {
+    val firstLine = notes.lineSequence().firstOrNull() ?: return false
+    val separator = firstLine.indexOf(" — ")
+    if (separator <= 0) return false
+    val dateText = firstLine.substring(0, separator)
+    val formatter = DateFormat.getDateInstance(DateFormat.MEDIUM)
+    val parsed = runCatching { formatter.parse(dateText) }.getOrNull() ?: return false
+    return formatter.format(parsed) == dateText
+}
+
+/**
+ * Adds a date directly to the first note and to each new line appended at the end.
+ * Existing lines stay unchanged when they're edited; dates become part of the saved text.
+ */
+private fun addDateToNewInspectionNoteLines(previousNotes: String, updatedNotes: String): String {
+    if (updatedNotes.isEmpty()) return updatedNotes
+    val datePrefix = inspectionNoteDatePrefix(System.currentTimeMillis())
+
+    // First text in an empty field gets a date. Pasted multi-line text receives a date
+    // for each line, while Enter at the start preserves the empty first line.
+    if (previousNotes.isBlank()) {
+        return updatedNotes.split('\n').mapIndexed { index, line ->
+            when {
+                line.startsWith(datePrefix) -> line
+                index == 0 && line.isBlank() -> line
+                else -> datePrefix + line
+            }
+        }.joinToString("\n")
+    }
+
+    // Only auto-date lines when text is appended, so editing historical lines does not
+    // rewrite their content or replace their original dates.
+    if (!updatedNotes.startsWith(previousNotes)) return updatedNotes
+    val appended = updatedNotes.substring(previousNotes.length)
+    if (!appended.contains('\n')) return updatedNotes
+
+    val appendedLines = appended.split('\n')
+    return buildString {
+        append(previousNotes)
+        appendedLines.forEachIndexed { index, line ->
+            if (index == 0) {
+                append(line)
+            } else {
+                append('\n')
+                append(if (line.startsWith(datePrefix)) line else datePrefix + line)
+            }
+        }
+    }
+}
+
 @Composable
 private fun InspectionSnapshot(i: Inspection) {
     Card(shape = RoundedCornerShape(16.dp)) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("${i.strength}/10 strength • ${i.queenStatus}")
+            Text("${ColonyStrength.labelFromStored(i.strength)} • Queen ${i.queenStatus}")
             Text("Mites ${i.miteCount}/${i.sampleSize} = ${String.format(Locale.US, "%.2f", i.mitePercent)}%")
             Text("Brood: eggs ${i.eggs}, open ${i.openBrood}, capped ${i.cappedBrood}")
             Text("Stores: honey ${i.honeyStores}, pollen ${i.pollen}")
@@ -1478,20 +2944,55 @@ private fun InspectionSnapshot(i: Inspection) {
             }
             if (i.notes.isNotBlank()) {
                 Text("FIELD NOTES", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.ExtraBold)
-                Text(i.notes, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (hasInlineInspectionNoteDate(i.notes)) i.notes else "${inspectionNoteDatePrefix(i.createdAt)}${i.notes}",
+                    style = MaterialTheme.typography.bodyMedium
+                )
             }
         }
     }
 }
 
 @Composable
+private fun InspectionHoneycombBackground(modifier: Modifier = Modifier) {
+    val patternColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.06f)
+    Canvas(modifier) {
+        val radius = 18.dp.toPx()
+        val horizontalStep = radius * 1.5f
+        val verticalStep = radius * kotlin.math.sqrt(3f)
+        val honeycomb = Path()
+        var row = 0
+        var centerY = -radius
+        while (centerY <= size.height + radius) {
+            var centerX = (if (row % 2 == 0) 0f else horizontalStep / 2f) - radius
+            while (centerX <= size.width + radius) {
+                for (vertex in 0..5) {
+                    val angle = Math.PI * vertex / 3.0
+                    val x = centerX + radius * Math.cos(angle).toFloat()
+                    val y = centerY + radius * Math.sin(angle).toFloat()
+                    if (vertex == 0) honeycomb.moveTo(x, y) else honeycomb.lineTo(x, y)
+                }
+                honeycomb.close()
+                centerX += horizontalStep
+            }
+            centerY += verticalStep
+            row++
+        }
+        drawPath(honeycomb, patternColor, style = Stroke(width = 1.dp.toPx()))
+    }
+}
+
+@Composable
 private fun InspectionScreen(
     activity: ComponentActivity,
-    photoStore: PhotoStore,
     locationController: LocationController,
     hive: Hive,
     priorInspections: List<Inspection>,
+    autoStartVoice: Boolean,
+    onVoiceAutoStartConsumed: () -> Unit,
+    onSaveHiveLocation: (Long, Double, Double, (String?) -> Unit) -> Unit,
     onBack: () -> Unit,
+    onHome: () -> Unit,
     onSave: suspend (Inspection) -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
@@ -1504,7 +3005,15 @@ private fun InspectionScreen(
         context.getSharedPreferences(INSPECTION_FORM_DRAFTS, android.content.Context.MODE_PRIVATE)
     }
     val noteDraftKey = remember(hive.id) { "hive_${hive.id}" }
-    val lastInspection = remember(priorInspections) { priorInspections.maxByOrNull { it.createdAt } }
+    val noteDraftTimestampKey = remember(hive.id) { "${noteDraftKey}_recorded_at" }
+    // The inspection list may briefly still contain the previous hive while NFC
+    // switches the selected hive. Never let another hive's latest inspection seed this form.
+    val lastInspection = remember(hive.id, priorInspections) {
+        priorInspections
+            .asSequence()
+            .filter { it.hiveId == hive.id }
+            .maxByOrNull { it.createdAt }
+    }
     // Load unfinished field values for this specific hive; if none exist, use the last saved inspection.
     val formDraft = remember(hive.id) { readInspectionFormDraft(formDraftPrefs, hive.id) }
     val formStateKey = formDraft?.updatedAt ?: 0L
@@ -1512,11 +3021,21 @@ private fun InspectionScreen(
     val savedNoteDraft = remember(hive.id) { noteDraftPrefs.getString(noteDraftKey, "").orEmpty() }
     // A stored empty string means the beekeeper deliberately cleared the notes; don't restore older text.
     val startingNotes = remember(hive.id, hasSavedNoteDraft, savedNoteDraft, lastInspection?.id, lastInspection?.notes) {
-        if (hasSavedNoteDraft) savedNoteDraft else lastInspection?.notes.orEmpty()
+        val loadedNotes = if (hasSavedNoteDraft) savedNoteDraft else lastInspection?.notes.orEmpty()
+        if (loadedNotes.isBlank() || hasInlineInspectionNoteDate(loadedNotes)) {
+            loadedNotes
+        } else {
+            val originalTimestamp = if (hasSavedNoteDraft) {
+                noteDraftPrefs.getLong(noteDraftTimestampKey, 0L)
+            } else {
+                lastInspection?.createdAt ?: 0L
+            }
+            if (originalTimestamp > 0L) "${inspectionNoteDatePrefix(originalTimestamp)}$loadedNotes" else loadedNotes
+        }
     }
 
     var strength by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.strength ?: lastInspection?.strength ?: hive.strength)
+        mutableIntStateOf(ColonyStrength.gradeFromStored(formDraft?.strength ?: lastInspection?.strength ?: hive.strength))
     }
     var queen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.queenStatus ?: lastInspection?.queenStatus ?: hive.queenStatus)
@@ -1561,17 +3080,14 @@ private fun InspectionScreen(
     var diseasesCsv by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.diseaseFlags ?: lastInspection?.diseaseFlags.orEmpty())
     }
-    var photoPath by rememberSaveable { mutableStateOf<String?>(null) }
-    var cameraOpen by rememberSaveable { mutableStateOf(false) }
-    var lat by rememberSaveable { mutableStateOf<Double?>(null) }
-    var lon by rememberSaveable { mutableStateOf<Double?>(null) }
-    var locationStatus by rememberSaveable { mutableStateOf("No GPS captured") }
+    var lat by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.latitude) }
+    var lon by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.longitude) }
+    var locationStatus by rememberSaveable(hive.id) { mutableStateOf("No GPS captured") }
+    var pendingGpsHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var voiceStatus by rememberSaveable { mutableStateOf("") }
-    var cameraStatus by rememberSaveable { mutableStateOf("") }
+    var voiceListeningRequested by rememberSaveable(hive.id) { mutableStateOf(false) }
+    var voicePartialText by rememberSaveable(hive.id) { mutableStateOf("") }
     var saving by rememberSaveable { mutableStateOf(false) }
-    var photoCaptured by rememberSaveable { mutableStateOf(false) }
-    var photoProcessing by rememberSaveable { mutableStateOf(false) }
-    var pendingPhotoPath by rememberSaveable { mutableStateOf<String?>(null) }
 
     val currentFormDraft = InspectionFormDraft(
         strength = strength,
@@ -1588,124 +3104,236 @@ private fun InspectionScreen(
         supercedureCells = supercedure,
         swarmCells = swarm,
         diseaseFlags = diseasesCsv,
-        updatedAt = formStateKey
+        updatedAt = formStateKey,
+        latitude = lat,
+        longitude = lon
     )
-    val latestFormDraft by rememberUpdatedState(currentFormDraft)
+    // Keep a separate latest-draft state per hive. A single rememberUpdatedState
+    // here was shared while the screen stayed open during NFC cycling, allowing the
+    // next hive's values to be written under the previous hive's key on disposal.
+    val latestFormDraft = remember(hive.id) { mutableStateOf(currentFormDraft) }
+    androidx.compose.runtime.SideEffect {
+        latestFormDraft.value = currentFormDraft
+    }
 
     androidx.compose.runtime.LaunchedEffect(
         hive.id, strength, queen, mites, sample, eggs, openBrood, cappedBrood,
-        honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv
+        honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv, lat, lon
     ) {
         saveInspectionFormDraft(formDraftPrefs, hive.id, currentFormDraft)
     }
     DisposableEffect(hive.id) {
+        val hiveIdForDraft = hive.id
+        val formDraftForThisHive = latestFormDraft
         onDispose {
-            saveInspectionFormDraft(formDraftPrefs, hive.id, latestFormDraft)
+            saveInspectionFormDraft(formDraftPrefs, hiveIdForDraft, formDraftForThisHive.value)
         }
     }
 
-    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) {
-            cameraStatus = ""
-            cameraOpen = true
-        } else {
-            pendingPhotoPath?.let { File(it).delete() }
-            pendingPhotoPath = null
-            cameraStatus = "Camera permission denied"
+    fun captureAndSaveHiveGps(targetHiveId: Long, latitude: Double, longitude: Double) {
+        val coordinates = "${"%.5f".format(Locale.US, latitude)}, ${"%.5f".format(Locale.US, longitude)}"
+        if (hive.id == targetHiveId) {
+            lat = latitude
+            lon = longitude
+            locationStatus = "GPS captured • saving to hive…"
+        }
+        onSaveHiveLocation(targetHiveId, latitude, longitude) { error ->
+            if (hive.id == targetHiveId) {
+                locationStatus = if (error == null) {
+                    "Hive GPS saved • $coordinates"
+                } else {
+                    "Inspection GPS captured; hive GPS save failed: $error"
+                }
+            }
         }
     }
+
     val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+        val targetHiveId = pendingGpsHiveId ?: hive.id
+        pendingGpsHiveId = null
         val granted = r[Manifest.permission.ACCESS_FINE_LOCATION] == true || r[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         if (!granted) {
-            locationStatus = "Location permission denied"
+            if (hive.id == targetHiveId) locationStatus = "Location permission denied"
             return@rememberLauncherForActivityResult
         }
         locationController.current { loc ->
             if (loc != null) {
-                lat = loc.latitude
-                lon = loc.longitude
-                locationStatus = "GPS captured • ${"%.5f".format(Locale.US, loc.latitude)}, ${"%.5f".format(Locale.US, loc.longitude)}"
-            } else locationStatus = "Could not get a location"
+                captureAndSaveHiveGps(targetHiveId, loc.latitude, loc.longitude)
+            } else if (hive.id == targetHiveId) {
+                locationStatus = "Could not get a location"
+            }
         }
     }
-    val voiceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { spokenText ->
-            // Each completed dictation is a separate note entry. Keep earlier notes and add this one below.
-            val cleanSpokenText = spokenText.trim()
-            val updatedNotes = if (notes.isBlank()) cleanSpokenText else "${notes.trimEnd()}\n$cleanSpokenText"
+    val voiceHandler = remember { Handler(Looper.getMainLooper()) }
+    val speechRecognizer = remember(context) {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            runCatching { SpeechRecognizer.createSpeechRecognizer(context) }.getOrNull()
+        } else null
+    }
+    val speechIntent = remember(hive.id, hive.number) {
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak inspection notes for Hive ${hive.number}")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        }
+    }
+    val latestNotes by rememberUpdatedState(notes)
+    val keepVoiceListening by rememberUpdatedState(voiceListeningRequested)
+    val voiceBlocked by rememberUpdatedState(saving)
+    val appendRecognizedSpeech by rememberUpdatedState<(String) -> Unit>({ spokenText ->
+        val cleanSpokenText = spokenText.trim()
+        if (cleanSpokenText.isNotBlank()) {
+            val recordedAt = System.currentTimeMillis()
+            val datedSpokenText = "${inspectionNoteDatePrefix(recordedAt)}$cleanSpokenText"
+            val updatedNotes = if (latestNotes.isBlank()) datedSpokenText else "${latestNotes.trimEnd()}\n$datedSpokenText"
             notes = updatedNotes
-            // Save immediately when Android returns the finished speech transcription.
-            noteDraftPrefs.edit { putString(noteDraftKey, updatedNotes) }
+            noteDraftPrefs.edit {
+                putString(noteDraftKey, updatedNotes)
+            }
             noteSaveStatus = "Note auto-saved"
-            voiceStatus = "Voice added"
+            voicePartialText = ""
+            voiceStatus = "Saved • continuing to listen"
         }
-    }
+    })
     val voicePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Describe what you see in Hive ${hive.number}")
+            voiceStatus = "Starting hands-free dictation…"
+            voiceListeningRequested = true
+        } else {
+            voiceListeningRequested = false
+            voiceStatus = "Microphone permission denied • tap VOICE to try again"
+        }
+    }
+
+    DisposableEffect(speechRecognizer) {
+        val recognizer = speechRecognizer
+        if (recognizer != null) {
+            recognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    voiceStatus = "Listening • speak your notes"
+                }
+                override fun onBeginningOfSpeech() {
+                    voiceStatus = "Listening • capturing speech"
+                }
+                override fun onRmsChanged(rmsdB: Float) = Unit
+                override fun onBufferReceived(buffer: ByteArray?) = Unit
+                override fun onEndOfSpeech() {
+                    voiceStatus = "Processing speech…"
+                }
+                override fun onResults(results: Bundle?) {
+                    val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                    if (!spoken.isNullOrBlank()) {
+                        appendRecognizedSpeech(spoken)
+                        voiceStatus = "Voice note saved • tap VOICE to record another"
+                    } else {
+                        voiceStatus = "No speech detected • tap VOICE to try again"
+                    }
+                    voicePartialText = ""
+                    // One dictated phrase per activation. Leave the microphone stopped
+                    // after the recognizer finishes and the note has been saved.
+                    voiceListeningRequested = false
+                    voiceHandler.removeCallbacksAndMessages(null)
+                }
+                override fun onPartialResults(partialResults: Bundle?) {
+                    voicePartialText = partialResults
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull().orEmpty()
+                }
+                override fun onError(error: Int) {
+                    // Do not automatically reopen the microphone after a timeout,
+                    // silence, or recognition error. The beekeeper can explicitly retry.
+                    voiceListeningRequested = false
+                    voiceHandler.removeCallbacksAndMessages(null)
+                    voicePartialText = ""
+                    voiceStatus = when (error) {
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission is required"
+                        SpeechRecognizer.ERROR_NO_MATCH,
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected • tap VOICE to try again"
+                        SpeechRecognizer.ERROR_NETWORK,
+                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech service unavailable • tap VOICE to retry"
+                        else -> "Voice dictation stopped • tap VOICE to try again"
+                    }
+                }
+                override fun onEvent(eventType: Int, params: Bundle?) = Unit
+            })
+        }
+        onDispose {
+            voiceHandler.removeCallbacksAndMessages(null)
+            if (recognizer != null) {
+                runCatching { recognizer.cancel() }
+                recognizer.destroy()
             }
-            runCatching { voiceLauncher.launch(intent) }.onFailure { voiceStatus = "Voice input unavailable" }
-        } else voiceStatus = "Microphone permission denied"
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(hive.id) {
+        // Manual Inspect opens with the microphone off. Auto-start is reserved for
+        // an explicit scan-to-open request and is consumed once for this hive.
+        if (!autoStartVoice) return@LaunchedEffect
+        onVoiceAutoStartConsumed()
+        // NFC entry announces the hive number with text-to-speech. Let that finish
+        // before opening the microphone so the announcement is not dictated into notes.
+        delay(1_800L)
+        if (voiceListeningRequested) return@LaunchedEffect
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            voiceStatus = "Starting hands-free dictation…"
+            voiceListeningRequested = true
+        } else {
+            voicePermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(voiceListeningRequested, saving, speechRecognizer) {
+        val recognizer = speechRecognizer
+        if (!voiceListeningRequested || saving) {
+            voiceHandler.removeCallbacksAndMessages(null)
+            runCatching { recognizer?.cancel() }
+            if (!voiceListeningRequested && voiceStatus.startsWith("Listening")) voiceStatus = "Voice dictation paused"
+            return@LaunchedEffect
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return@LaunchedEffect
+        if (recognizer == null) {
+            voiceListeningRequested = false
+            voiceStatus = "Speech recognition isn't available on this device"
+            return@LaunchedEffect
+        }
+        runCatching { recognizer.startListening(speechIntent) }
+            .onFailure {
+                voiceListeningRequested = false
+                voiceStatus = "Couldn't start voice dictation • tap VOICE to retry"
+            }
+    }
+
+    // Do not leave the microphone active if the beekeeper backgrounds BeeKeep or locks the phone.
+    val voiceLifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(voiceLifecycleOwner, speechRecognizer) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE && keepVoiceListening) {
+                voiceListeningRequested = false
+                voicePartialText = ""
+                voiceHandler.removeCallbacksAndMessages(null)
+                runCatching { speechRecognizer?.cancel() }
+                voiceStatus = "Voice dictation paused while BeeKeep is in the background"
+            }
+        }
+        voiceLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { voiceLifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     androidx.compose.runtime.LaunchedEffect(hive.id, notes) {
         // Debounce edits so a longer note is stored when the user pauses typing.
         delay(400)
         // Store blank too: it records an intentional manual clear rather than reviving old notes later.
-        noteDraftPrefs.edit { putString(noteDraftKey, notes) }
+        noteDraftPrefs.edit {
+            putString(noteDraftKey, notes)
+            if (notes.isBlank()) remove(noteDraftTimestampKey)
+        }
         noteSaveStatus = if (notes.isBlank()) "" else "Note auto-saved"
     }
 
-    BackHandler {
-        if (cameraOpen && pendingPhotoPath != null) {
-            if (!photoCaptured) File(pendingPhotoPath!!).delete()
-            pendingPhotoPath = null
-            cameraOpen = false
-        } else {
-            photoPath?.let { File(it).delete() }
-            pendingPhotoPath?.let { File(it).delete() }
-            onBack()
-        }
-    }
-
-    if (cameraOpen && pendingPhotoPath != null) {
-        val pendingFile = File(pendingPhotoPath!!)
-        CameraCaptureView(
-            outputFile = pendingFile,
-            onCaptured = {
-                val previousPhoto = photoPath
-                photoPath = pendingFile.absolutePath
-                if (!previousPhoto.isNullOrBlank() && previousPhoto != pendingFile.absolutePath) {
-                    File(previousPhoto).delete()
-                }
-                photoCaptured = true
-                photoProcessing = true
-                cameraOpen = false
-                pendingPhotoPath = null
-                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                    val optimized = photoStore.optimizeInPlace(pendingFile)
-                    withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        photoProcessing = false
-                        cameraStatus = if (optimized) "Photo ready" else "Photo saved; optimization unavailable"
-                    }
-                }
-            },
-            onClose = {
-                if (!photoCaptured) pendingFile.delete()
-                pendingPhotoPath = null
-                cameraOpen = false
-            },
-            onError = { message ->
-                cameraStatus = message
-                if (!photoCaptured) pendingFile.delete()
-                pendingPhotoPath = null
-                cameraOpen = false
-            }
-        )
-        return
-    }
+    BackHandler { onBack() }
 
     val miteRate = if (sample > 0) mites * 100.0 / sample else 0.0
     val previousForComparison = remember(priorInspections) {
@@ -1713,8 +3341,9 @@ private fun InspectionScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            Surface(shadowElevation = 2.dp) {
+            Surface(color = MaterialTheme.colorScheme.primaryContainer, shadowElevation = 2.dp) {
                 Row(
                     Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 8.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -1723,65 +3352,76 @@ private fun InspectionScreen(
                     IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
                     Column(Modifier.weight(1f)) {
                         Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                        Text("FIELD INSPECTION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("FIELD INSPECTION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                    }
+                    IconButton(onClick = onHome) {
+                        Icon(Icons.Rounded.Home, contentDescription = "Home")
                     }
                 }
             }
         },
 
     ) { padding ->
-        LazyColumn(
-            Modifier.fillMaxSize().padding(padding),
+        Box(
+            Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+        ) {
+            InspectionHoneycombBackground(Modifier.matchParentSize())
+            LazyColumn(
+                Modifier.fillMaxSize().padding(padding),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
-                Card(shape = RoundedCornerShape(18.dp)) {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                ) {
                     Column(
                         Modifier.fillMaxWidth().padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FieldActionButton(Icons.Rounded.CameraAlt, "PHOTO", Modifier.weight(1f)) {
-                                val file = photoStore.createInspectionPhoto(hive.id).file
-                                pendingPhotoPath = file.absolutePath
-                                photoCaptured = false
-                                cameraStatus = ""
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                                    cameraOpen = true
-                                } else cameraPermission.launch(Manifest.permission.CAMERA)
-                            }
-                            FieldActionButton(Icons.Rounded.Mic, "VOICE", Modifier.weight(1f)) {
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                                        putExtra(RecognizerIntent.EXTRA_PROMPT, "Describe Hive ${hive.number}")
-                                    }
-                                    runCatching { voiceLauncher.launch(intent) }.onFailure { voiceStatus = "Voice input unavailable" }
-                                } else voicePermission.launch(Manifest.permission.RECORD_AUDIO)
+                        FieldActionButton(
+                            Icons.Rounded.Mic,
+                            if (voiceListeningRequested) "STOP VOICE" else "VOICE",
+                            Modifier.fillMaxWidth()
+                        ) {
+                            if (voiceListeningRequested) {
+                                voiceListeningRequested = false
+                                voicePartialText = ""
+                                voiceStatus = "Voice dictation paused"
+                            } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                voiceListeningRequested = true
+                                voiceStatus = "Starting hands-free dictation…"
+                            } else {
+                                voicePermission.launch(Manifest.permission.RECORD_AUDIO)
                             }
                         }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FieldActionButton(Icons.Rounded.GpsFixed, "GPS", Modifier.weight(1f)) {
+                                val targetHiveId = hive.id
                                 if (locationController.hasPermission()) {
                                     locationController.current { loc ->
                                         if (loc != null) {
-                                            lat = loc.latitude
-                                            lon = loc.longitude
-                                            locationStatus = "GPS captured • ${"%.5f".format(Locale.US, loc.latitude)}, ${"%.5f".format(Locale.US, loc.longitude)}"
-                                        } else locationStatus = "Could not get a location"
+                                            captureAndSaveHiveGps(targetHiveId, loc.latitude, loc.longitude)
+                                        } else if (hive.id == targetHiveId) {
+                                            locationStatus = "Could not get a location"
+                                        }
                                     }
-                                } else locationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+                                } else {
+                                    pendingGpsHiveId = targetHiveId
+                                    locationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+                                }
                             }
                             Button(
                                 onClick = {
-                                    if (!saving && !photoProcessing) {
+                                    if (!saving) {
                                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                         saving = true
                                         val now = System.currentTimeMillis()
                                         val inspection = Inspection(
-                                            IdGenerator.nextLong(), hive.id, now, strength, queen, mites,
-                                            sample.coerceAtLeast(1), notes.trim(), photoPath, lat, lon,
+                                            IdGenerator.nextLong(), hive.id, now, ColonyStrength.storedFromGrade(strength), queen, mites,
+                                            sample.coerceAtLeast(1), notes.trim(), null, lat, lon,
                                             emergency, supercedure, swarm, eggs, openBrood, cappedBrood,
                                             honey, pollen, emptyComb, diseasesCsv
                                         )
@@ -1791,18 +3431,21 @@ private fun InspectionScreen(
                                         }
                                     }
                                 },
-                                enabled = !saving && !photoProcessing,
+                                enabled = !saving,
                                 modifier = Modifier.weight(1f).height(54.dp),
                                 shape = RoundedCornerShape(16.dp),
+                                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFD97706),
+                                    contentColor = Color.White,
+                                    disabledContainerColor = Color(0xFFD97706).copy(alpha = 0.45f),
+                                    disabledContentColor = Color.White.copy(alpha = 0.75f)
+                                ),
                                 contentPadding = PaddingValues(horizontal = 8.dp)
                             ) {
                                 Icon(Icons.Rounded.Check, null)
                                 Spacer(Modifier.width(5.dp))
                                 Text(if (saving) "SAVING…" else "SAVE", fontWeight = FontWeight.ExtraBold, maxLines = 1)
                             }
-                        }
-                        if (photoProcessing) {
-                            Text("Preparing photo…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
@@ -1818,21 +3461,49 @@ private fun InspectionScreen(
                                 queen = option
                                 haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
                             },
-                            label = { Text(option) }
+                            label = { Text(option) },
+                            colors = androidx.compose.material3.FilterChipDefaults.filterChipColors(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                selectedContainerColor = Color(0xFFD97706),
+                                selectedLabelColor = Color.White
+                            ),
+                            border = BorderStroke(
+                                1.dp,
+                                if (queen == option) Color(0xFFD97706) else MaterialTheme.colorScheme.outline
+                            )
                         )
                     }
                 }
             }
 
             item {
-                Card(shape = RoundedCornerShape(24.dp)) {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("FIELD NOTES", fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            "FIELD NOTES",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
                         OutlinedTextField(
                             value = notes,
                             onValueChange = {
-                                notes = it
-                                noteSaveStatus = if (it.isBlank()) "" else "Saving note…"
+                                val updatedNotes = addDateToNewInspectionNoteLines(notes, it)
+                                notes = updatedNotes
+                                noteDraftPrefs.edit {
+                                    putString(noteDraftKey, updatedNotes)
+                                    if (updatedNotes.isBlank()) {
+                                        remove(noteDraftTimestampKey)
+                                    } else if (!noteDraftPrefs.contains(noteDraftTimestampKey)) {
+                                        putLong(noteDraftTimestampKey, System.currentTimeMillis())
+                                    }
+                                }
+                                noteSaveStatus = if (updatedNotes.isBlank()) "" else "Saving note…"
                             },
                             modifier = Modifier.fillMaxWidth().height(124.dp),
                             label = { Text("What did you see?") }
@@ -1844,6 +3515,13 @@ private fun InspectionScreen(
                                 color = MaterialTheme.colorScheme.primary
                             )
                         }
+                        if (voicePartialText.isNotBlank()) {
+                            Text(
+                                "Hearing: $voicePartialText",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (voiceStatus.isNotBlank()) Text(voiceStatus, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
                             if (locationStatus != "No GPS captured") Text(locationStatus, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
@@ -1853,14 +3531,25 @@ private fun InspectionScreen(
             }
 
             item {
-                ComparisonCounter("Colony strength", strength, previousForComparison?.strength, 0..10, haptic) { strength = it }
+                ComparisonCounter(
+                    "Colony strength",
+                    strength,
+                    previousForComparison?.strength?.let { ColonyStrength.gradeFromStored(it) },
+                    1..5,
+                    haptic,
+                    valueLabel = ColonyStrength.labelForGrade(strength)
+                ) { strength = it }
             }
             item {
-                Card(shape = RoundedCornerShape(24.dp)) {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
                     Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                Text("Mite wash", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
+                                Text("Mite wash", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text("${mites} / ${sample} bees", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Text(String.format(Locale.US, "%.2f%%", miteRate), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
@@ -1929,7 +3618,17 @@ private fun InspectionScreen(
                                 diseasesCsv = current.joinToString(", ")
                                 haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
                             },
-                            label = { Text(flag) }
+                            label = { Text(flag) },
+                            colors = androidx.compose.material3.FilterChipDefaults.filterChipColors(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                selectedContainerColor = Color(0xFFD97706),
+                                selectedLabelColor = Color.White
+                            ),
+                            border = BorderStroke(
+                                1.dp,
+                                if (active) Color(0xFFD97706) else MaterialTheme.colorScheme.outline
+                            )
                         )
                     }
                 }
@@ -1937,21 +3636,9 @@ private fun InspectionScreen(
 
 
 
-            item {
-                photoPath?.let { path ->
-                    Card(shape = RoundedCornerShape(24.dp)) {
-                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("PHOTO", fontWeight = FontWeight.ExtraBold)
-                            rememberPhotoBitmap(path, 1200)?.let { bitmap ->
-                                Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 280.dp).clip(RoundedCornerShape(16.dp)))
-                            }
-                            if (photoProcessing) Text("Preparing photo…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            if (cameraStatus.isNotBlank()) Text(cameraStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
 
+
+            }
         }
     }
 }
@@ -1967,6 +3654,11 @@ private fun FieldActionButton(
         onClick = onClick,
         modifier = modifier.height(54.dp),
         shape = RoundedCornerShape(16.dp),
+        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp)
     ) {
         Icon(icon, contentDescription = label)
@@ -1977,7 +3669,13 @@ private fun FieldActionButton(
 
 @Composable
 private fun SectionHeader(title: String) {
-    Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 2.dp, vertical = 2.dp))
+    Text(
+        title,
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.ExtraBold,
+        color = MaterialTheme.colorScheme.onBackground,
+        modifier = Modifier.padding(horizontal = 2.dp, vertical = 2.dp)
+    )
 }
 
 @Composable
@@ -1987,21 +3685,25 @@ private fun ComparisonCounter(
     previous: Int?,
     range: IntRange,
     haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
+    valueLabel: String? = null,
     onChange: (Int) -> Unit
 ) {
-    Card(shape = RoundedCornerShape(16.dp)) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Column(
             Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(1.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
+                Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 previous?.let {
-                    val delta = value - it
                     Text(
-                        "Prev $it • ${if (delta >= 0) "+$delta" else delta}",
+                        "Prev: ${ColonyStrength.labelForGrade(it)}",
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (delta < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -2014,7 +3716,18 @@ private fun ComparisonCounter(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
                     modifier = Modifier.size(36.dp)
                 ) { Text("−", style = MaterialTheme.typography.titleMedium) }
-                Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(0.dp)
+                ) {
+                    Text(
+                        valueLabel ?: value.toString(),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
+                }
                 IconButton(
                     onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
                     modifier = Modifier.size(36.dp)
@@ -2033,7 +3746,12 @@ private fun CompactCounter(
     modifier: Modifier = Modifier,
     onChange: (Int) -> Unit
 ) {
-    Card(modifier = modifier, shape = RoundedCornerShape(12.dp)) {
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 5.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -2044,13 +3762,14 @@ private fun CompactCounter(
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1
             )
             IconButton(
                 onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
                 modifier = Modifier.size(32.dp)
             ) { Text("−", style = MaterialTheme.typography.bodyMedium) }
-            Text(value.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
+            Text(value.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
             IconButton(
                 onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
                 modifier = Modifier.size(32.dp)
@@ -2060,18 +3779,130 @@ private fun CompactCounter(
 }
 
 @Composable
-private fun rememberPhotoBitmap(path: String?, maxDimension: Int): Bitmap? {
-    val currentPath = path
-    return produceState<Bitmap?>(initialValue = null, key1 = currentPath, key2 = maxDimension) {
-        value = withContext(kotlinx.coroutines.Dispatchers.IO) { PhotoStore.decodeSampled(currentPath, maxDimension) }
-        awaitDispose { value?.recycle() }
-    }.value
+private fun Counter(
+    label: String,
+    value: Int,
+    range: IntRange,
+    valueLabel: String? = null,
+    onChange: (Int) -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(label, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            IconButton({ onChange((value - 1).coerceIn(range)) }) {
+                Text("−", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    valueLabel ?: value.toString(),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+            }
+            IconButton({ onChange((value + 1).coerceIn(range)) }) {
+                Text("+", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
 }
 
-@Composable private fun Counter(label:String,value:Int,range:IntRange,onChange:(Int)->Unit){Card(shape=RoundedCornerShape(16.dp)){Row(Modifier.fillMaxWidth().padding(10.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Text(label,fontWeight=FontWeight.Bold)};IconButton({onChange((value-1).coerceIn(range))}){Text("−",style=MaterialTheme.typography.headlineMedium)};Text(value.toString(),style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold);IconButton({onChange((value+1).coerceIn(range))}){Text("+",style=MaterialTheme.typography.headlineMedium)}}}}
-@Composable private fun NumberField(label:String,value:Int,mod:Modifier,onChange:(Int)->Unit){OutlinedTextField(value.toString(),{it.filter(Char::isDigit).toIntOrNull()?.let(onChange)},mod,label={Text(label)},keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number),singleLine=true)}
+@Composable
+private fun NumberField(
+    label: String,
+    value: Int,
+    mod: Modifier,
+    onChange: (Int) -> Unit
+) {
+    // Preserve intermediate typing so the field can be cleared before entering
+    // zero or a replacement number. An empty value is treated as zero rather
+    // than leaving the previous number silently stored behind the blank field.
+    var inputText by remember(label) { mutableStateOf(value.toString()) }
+    var isFocused by remember(label) { mutableStateOf(false) }
 
-@Composable private fun AddHiveScreen(apiaries:List<Apiary>, initialApiary: String?, onBack:()->Unit, onCreate:(String,String,String,Int)->Unit){BackHandler{onBack()};var number by rememberSaveable{mutableStateOf("")};var apiary by rememberSaveable(initialApiary) { mutableStateOf(initialApiary ?: apiaries.firstOrNull()?.name ?: "Home Yard") };var queen by rememberSaveable{mutableStateOf("Laying")};var strength by rememberSaveable{mutableIntStateOf(5)};Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){Row(verticalAlignment=Alignment.CenterVertically){IconButton(onBack){Icon(Icons.Rounded.ArrowBack,"Back")};Text("Add Hive",style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold)};OutlinedTextField(number,{number=it},Modifier.fillMaxWidth(),label={Text("Hive number")},singleLine=true);OutlinedTextField(apiary,{ if (initialApiary == null) apiary=it },Modifier.fillMaxWidth(),label={Text("Apiary / Yard")},singleLine=true,readOnly=initialApiary != null);Text("Queen status",fontWeight=FontWeight.Bold);Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){for(status in listOf("Laying","Spotted","Unspotted","Queenless","Virgin")){FilterChip(queen==status,{queen=status},{Text(status)})}};Counter("Starting strength",strength,0..10){strength=it};Button({onCreate(number,apiary,queen,strength)},Modifier.fillMaxWidth().height(60.dp),enabled=number.isNotBlank(),shape=RoundedCornerShape(24.dp)){Text("CREATE HIVE",fontWeight=FontWeight.ExtraBold)}}}
+    androidx.compose.runtime.LaunchedEffect(value, isFocused) {
+        // Don't overwrite a blank editing buffer while the user is typing.
+        // Once focus leaves, show the actual normalized value again.
+        if (!isFocused && inputText != value.toString()) {
+            inputText = value.toString()
+        }
+    }
+
+    OutlinedTextField(
+        value = inputText,
+        onValueChange = { entered ->
+            val digits = entered.filter(Char::isDigit)
+            inputText = digits
+            onChange(digits.toIntOrNull() ?: 0)
+        },
+        modifier = mod.onFocusChanged { isFocused = it.isFocused },
+        label = { Text(label) },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        singleLine = true
+    )
+}
+
+@Composable
+private fun AddHiveScreen(
+    apiaries: List<Apiary>,
+    initialApiary: String?,
+    onBack: () -> Unit,
+    onCreate: (String, String, String, Int) -> Unit
+) {
+    BackHandler { onBack() }
+    var number by rememberSaveable { mutableStateOf("") }
+    var apiary by rememberSaveable(initialApiary) { mutableStateOf(initialApiary ?: apiaries.firstOrNull()?.name ?: "Home Yard") }
+    var queen by rememberSaveable { mutableStateOf("Laying") }
+    var strength by rememberSaveable { mutableIntStateOf(3) }
+
+    Column(
+        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
+            Text("Add Hive", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+        }
+        OutlinedTextField(number, { number = it }, Modifier.fillMaxWidth(), label = { Text("Hive number") }, singleLine = true)
+        OutlinedTextField(
+            apiary,
+            { if (initialApiary == null) apiary = it },
+            Modifier.fillMaxWidth(),
+            label = { Text("Apiary / Yard") },
+            singleLine = true,
+            readOnly = initialApiary != null
+        )
+        Text("Queen status", fontWeight = FontWeight.Bold)
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (status in listOf("Laying", "Spotted", "Unspotted", "Queenless", "Virgin")) {
+                FilterChip(queen == status, { queen = status }, { Text(status) })
+            }
+        }
+        Counter(
+            "Starting strength",
+            strength,
+            1..5,
+            valueLabel = ColonyStrength.labelForGrade(strength)
+        ) { strength = it }
+        Button(
+            { onCreate(number, apiary, queen, ColonyStrength.storedFromGrade(strength)) },
+            Modifier.fillMaxWidth().height(60.dp),
+            enabled = number.isNotBlank(),
+            shape = RoundedCornerShape(24.dp)
+        ) { Text("CREATE HIVE", fontWeight = FontWeight.ExtraBold) }
+    }
+}
 
 @Composable
 private fun AddApiaryScreen(
@@ -2110,6 +3941,26 @@ private fun AddApiaryScreen(
         },Modifier.fillMaxWidth().height(54.dp)){Icon(Icons.Rounded.LocationOn,null);Spacer(Modifier.width(6.dp));Text(if(lat==null)"CAPTURE CURRENT GPS" else "GPS CAPTURED")}
         if (lat != null && lon != null) {
             Text("Saved GPS: ${"%.5f".format(Locale.US, lat)}, ${"%.5f".format(Locale.US, lon)}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+            Text("Satellite preview • drag to move, pinch to zoom", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            ApiarySatelliteMap(
+                apiaries = listOf(
+                    Apiary(
+                        id = existingApiary?.id ?: Long.MIN_VALUE,
+                        name = "Current apiary location",
+                        notes = notes,
+                        latitude = lat,
+                        longitude = lon,
+                        forageNotes = forage,
+                        waterNotes = water
+                    )
+                ),
+                focusedApiaryId = existingApiary?.id ?: Long.MIN_VALUE,
+                currentLocation = null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(260.dp)
+                    .clip(RoundedCornerShape(20.dp))
+            )
             TextButton(onClick = { lat = null; lon = null; gpsStatus = "GPS location removed" }) { Text("REMOVE GPS LOCATION") }
         }
         if(gpsStatus.isNotBlank()) Text(gpsStatus,color=if(gpsStatus.startsWith("Could") || gpsStatus.startsWith("Location permission denied"))MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,fontWeight=FontWeight.Bold)
@@ -2191,8 +4042,10 @@ private fun TagManagementScreen(
     onPendingUidConsumed: () -> Unit,
     onBack: () -> Unit,
     onOpenHive: (Long) -> Unit,
+    onScanOpenHive: (Long) -> Unit,
     onAssignTag: (Long, String, Boolean, (Boolean, String?) -> Unit) -> Unit,
-    onClearTag: (Long) -> Unit
+    onClearTag: (Long) -> Unit,
+    onUnassignedTag: (String) -> Unit
 ) {
     val context = LocalContext.current
     var status by rememberSaveable { mutableStateOf("") }
@@ -2211,14 +4064,58 @@ private fun TagManagementScreen(
         allowOverwriteOtherHive: Boolean = false,
         updateStatus: (String) -> Unit
     ) {
-        // Do not immediately re-arm the NFC reader here: the user's first tap
-        // may still be against the phone. Show an explicit prompt first, then
-        // start a fresh write scan only after they confirm they are ready.
-        updateStatus("Tag $uid assigned. One more tap is needed to write BeeKeep launch data.")
+        // This fallback is retained for confirmed reassignment and legacy pending-tag flows.
+        updateStatus("Tag $uid assigned. Tap the tag again to finish writing BeeKeep launch data.")
         launchWriteHiveId = hiveId
         launchWriteUid = uid
         launchWriteOverwrite = allowOverwriteOtherHive
         launchWriteStatusHandler = updateStatus
+    }
+
+    fun assignAndWriteOnScan(
+        hiveId: Long,
+        expectedUid: String? = null,
+        consumePending: Boolean = false,
+        updateStatus: (String) -> Unit
+    ) {
+        nfc.startAssignAndWrite(
+            activity = activity,
+            text = BeeKeepNfcPayload.forHive(hiveId),
+            expectedUid = expectedUid,
+            isAssignedElsewhere = { uid ->
+                hives.any { it.id != hiveId && it.tagUid.equals(uid, ignoreCase = true) }
+            },
+            onResult = { result ->
+                when (result) {
+                    is NfcResult.Written -> {
+                        onAssignTag(hiveId, result.uid, false) { success, error ->
+                            if (success) {
+                                if (consumePending) onPendingUidConsumed()
+                                val hiveNumber = hives.firstOrNull { it.id == hiveId }?.number ?: hiveId.toString()
+                                updateStatus("Tag assigned and launch data written. With BeeKeep closed, tapping this tag should open Hive ${hiveNumber}.")
+                            } else {
+                                updateStatus(error ?: "Payload was written, but BeeKeep could not save the tag assignment.")
+                            }
+                        }
+                    }
+                    is NfcResult.Read -> {
+                        val owner = hives.firstOrNull { it.tagUid.equals(result.uid, ignoreCase = true) }
+                        val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
+                        when {
+                            owner != null && owner.id != hiveId -> {
+                                reassignPrompt = hiveId to result.uid
+                                updateStatus("Tag ${result.uid} is assigned to Hive ${owner.number}. Confirm REASSIGN before changing it.")
+                            }
+                            payloadHiveId != null && payloadHiveId != hiveId -> {
+                                updateStatus("Tag payload belongs to another hive. No data was changed.")
+                            }
+                            else -> updateStatus("Could not write this tag automatically. Use WRITE TAG from the hive details to retry.")
+                        }
+                    }
+                    is NfcResult.Error -> updateStatus(result.message)
+                }
+            }
+        )
     }
 
     if (launchWriteHiveId != null && launchWriteUid != null) {
@@ -2311,7 +4208,7 @@ private fun TagManagementScreen(
         Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("How BeeKeep tags work", fontWeight = FontWeight.Bold)
-                Text("Assign links the tag UID to a hive. BeeKeep then asks you to tap the same tag again to write its launch data. That small NDEF payload lets Android open BeeKeep directly when the app is closed; hive history stays in BeeKeep, not on the tag.", color = MaterialTheme.colorScheme.onPrimaryContainer)
+                Text("Choose a hive and tap ASSIGN/REPLACE. During that scan BeeKeep links the tag and writes its launch payload in the same step, including an Android app-launch record so Android can open BeeKeep directly. Hive history stays in BeeKeep, not on the tag.", color = MaterialTheme.colorScheme.onPrimaryContainer)
                 Text("Tags are reusable: when a colony dies its tag is released and can be assigned to another hive. Scanning always opens the colony the tag is currently assigned to.", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.bodySmall)
                 Text("Use durable, weather-resistant NFC tags on the hive lid or another protected surface.", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.bodySmall)
             }
@@ -2330,9 +4227,10 @@ private fun TagManagementScreen(
         Button(
             onClick = {
                 assigningHiveId = null
-                nfc.startRead(activity) { result ->
+                nfc.startReadAndPrepareForBeeKeep(activity) { result ->
                     when (result) {
                         is NfcResult.Read -> {
+                            result.launchPreparationError?.let { status = it }
                             val hiveByUid = hives.firstOrNull { it.tagUid.equals(result.uid, ignoreCase = true) }
                             val hiveByPayload = BeeKeepNfcPayload.hiveId(result.text)?.let { id -> hives.firstOrNull { it.id == id } }
                             status = when {
@@ -2340,7 +4238,9 @@ private fun TagManagementScreen(
                                 hiveByPayload != null -> "Hive ${hiveByPayload.number} • tag payload recognized"
                                 else -> "Unassigned tag • ${result.uid}"
                             }
-                            hiveByUid?.let { onOpenHive(it.id) } ?: hiveByPayload?.let { onOpenHive(it.id) }
+                            if (hiveByUid != null) onScanOpenHive(hiveByUid.id)
+                            else if (hiveByPayload != null) onScanOpenHive(hiveByPayload.id)
+                            else onUnassignedTag(result.uid)
                         }
                         is NfcResult.Error -> status = result.message
                         is NfcResult.Written -> Unit
@@ -2375,43 +4275,14 @@ private fun TagManagementScreen(
                         OutlinedButton(onClick = { onOpenHive(hive.id) }, modifier = Modifier.weight(1f)) { Text("OPEN") }
                         OutlinedButton(
                             onClick = {
-                                if (pendingUid != null) {
-                                    onAssignTag(hive.id, pendingUid, false) { success, error ->
-                                        if (success) {
-                                            onPendingUidConsumed()
-                                            writeLaunchDataAfterAssignment(hive.id, pendingUid) { verifyText = it }
-                                        } else if (error?.contains("already assigned") == true) {
-                                            reassignPrompt = hive.id to pendingUid
-                                        } else {
-                                            verifyText = error ?: "Could not assign tag."
-                                        }
-                                    }
-                                    return@OutlinedButton
-                                }
                                 assigningHiveId = hive.id
-                                nfc.startRead(activity) { result ->
-                                    when (result) {
-                                        is NfcResult.Read -> {
-                                            val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
-                                            if (payloadHiveId != null && payloadHiveId != hive.id) {
-                                                verifyText = "Tag payload belongs to another hive. Use REPLACE/WRITE on the destination hive."
-                                                assigningHiveId = null
-                                            } else {
-                                                onAssignTag(hive.id, result.uid, false) { success, error ->
-                                                    if (success) {
-                                                        writeLaunchDataAfterAssignment(hive.id, result.uid) { verifyText = it }
-                                                    } else if (error?.contains("already assigned") == true) {
-                                                        reassignPrompt = hive.id to result.uid
-                                                    } else {
-                                                        verifyText = error ?: "Could not assign tag."
-                                                    }
-                                                    assigningHiveId = null
-                                                }
-                                            }
-                                        }
-                                        is NfcResult.Error -> { verifyText = result.message; assigningHiveId = null }
-                                        is NfcResult.Written -> Unit
-                                    }
+                                assignAndWriteOnScan(
+                                    hiveId = hive.id,
+                                    expectedUid = pendingUid,
+                                    consumePending = pendingUid != null
+                                ) { message ->
+                                    verifyText = message
+                                    assigningHiveId = null
                                 }
                             },
                             enabled = nfc.isAvailable() && nfc.isEnabled(),
@@ -2583,7 +4454,7 @@ private fun MoreScreen(
         Card(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.padding(16.dp)) {
                 Text("Native Android • Kotlin + Compose", fontWeight = FontWeight.Bold)
-                Text("Room offline database • NFC • CameraX • GPS • Voice • WorkManager • cloud sync outbox", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Room offline database • NFC • GPS • Voice • WorkManager • cloud sync outbox", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }

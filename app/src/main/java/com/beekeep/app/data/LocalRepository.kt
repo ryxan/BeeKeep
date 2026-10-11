@@ -1,5 +1,7 @@
 package com.beekeep.app.data
 
+import com.beekeep.app.ColonyStrength
+
 import android.content.Context
 import androidx.room.withTransaction
 import com.beekeep.app.cloud.CloudDocumentRow
@@ -14,8 +16,9 @@ class LocalHiveRepository(context: Context) {
     private val db = BeeKeepRoomDb.get(appContext)
 
     suspend fun initialize() {
+        // Keep real records imported from older BeeKeep versions. Never inject
+        // demo hives into an empty production database; an empty apiary is valid.
         LegacyImporter.importIfNeeded(appContext, db)
-        seedIfEmpty()
     }
 
     fun observeHives(): Flow<List<Hive>> = db.hives().observeAll().map { it.map(::toHive) }
@@ -40,23 +43,6 @@ class LocalHiveRepository(context: Context) {
     }
     suspend fun findHiveByNumberAndApiary(number: String, apiary: String): Hive? = withContext(Dispatchers.IO) {
         db.hives().byNumberAndApiary(number.trim(), apiary.trim()).let { it?.let(::toHive) }
-    }
-
-    private suspend fun seedIfEmpty() = withContext(Dispatchers.IO) {
-        db.withTransaction {
-            if (db.hives().countAll() == 0) {
-                val now = System.currentTimeMillis()
-                val home = ApiaryEntity(100L, "Home Yard", notes = "Main apiary", forageNotes = "Willow + clover", waterNotes = "Stock tank")
-                val out = ApiaryEntity(101L, "Out Yard A", forageNotes = "Canola", waterNotes = "Natural slough")
-                db.apiaries().upsert(home); db.apiaries().upsert(out)
-                db.hives().upsert(HiveEntity(1, "01", "Home Yard", 100, "Laying", queenMarkColor = "White", queenOrigin = "Graft", queenAgeMonths = 18, queenTemperament = 2, strength = 8, mitePercent = .8, tagUid = "BEEKEEP-HIVE-01", statusChangedAt = now))
-                db.hives().upsert(HiveEntity(2, "02", "Home Yard", 100, "Spotted", queenMarkColor = "Yellow", queenOrigin = "Package", queenAgeMonths = 9, queenTemperament = 3, strength = 7, mitePercent = 1.2, tagUid = "BEEKEEP-HIVE-02", statusChangedAt = now))
-                db.hives().upsert(HiveEntity(3, "03", "Out Yard A", 101, "Laying", queenMarkColor = "Red", queenOrigin = "Swarm", queenAgeMonths = 24, queenTemperament = 4, strength = 6, mitePercent = 2.3, tagUid = "BEEKEEP-HIVE-03", statusChangedAt = now))
-                db.nfcTagAssignments().upsert(NfcTagAssignmentEntity(1, "BEEKEEP-HIVE-01", 1, now))
-                db.nfcTagAssignments().upsert(NfcTagAssignmentEntity(2, "BEEKEEP-HIVE-02", 2, now))
-                db.nfcTagAssignments().upsert(NfcTagAssignmentEntity(3, "BEEKEEP-HIVE-03", 3, now))
-            }
-        }
     }
 
     suspend fun saveHive(h: Hive) = withContext(Dispatchers.IO) {
@@ -86,7 +72,9 @@ class LocalHiveRepository(context: Context) {
             deleted = existing?.deleted ?: false,
             status = existing?.status ?: h.status,
             deadAt = existing?.deadAt ?: h.deadAt,
-            statusChangedAt = existing?.statusChangedAt ?: now
+            statusChangedAt = existing?.statusChangedAt ?: now,
+            latitude = if (h.latitude != null && h.longitude != null) h.latitude else existing?.latitude,
+            longitude = if (h.latitude != null && h.longitude != null) h.longitude else existing?.longitude
         )
         db.hives().upsert(entity)
         enqueue("hive", h.id, "upsert", hivePayload(entity))
@@ -98,6 +86,21 @@ class LocalHiveRepository(context: Context) {
             db.events().upsert(event)
             enqueue("event", event.id, "upsert", eventPayload(event))
         }
+        }
+    }
+
+    suspend fun updateHiveLocation(hiveId: Long, latitude: Double, longitude: Double) = withContext(Dispatchers.IO) {
+        require(latitude.isFinite() && latitude in -90.0..90.0) { "Latitude is outside the valid range." }
+        require(longitude.isFinite() && longitude in -180.0..180.0) { "Longitude is outside the valid range." }
+        db.withTransaction {
+            val existing = db.hives().get(hiveId) ?: throw IllegalArgumentException("Hive not found.")
+            val updated = existing.copy(
+                latitude = latitude,
+                longitude = longitude,
+                updatedAt = System.currentTimeMillis()
+            )
+            db.hives().upsert(updated)
+            enqueue("hive", hiveId, "upsert", hivePayload(updated))
         }
     }
 
@@ -221,7 +224,7 @@ class LocalHiveRepository(context: Context) {
                 // Use wall-clock update time so backfilled inspections cannot make the hive look stale during sync.
                 db.hives().upsert(it.copy(strength = entity.strength, queenStatus = entity.queenStatus, mitePercent = entity.mitePercent, updatedAt = System.currentTimeMillis()))
             }
-            val event = ActivityEventEntity(i.id, i.hiveId, i.createdAt, "inspection", "Inspection", "Strength ${entity.strength}/10 • Mites ${String.format(java.util.Locale.US, "%.2f", entity.mitePercent)}%")
+            val event = ActivityEventEntity(i.id, i.hiveId, i.createdAt, "inspection", "Inspection", "Strength ${ColonyStrength.gradeFromStored(entity.strength)}/5 • ${ColonyStrength.labelFromStored(entity.strength)} • Mites ${String.format(java.util.Locale.US, "%.2f", entity.mitePercent)}%")
             db.events().upsert(event)
             enqueue("inspection", i.id, "upsert", inspectionPayload(entity))
             val updatedHive = db.hives().get(i.hiveId) ?: return@withTransaction
@@ -356,7 +359,9 @@ class LocalHiveRepository(context: Context) {
                     deleted = existing?.deleted ?: json.optBoolean("deleted", false),
                     status = status,
                     deadAt = if (lifecycleWins) json.longOrNull("dead_at") else existing.deadAt,
-                    statusChangedAt = if (lifecycleWins) incomingStatusChangedAt else existing.statusChangedAt
+                    statusChangedAt = if (lifecycleWins) incomingStatusChangedAt else existing.statusChangedAt,
+                    latitude = if (json.doubleOrNull("latitude") != null && json.doubleOrNull("longitude") != null) json.doubleOrNull("latitude") else existing?.latitude,
+                    longitude = if (json.doubleOrNull("latitude") != null && json.doubleOrNull("longitude") != null) json.doubleOrNull("longitude") else existing?.longitude
                 ))
                 // Older BeeKeep builds stored the tag on the hive document. Adopt it
                 // into the assignment ledger so mixed-version fleets still resolve scans.
@@ -412,7 +417,7 @@ class LocalHiveRepository(context: Context) {
         db.outbox().enqueue(SyncOutboxEntity(IdGenerator.nextLong(), type, entityId, operation, payload))
     }
 
-    private fun hivePayload(e: HiveEntity) = JSONObject().put("id",e.id).put("number",e.number).put("apiary",e.apiaryName).put("apiary_id",e.apiaryId).put("queen_status",e.queenStatus).put("queen_mark_color",e.queenMarkColor).put("queen_origin",e.queenOrigin).put("queen_age_months",e.queenAgeMonths).put("queen_temperament",e.queenTemperament).put("strength",e.strength).put("mite_percent",e.mitePercent).put("tag_uid",e.tagUid).put("updated_at",e.updatedAt).put("deleted",e.deleted).put("status",e.status).put("dead_at",e.deadAt).put("status_changed_at",e.statusChangedAt).toString()
+    private fun hivePayload(e: HiveEntity) = JSONObject().put("id",e.id).put("number",e.number).put("apiary",e.apiaryName).put("apiary_id",e.apiaryId).put("queen_status",e.queenStatus).put("queen_mark_color",e.queenMarkColor).put("queen_origin",e.queenOrigin).put("queen_age_months",e.queenAgeMonths).put("queen_temperament",e.queenTemperament).put("strength",e.strength).put("mite_percent",e.mitePercent).put("tag_uid",e.tagUid).put("updated_at",e.updatedAt).put("deleted",e.deleted).put("status",e.status).put("dead_at",e.deadAt).put("status_changed_at",e.statusChangedAt).put("latitude",e.latitude).put("longitude",e.longitude).toString()
     private fun nfcAssignmentPayload(e: NfcTagAssignmentEntity) = JSONObject().put("id",e.id).put("tag_uid",e.tagUid).put("hive_id",e.hiveId).put("assigned_at",e.assignedAt).put("unassigned_at",e.unassignedAt).put("updated_at",maxOf(e.assignedAt, e.unassignedAt ?: 0L)).toString()
     private fun apiaryPayload(e: ApiaryEntity) = JSONObject().put("id",e.id).put("name",e.name).put("notes",e.notes).put("latitude",e.latitude).put("longitude",e.longitude).put("forage_notes",e.forageNotes).put("water_notes",e.waterNotes).put("updated_at",e.updatedAt).put("deleted",e.deleted).toString()
     private fun inspectionPayload(e: InspectionEntity) = JSONObject().put("id",e.id).put("hive_id",e.hiveId).put("created_at",e.createdAt).put("strength",e.strength).put("queen_status",e.queenStatus).put("mite_count",e.miteCount).put("sample_size",e.sampleSize).put("notes",e.notes)
@@ -428,7 +433,7 @@ class LocalHiveRepository(context: Context) {
     private fun JSONObject.intOrNull(key: String): Int? = if (has(key) && !isNull(key)) optInt(key) else null
     private fun JSONObject.stringOrNull(key: String): String? = if (has(key) && !isNull(key)) optString(key) else null
 
-    private fun toHive(e: HiveEntity) = Hive(e.id, e.number, e.apiaryName, e.queenStatus, e.queenMarkColor, e.queenOrigin, e.queenAgeMonths, e.queenTemperament, e.strength, e.mitePercent, e.tagUid, e.status, e.deadAt)
+    private fun toHive(e: HiveEntity) = Hive(e.id, e.number, e.apiaryName, e.queenStatus, e.queenMarkColor, e.queenOrigin, e.queenAgeMonths, e.queenTemperament, e.strength, e.mitePercent, e.tagUid, e.status, e.deadAt, e.latitude, e.longitude)
     private fun toInspection(e: InspectionEntity) = Inspection(e.id, e.hiveId, e.createdAt, e.strength, e.queenStatus, e.miteCount, e.sampleSize, e.notes, e.photoPath, e.latitude, e.longitude, e.emergencyCells, e.supercedureCells, e.swarmCells, e.eggs, e.openBrood, e.cappedBrood, e.honeyStores, e.pollen, e.emptyDrawnComb, e.diseaseFlags)
     private fun toFeeding(e: FeedingEntity) = Feeding(e.id, e.hiveId, e.createdAt, e.feedType, e.ratio, e.amount, e.unit, e.notes)
     private fun toTreatment(e: TreatmentEntity) = Treatment(e.id, e.hiveId, e.createdAt, e.treatmentType, e.product, e.insertedAt, e.removalAt, e.withdrawalUntil, e.notes)

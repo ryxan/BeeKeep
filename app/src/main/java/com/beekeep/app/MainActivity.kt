@@ -133,6 +133,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
@@ -574,26 +575,57 @@ fun BeeKeepApp(
 
     unassignedTagUid?.let { uid ->
         AlertDialog(
-            onDismissRequest = { unassignedTagUid = null },
+            // Keep outside taps from dismissing this dialog and revealing the
+            // scan screen underneath. Back and the explicit Cancel action exit safely.
+            onDismissRequest = {
+                unassignedTagUid = null
+                nfc.stop(activity)
+                scanning = false
+                screen = Screen.HOME
+            },
+            properties = DialogProperties(dismissOnClickOutside = false),
             title = { Text("Unassigned NFC tag", fontWeight = FontWeight.ExtraBold) },
             text = { Text("Tag $uid is not assigned to a colony. What would you like to do with it?") },
             confirmButton = {
-                TextButton(onClick = {
-                    unassignedTagUid = null
-                    pendingTagUid = uid
-                    screen = Screen.TAG_MANAGER
-                }) { Text("ASSIGN TO EXISTING HIVE", fontWeight = FontWeight.ExtraBold) }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = {
-                        unassignedTagUid = null
-                        pendingTagUid = uid
-                        addHive = true
-                    }) { Text("CREATE NEW HIVE") }
-                    TextButton(onClick = { unassignedTagUid = null }) { Text("CANCEL") }
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            pendingTagUid = uid
+                            screen = Screen.TAG_MANAGER
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("ASSIGN TO EXISTING HIVE", fontWeight = FontWeight.ExtraBold)
+                    }
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            pendingTagUid = uid
+                            addHive = true
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("CREATE NEW HIVE", fontWeight = FontWeight.ExtraBold)
+                    }
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            nfc.stop(activity)
+                            scanning = false
+                            screen = Screen.HOME
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("CANCEL", fontWeight = FontWeight.ExtraBold)
+                    }
                 }
-            }
+            },
+            dismissButton = {}
         )
     }
 

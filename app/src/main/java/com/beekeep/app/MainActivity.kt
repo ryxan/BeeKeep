@@ -2,10 +2,15 @@ package com.beekeep.app
 
 import android.Manifest
 import android.content.Intent
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -17,10 +22,11 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,12 +37,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -48,12 +54,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.LocationOn
+import androidx.compose.material.icons.rounded.MyLocation
+import androidx.compose.material.icons.rounded.Map
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Nfc
 import androidx.compose.material.icons.rounded.Search
@@ -61,14 +68,19 @@ import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.TaskAlt
 import androidx.compose.material.icons.rounded.Yard
 import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Divider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -94,27 +106,33 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.compose.runtime.produceState
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.withContext
-import java.io.File
 import com.beekeep.app.data.IdGenerator
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
@@ -130,14 +148,12 @@ import com.beekeep.app.cloud.CloudResult
 import com.beekeep.app.cloud.CloudSyncScheduler
 import com.beekeep.app.cloud.SupabaseGateway
 import com.beekeep.app.location.LocationController
-import com.beekeep.app.media.PhotoStore
 import com.beekeep.app.nfc.NfcController
 import com.beekeep.app.nfc.BeeKeepNfcPayload
 import com.beekeep.app.nfc.NfcResult
-import com.beekeep.app.ui.camera.CameraCaptureView
+import com.beekeep.app.nfc.NfcTagResolution
 import com.beekeep.app.ui.theme.BeeKeepTheme
-import com.beekeep.app.ui.theme.LandscapeDay
-import com.beekeep.app.ui.theme.LandscapeDusk
+import com.beekeep.app.ui.theme.BeeKeepAccent
 import com.beekeep.app.ui.theme.NavBarDark
 import com.beekeep.app.ui.theme.NavBarLight
 import com.beekeep.app.ui.theme.NavIndicator
@@ -150,80 +166,8 @@ import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
-import org.json.JSONObject
 
 private const val PREFS = "beekeep_prefs"
-private const val INSPECTION_NOTE_DRAFTS = "beekeep_inspection_note_drafts"
-private const val INSPECTION_FORM_DRAFTS = "beekeep_inspection_form_drafts"
-
-private data class InspectionFormDraft(
-    val strength: Int,
-    val queenStatus: String,
-    val miteCount: Int,
-    val sampleSize: Int,
-    val eggs: Int,
-    val openBrood: Int,
-    val cappedBrood: Int,
-    val honeyStores: Int,
-    val pollen: Int,
-    val emptyDrawnComb: Int,
-    val emergencyCells: Int,
-    val supercedureCells: Int,
-    val swarmCells: Int,
-    val diseaseFlags: String,
-    val updatedAt: Long
-)
-
-private fun readInspectionFormDraft(
-    prefs: android.content.SharedPreferences,
-    hiveId: Long
-): InspectionFormDraft? {
-    val raw = prefs.getString("hive_$hiveId", null) ?: return null
-    return runCatching {
-        val json = JSONObject(raw)
-        InspectionFormDraft(
-            strength = json.optInt("strength", 5),
-            queenStatus = json.optString("queenStatus", "Laying"),
-            miteCount = json.optInt("miteCount", 0),
-            sampleSize = json.optInt("sampleSize", 300).coerceAtLeast(1),
-            eggs = json.optInt("eggs", 0),
-            openBrood = json.optInt("openBrood", 0),
-            cappedBrood = json.optInt("cappedBrood", 0),
-            honeyStores = json.optInt("honeyStores", 0),
-            pollen = json.optInt("pollen", 0),
-            emptyDrawnComb = json.optInt("emptyDrawnComb", 0),
-            emergencyCells = json.optInt("emergencyCells", 0),
-            supercedureCells = json.optInt("supercedureCells", 0),
-            swarmCells = json.optInt("swarmCells", 0),
-            diseaseFlags = json.optString("diseaseFlags", ""),
-            updatedAt = json.optLong("updatedAt", 0L)
-        )
-    }.getOrNull()
-}
-
-private fun saveInspectionFormDraft(
-    prefs: android.content.SharedPreferences,
-    hiveId: Long,
-    draft: InspectionFormDraft
-) {
-    val json = JSONObject()
-        .put("strength", draft.strength.coerceIn(0, 10))
-        .put("queenStatus", draft.queenStatus)
-        .put("miteCount", draft.miteCount.coerceAtLeast(0))
-        .put("sampleSize", draft.sampleSize.coerceAtLeast(1))
-        .put("eggs", draft.eggs.coerceAtLeast(0))
-        .put("openBrood", draft.openBrood.coerceAtLeast(0))
-        .put("cappedBrood", draft.cappedBrood.coerceAtLeast(0))
-        .put("honeyStores", draft.honeyStores.coerceAtLeast(0))
-        .put("pollen", draft.pollen.coerceAtLeast(0))
-        .put("emptyDrawnComb", draft.emptyDrawnComb.coerceAtLeast(0))
-        .put("emergencyCells", draft.emergencyCells.coerceAtLeast(0))
-        .put("supercedureCells", draft.supercedureCells.coerceAtLeast(0))
-        .put("swarmCells", draft.swarmCells.coerceAtLeast(0))
-        .put("diseaseFlags", draft.diseaseFlags)
-        .put("updatedAt", System.currentTimeMillis())
-    prefs.edit { putString("hive_$hiveId", json.toString()) }
-}
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private val nfc = NfcController()
@@ -231,7 +175,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var speechEngine: TextToSpeech? = null
     private var speechReady = false
     private var pendingSpeech: String? = null
-    private lateinit var photoStore: PhotoStore
     private lateinit var locationController: LocationController
     private lateinit var cloudGateway: SupabaseGateway
 
@@ -241,7 +184,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         speechEngine = TextToSpeech(this, this)
         nfc.attach(this)
         handleNfcIntent(intent)
-        photoStore = PhotoStore(this)
         locationController = LocationController(this)
         val repository = LocalHiveRepository(applicationContext)
         // Keep NFC in foreground-reader mode while BeeKeep is visible. This takes
@@ -251,8 +193,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
                     val assignedHive = repository.findHiveByNfc(result.uid)
-                    val payloadHive = BeeKeepNfcPayload.hiveId(result.text)?.let { repository.getHive(it) }
-                    if (assignedHive != null || payloadHive != null) {
+                    if (assignedHive != null || result.info.hasBeeKeepLaunchRecord ||
+                        BeeKeepNfcPayload.isBeeKeepPayload(result.text) || result.launchPreparationError != null) {
                         pendingNfcResult.value = result
                     }
                 }
@@ -266,19 +208,33 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         setContent {
             var darkMode by rememberSaveable { mutableStateOf(prefs.getBoolean("dark_mode", false)) }
+            var largeFieldText by rememberSaveable { mutableStateOf(prefs.getBoolean("large_field_text", false)) }
             BeeKeepTheme(darkMode = darkMode) {
-                androidx.compose.runtime.SideEffect {
-                    val controller = WindowCompat.getInsetsController(window, window.decorView)
-                    controller.isAppearanceLightStatusBars = !darkMode
-                    controller.isAppearanceLightNavigationBars = false
-                }
-                val incomingNfc by pendingNfcResult.collectAsStateWithLifecycle()
-                BeeKeepApp(
-                    vm, nfc, this, photoStore, locationController, cloud, darkMode, incomingNfc,
-                    onSpeakHiveNumber = ::speakHiveNumber
-                ) { value ->
-                    darkMode = value
-                    prefs.edit { putBoolean("dark_mode", value) }
+                val baseDensity = androidx.compose.ui.platform.LocalDensity.current
+                androidx.compose.runtime.CompositionLocalProvider(
+                    androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(baseDensity.density,
+                        fontScale = if (largeFieldText) (baseDensity.fontScale * 1.12f).coerceAtMost(2.0f) else baseDensity.fontScale
+                    )
+                ) {
+                    androidx.compose.runtime.SideEffect {
+                        val controller = WindowCompat.getInsetsController(window, window.decorView)
+                        controller.isAppearanceLightStatusBars = !darkMode
+                        controller.isAppearanceLightNavigationBars = false
+                    }
+                    val incomingNfc by pendingNfcResult.collectAsStateWithLifecycle()
+                    BeeKeepApp(
+                        vm, nfc, this, locationController, cloud, darkMode, incomingNfc,
+                        onSpeakHiveNumber = ::speakHiveNumber,
+                        largeFieldText = largeFieldText,
+                        onLargeFieldTextChange = { value ->
+                            largeFieldText = value
+                            prefs.edit { putBoolean("large_field_text", value) }
+                        },
+                        onDarkModeChange = { value ->
+                            darkMode = value
+                            prefs.edit { putBoolean("dark_mode", value) }
+                        }
+                    )
                 }
             }
         }
@@ -364,10 +320,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
 enum class Screen {
     HOME,
+    HIVES,
+    PREMADE_SETUP,
     APIARIES,
     APIARY_HIVES,
+    MAP,
     SCAN,
     MORE,
+    SETTINGS,
     TAG_MANAGER,
     COLONY_HISTORY
 }
@@ -385,25 +345,43 @@ fun BeeKeepApp(
     vm: BeeKeepViewModel,
     nfc: NfcController,
     activity: ComponentActivity,
-    photoStore: PhotoStore,
     locationController: LocationController,
     cloud: SupabaseGateway,
     darkMode: Boolean,
     incomingNfc: NfcResult.Read?,
     onSpeakHiveNumber: (String) -> Unit,
+    largeFieldText: Boolean,
+    onLargeFieldTextChange: (Boolean) -> Unit,
     onDarkModeChange: (Boolean) -> Unit
 ) {
+    val context = LocalContext.current
+    val autoVoicePrefs = remember(context) {
+        context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+    }
+    var autoVoiceEnabled by rememberSaveable {
+        mutableStateOf(autoVoicePrefs.getBoolean("auto_voice_on_nfc", true))
+    }
     var screen by rememberSaveable { mutableStateOf(Screen.HOME) }
     var selectedHiveOpen by rememberSaveable { mutableStateOf(false) }
     var selectedApiaryName by rememberSaveable { mutableStateOf<String?>(null) }
+    var mapOrigin by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var mapFocusApiaryId by rememberSaveable { mutableStateOf<Long?>(null) }
     var inspecting by rememberSaveable { mutableStateOf(false) }
     var addHive by rememberSaveable { mutableStateOf(false) }
     var logType by rememberSaveable { mutableStateOf<HiveLogType?>(null) }
     var addApiary by rememberSaveable { mutableStateOf(false) }
     var editingApiary by remember { mutableStateOf<Apiary?>(null) }
     var unassignedTagUid by rememberSaveable { mutableStateOf<String?>(null) }
+    var lastHiveTagSuccessHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var lastHiveTagSuccessUid by rememberSaveable { mutableStateOf<String?>(null) }
+    var unassignedTagOrigin by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var tagManagerReturnScreen by rememberSaveable { mutableStateOf(Screen.MORE) }
     var pendingTagUid by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingInspectionHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var pendingAutoStartVoiceHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    var firstRunPromptVisible by rememberSaveable { mutableStateOf(false) }
+    var firstRunPromptChecked by rememberSaveable { mutableStateOf(false) }
     var pendingLocationHive by remember { mutableStateOf<Hive?>(null) }
     var pendingApiaryMove by remember { mutableStateOf<Pair<Hive, Apiary>?>(null) }
     var locationCheckCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -420,6 +398,57 @@ fun BeeKeepApp(
     val treatments by vm.treatments.collectAsStateWithLifecycle()
     val harvests by vm.harvests.collectAsStateWithLifecycle()
     val ready by vm.ready.collectAsStateWithLifecycle()
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var nfcEnabledForIndicator by remember(nfc) {
+        mutableStateOf(nfc.isAvailable() && nfc.isEnabled())
+    }
+    DisposableEffect(lifecycleOwner, nfc) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                nfcEnabledForIndicator = nfc.isAvailable() && nfc.isEnabled()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        nfcEnabledForIndicator = nfc.isAvailable() && nfc.isEnabled()
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Offer first-run setup only after every record stream has hydrated. Existing
+    // workspaces are marked as initialized silently so upgrades are never interrupted.
+    androidx.compose.runtime.LaunchedEffect(ready, hives, deadHives, apiaries) {
+        if (!ready || firstRunPromptChecked) return@LaunchedEffect
+        firstRunPromptChecked = true
+        val setupAlreadyCompleted = autoVoicePrefs.getBoolean("initial_setup_completed", false)
+        if (!setupAlreadyCompleted && hives.isEmpty() && deadHives.isEmpty() && apiaries.isEmpty()) {
+            firstRunPromptVisible = true
+        } else if (!setupAlreadyCompleted) {
+            autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
+        }
+    }
+
+    // Wait until the ViewModel has loaded the scanned hive before presenting Inspect.
+    androidx.compose.runtime.LaunchedEffect(selected?.id, pendingInspectionHiveId) {
+        val targetHiveId = pendingInspectionHiveId ?: return@LaunchedEffect
+        if (selected?.id == targetHiveId) {
+            inspecting = true
+            pendingInspectionHiveId = null
+        }
+    }
+
+    // Keep the NFC writer's UID protection and released-tag history synchronized with Room.
+    androidx.compose.runtime.LaunchedEffect(ready, hives, deadHives) {
+        if (!ready) {
+            nfc.updateKnownHiveTags(emptyMap(), ready)
+            return@LaunchedEffect
+        }
+        // Include inactive colonies too; their current tags must never be treated as blank.
+        val assignments = (hives + deadHives).mapNotNull { hive ->
+            hive.tagUid?.trim()?.takeIf { it.isNotBlank() }?.let { it to hive.id }
+        }.toMap()
+        val releasedTagUids = vm.getUnassignedNfcTagUids()
+        nfc.updateKnownHiveTags(assignments, ready, releasedTagUids)
+    }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -460,22 +489,33 @@ fun BeeKeepApp(
                 // clearly away from the assigned yard and close to another saved yard.
                 if (assignedDistance <= 300f) return@launch
                 val nearestOther = apiaries
-                    .filter { apiary ->
-                        apiary.latitude != null && apiary.longitude != null &&
-                            (currentApiary == null || apiary.id != currentApiary.id)
-                    }
-                    .map { apiary ->
+                    .filter { apiary -> currentApiary == null || apiary.id != currentApiary.id }
+                    .mapNotNull { apiary ->
+                        val latitude = apiary.latitude ?: return@mapNotNull null
+                        val longitude = apiary.longitude ?: return@mapNotNull null
                         apiary to distanceMeters(
                             phoneLocation.latitude, phoneLocation.longitude,
-                            apiary.latitude!!, apiary.longitude!!
+                            latitude, longitude
                         )
                     }
                     .filter { it.second <= 500f }
                     .minByOrNull { it.second }
                 if (nearestOther != null) {
-                    pendingApiaryMove = hive to nearestOther.first
+                    val targetApiary = nearestOther.first
+                    if (autoVoicePrefs.getBoolean("auto_move_hive_apiary", false)) {
+                        vm.moveHiveToApiary(hive.id, targetApiary.name) { success, error ->
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    if (success) "${hiveReferenceName(hive.number)} moved from ${hive.apiary} to ${targetApiary.name}"
+                                    else error ?: "Could not move ${hiveReferenceName(hive.number)} to ${targetApiary.name}."
+                                )
+                            }
+                        }
+                    } else {
+                        pendingApiaryMove = hive to targetApiary
+                    }
                 } else if (currentApiary != null) {
-                    snackbarHostState.showSnackbar("Hive ${hive.number} is far from ${currentApiary.name}, but no other saved apiary GPS location is nearby. No changes made.")
+                    snackbarHostState.showSnackbar("${hiveReferenceName(hive.number)} is far from ${currentApiary.name}, but no other saved apiary GPS location is nearby. No changes made.")
                 } else {
                     snackbarHostState.showSnackbar("No saved apiary GPS location is close enough to identify a destination. No changes made.")
                 }
@@ -486,6 +526,9 @@ fun BeeKeepApp(
     androidx.compose.runtime.LaunchedEffect(ready, incomingNfc?.uid, screen) {
         val result = incomingNfc ?: return@LaunchedEffect
         if (!ready) return@LaunchedEffect
+        result.launchPreparationError?.let { message ->
+            scope.launch { snackbarHostState.showSnackbar(message) }
+        }
 
         // Manual NFC management and scan screens own their tag reads. Ignore
         // passive-reader notifications there, otherwise a just-assigned tag can
@@ -495,25 +538,60 @@ fun BeeKeepApp(
             return@LaunchedEffect
         }
 
-        val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
         val assignedHive = vm.findHiveByTag(result.uid)
-        val payloadHive = payloadHiveId?.let { id -> hives.firstOrNull { it.id == id } }
-        val resolvedHive = assignedHive ?: payloadHive
+        val resolvedHiveId = NfcTagResolution.resolveHiveId(assignedHive?.id)
+        val resolvedHive = assignedHive?.takeIf { it.id == resolvedHiveId }
+        val openHiveForTagAssignment = selected?.takeIf { selectedHiveOpen && !it.isDead }
         if (resolvedHive != null) {
             checkHiveLocation(resolvedHive)
             // Announce every accepted tag read, even when this hive is already open.
-            onSpeakHiveNumber(resolvedHive.number)
-            // A tag may be seen repeatedly while held near the phone. Do not
-            // reload the same hive detail screen if it is already open.
+            if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
+            // Field NFC scans go directly to Inspect so the beekeeper can keep gloves on.
             val alreadyOpen = selectedHiveOpen && selected?.id == resolvedHive.id
+            val alreadyInspectingThisHive = inspecting && selected?.id == resolvedHive.id
+            if (!alreadyInspectingThisHive) pendingAutoStartVoiceHiveId = resolvedHive.id
             if (!alreadyOpen) {
                 vm.openHive(resolvedHive.id)
                 selectedHiveOpen = true
-                screen = Screen.HOME
-                scope.launch { snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized") }
+            }
+            screen = Screen.HOME
+            if (selected?.id == resolvedHive.id) {
+                inspecting = true
+            } else {
+                pendingInspectionHiveId = resolvedHive.id
+            }
+            if (!alreadyOpen) scope.launch { snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready") }
+        } else if (openHiveForTagAssignment != null) {
+            // When a hive is already open, treat a newly scanned unassigned tag as
+            // belonging to that hive. Keep the beekeeper on this page instead of
+            // showing the generic "assign or create" dialog.
+            val targetHive = openHiveForTagAssignment
+            lastHiveTagSuccessHiveId = null
+            lastHiveTagSuccessUid = null
+            if (result.launchPreparationError != null) {
+                scope.launch {
+                    snackbarHostState.showSnackbar(
+                        "Tag was not assigned because BeeKeep could not prepare it for app launch. " +
+                            result.launchPreparationError + " Use WRITE TAG on this hive to retry."
+                    )
+                }
+            } else {
+                vm.assignTagToHive(targetHive.id, result.uid) { success, error ->
+                    if (success) {
+                        lastHiveTagSuccessHiveId = targetHive.id
+                        lastHiveTagSuccessUid = result.uid
+                    }
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (success) "NFC tag assigned to ${hiveReferenceName(targetHive.number)}"
+                            else error ?: "Could not assign the NFC tag to ${hiveReferenceName(targetHive.number)}."
+                        )
+                    }
+                }
             }
         } else {
             screen = Screen.SCAN
+            unassignedTagOrigin = Screen.HOME
             unassignedTagUid = result.uid
         }
         (activity as? MainActivity)?.pendingNfcResult?.value = null
@@ -521,26 +599,62 @@ fun BeeKeepApp(
 
     unassignedTagUid?.let { uid ->
         AlertDialog(
-            onDismissRequest = { unassignedTagUid = null },
+            // Keep outside taps from dismissing this dialog and revealing the
+            // scan screen underneath. Back and the explicit Cancel action exit safely.
+            onDismissRequest = {
+                unassignedTagUid = null
+                nfc.stop(activity)
+                scanning = false
+                if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
+            },
+            properties = DialogProperties(dismissOnClickOutside = false),
             title = { Text("Unassigned NFC tag", fontWeight = FontWeight.ExtraBold) },
             text = { Text("Tag $uid is not assigned to a colony. What would you like to do with it?") },
             confirmButton = {
-                TextButton(onClick = {
-                    unassignedTagUid = null
-                    pendingTagUid = uid
-                    screen = Screen.TAG_MANAGER
-                }) { Text("ASSIGN TO EXISTING HIVE", fontWeight = FontWeight.ExtraBold) }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = {
-                        unassignedTagUid = null
-                        pendingTagUid = uid
-                        addHive = true
-                    }) { Text("CREATE NEW HIVE") }
-                    TextButton(onClick = { unassignedTagUid = null }) { Text("CANCEL") }
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            pendingTagUid = uid
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) {
+                                tagManagerReturnScreen = unassignedTagOrigin
+                            }
+                            screen = Screen.TAG_MANAGER
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("ASSIGN TO EXISTING HIVE", fontWeight = FontWeight.ExtraBold)
+                    }
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            pendingTagUid = uid
+                            // Return to Home after creating a hive from the scanner prompt.
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
+                            addHive = true
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("CREATE NEW HIVE", fontWeight = FontWeight.ExtraBold)
+                    }
+                    TextButton(
+                        onClick = {
+                            unassignedTagUid = null
+                            nfc.stop(activity)
+                            scanning = false
+                            if (unassignedTagOrigin != Screen.TAG_MANAGER) screen = Screen.HOME
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) {
+                        Text("CANCEL", fontWeight = FontWeight.ExtraBold)
+                    }
                 }
-            }
+            },
+            dismissButton = {}
         )
     }
 
@@ -549,7 +663,7 @@ fun BeeKeepApp(
             onDismissRequest = { pendingApiaryMove = null },
             title = { Text("Hive scanned at another apiary?", fontWeight = FontWeight.ExtraBold) },
             text = {
-                Text("Hive ${hive.number} is assigned to ${hive.apiary}, but your phone's GPS is near ${targetApiary.name}. Would you like to move this hive to ${targetApiary.name}?")
+                Text("${hiveReferenceName(hive.number)} is assigned to ${hive.apiary}, but your phone's GPS is near ${targetApiary.name}. Would you like to move this hive to ${targetApiary.name}?")
             },
             confirmButton = {
                 TextButton(onClick = {
@@ -557,7 +671,7 @@ fun BeeKeepApp(
                         pendingApiaryMove = null
                         scope.launch {
                             snackbarHostState.showSnackbar(
-                                if (success) "Hive ${hive.number} moved to ${targetApiary.name}"
+                                if (success) "${hiveReferenceName(hive.number)} moved to ${targetApiary.name}"
                                 else error ?: "Could not move the hive."
                             )
                         }
@@ -581,7 +695,13 @@ fun BeeKeepApp(
     }
 
     if (addHive) {
-        AddHiveScreen(apiaries, selectedApiaryName, { addHive = false }) { number, apiary, queen, strength ->
+        AddHiveScreen(
+            apiaries = apiaries,
+            initialApiary = selectedApiaryName,
+            defaultQueenStatus = autoVoicePrefs.getString("default_queen_status", "Laying")?.takeIf { it in setOf("Laying", "Queenless", "Virgin") } ?: "Laying",
+            defaultStrength = autoVoicePrefs.getInt("default_starting_strength", 3).coerceIn(1, 5),
+            onBack = { addHive = false; pendingTagUid = null }
+        ) { number, apiary, queen, strength ->
             vm.createHive(number, apiary, queen, strength, tagUid = pendingTagUid) { success, error ->
                 scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${number.trim()} created") }
                 if (success) { addHive = false; pendingTagUid = null }
@@ -589,14 +709,34 @@ fun BeeKeepApp(
         }
         return
     }
-    if (editingApiary != null) {
-        val apiaryToEdit = editingApiary!!
-        AddApiaryScreen(locationController, apiaryToEdit, { editingApiary = null }) { id, name, notes, lat, lon, forage, water ->
-            vm.updateApiary(id ?: apiaryToEdit.id, name, notes, lat, lon, forage, water) { success, error ->
-                scope.launch { snackbarHostState.showSnackbar(error ?: "Apiary updated") }
-                if (success) editingApiary = null
+    val apiaryToEdit = editingApiary
+    if (apiaryToEdit != null) {
+        AddApiaryScreen(
+            locationController = locationController,
+            existingApiary = apiaryToEdit,
+            onBack = { editingApiary = null },
+            onDelete = { apiaryId, onResult ->
+                vm.deleteApiaryPermanently(apiaryId) { success, error ->
+                    scope.launch {
+                        snackbarHostState.showSnackbar(error ?: "Apiary and its hives deleted")
+                    }
+                    if (success) {
+                        if (selectedApiaryName?.equals(apiaryToEdit.name, ignoreCase = true) == true) {
+                            selectedApiaryName = null
+                            if (screen == Screen.APIARY_HIVES) screen = Screen.APIARIES
+                        }
+                        editingApiary = null
+                    }
+                    onResult(success, error)
+                }
+            },
+            onSave = { id, name, notes, lat, lon, forage, water ->
+                vm.updateApiary(id ?: apiaryToEdit.id, name, notes, lat, lon, forage, water) { success, error ->
+                    scope.launch { snackbarHostState.showSnackbar(error ?: "Apiary updated") }
+                    if (success) editingApiary = null
+                }
             }
-        }
+        )
         return
     }
     if (addApiary) {
@@ -611,16 +751,42 @@ fun BeeKeepApp(
     if (inspecting) {
         val hiveForInspection = selected ?: run { inspecting = false; return }
         InspectionScreen(
-            activity, photoStore, locationController, hiveForInspection,
+            activity, locationController, hiveForInspection,
             priorInspections = inspections,
-            onBack = { inspecting = false },
+            defaultMiteSampleSize = autoVoicePrefs.getInt("default_mite_sample_size", 300).coerceIn(1, 10000),
+            defaultStartingStrength = autoVoicePrefs.getInt("default_starting_strength", 3).coerceIn(1, 5),
+            rememberLastInspectionValues = autoVoicePrefs.getBoolean("remember_last_inspection_values", true),
+            voiceReadyBeepEnabled = autoVoicePrefs.getBoolean("voice_ready_beep", true),
+            autoStartVoice = pendingAutoStartVoiceHiveId == hiveForInspection.id,
+            autoVoiceEnabled = autoVoiceEnabled,
+            onVoiceAutoStartConsumed = {
+                if (pendingAutoStartVoiceHiveId == hiveForInspection.id) pendingAutoStartVoiceHiveId = null
+            },
+            onSaveHiveLocation = { hiveId, latitude, longitude, onResult ->
+                vm.updateHiveLocation(hiveId, latitude, longitude, onResult)
+            },
+            onBack = { pendingAutoStartVoiceHiveId = null; inspecting = false },
+            onHome = {
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
+                selectedHiveOpen = false
+                selectedApiaryName = null
+                screen = Screen.HOME
+                vm.clearHive()
+            },
             onSave = { inspection ->
                 val saved = vm.saveInspection(inspection)
                 if (saved) {
                     // Keep the full note log (including an intentional empty value) available for the next Inspect session.
                     activity.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
                         .edit { putString("hive_${inspection.hiveId}", inspection.notes) }
-                    inspecting = false
+                    if (vm.selected.value?.id == inspection.hiveId) {
+                        if (pendingAutoStartVoiceHiveId == inspection.hiveId) {
+                            pendingAutoStartVoiceHiveId = null
+                        }
+                        inspecting = false
+                    }
                     scope.launch { snackbarHostState.showSnackbar("Inspection saved") }
                 } else {
                     scope.launch { snackbarHostState.showSnackbar("Could not save inspection. Your field screen is still open; try again.") }
@@ -678,22 +844,37 @@ fun BeeKeepApp(
             nfc = nfc,
             activity = activity,
             onBack = { selectedHiveOpen = false; vm.clearHive() },
-            onInspect = { inspecting = true },
+            onHome = {
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
+                selectedHiveOpen = false
+                selectedApiaryName = null
+                screen = Screen.HOME
+                vm.clearHive()
+            },
+            onInspect = { pendingAutoStartVoiceHiveId = null; inspecting = true },
             onFeed = { logType = HiveLogType.FEED },
             onTreat = { logType = HiveLogType.TREAT },
             onHarvest = { logType = HiveLogType.HARVEST },
             onTag = { uid, onResult -> vm.assignTag(uid, onResult) },
-            onClearTag = { vm.clearTag() },
+            onClearTag = { hiveId, onResult -> vm.clearTagForHive(hiveId, onResult) },
+            confirmBeforeTagRemoval = autoVoicePrefs.getBoolean("confirm_tag_removal", true),
+            tagAssignmentSuccessUid = if (lastHiveTagSuccessHiveId == hiveForDetail.id) lastHiveTagSuccessUid else null,
             onVerifyTag = {
                 nfc.startRead(activity) { result ->
                     when (result) {
                         is NfcResult.Read -> {
                             val matchesUid = result.uid.equals(hiveForDetail.tagUid, ignoreCase = true)
-                            val payloadHive = BeeKeepNfcPayload.hiveId(result.text)
+                            val currentMarker = BeeKeepNfcPayload.isTagPayload(result.text) && result.info.hasBeeKeepLaunchRecord
                             scope.launch {
                                 snackbarHostState.showSnackbar(
-                                    if (matchesUid && (payloadHive == null || payloadHive == hiveForDetail.id)) "NFC tag verified"
-                                    else "Tag read • ${result.uid} • does not match this hive"
+                                    when {
+                                        !matchesUid -> "Tag read • ${result.uid} • does not match this hive"
+                                        currentMarker -> "NFC tag verified • no hive data stored on tag"
+                                        BeeKeepNfcPayload.hiveId(result.text) != null -> "UID matches, but this tag still has old hive data. Scan it in BeeKeep to upgrade it."
+                                        else -> "UID matches, but the BeeKeep app-launch marker is missing. Use WRITE TAG to repair it."
+                                    }
                                 )
                             }
                         }
@@ -702,21 +883,20 @@ fun BeeKeepApp(
                     }
                 }
             },
-            onEditQueen = { status, mark, origin, age, temperament -> vm.updateQueenProfile(status, mark, origin, age, temperament) },
             onMarkDead = {
                 vm.markHiveDead(hiveForDetail.id) { _, error ->
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${hiveForDetail.number} marked dead. History preserved.") }
+                    scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} marked dead. History preserved.") }
                 }
             },
             onRestore = {
                 vm.restoreHive(hiveForDetail.id) { _, error ->
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${hiveForDetail.number} restored to active.") }
+                    scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} restored to active.") }
                 }
             },
             onDelete = {
                 vm.deleteHivePermanently(hiveForDetail.id) { success, error ->
                     if (success) { selectedHiveOpen = false; vm.clearHive() }
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${hiveForDetail.number} permanently deleted.") }
+                    scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} permanently deleted.") }
                 }
             }
         )
@@ -729,23 +909,28 @@ fun BeeKeepApp(
             onBack = { nfc.stop(activity); scanning = false; screen = Screen.HOME },
             onCancelScan = { nfc.stop(activity); scanning = false },
             onScan = {
-                nfc.startRead(activity) { result ->
+                nfc.startReadAndPrepareForBeeKeep(activity) { result ->
                     scanning = false
                     when (result) {
                         is NfcResult.Read -> {
+                            result.launchPreparationError?.let { message ->
+                                scope.launch { snackbarHostState.showSnackbar(message) }
+                            }
                             scope.launch {
-                                val payloadId = BeeKeepNfcPayload.hiveId(result.text)
                                 val assignedHive = vm.findHiveByTag(result.uid)
-                                val payloadHive = payloadId?.let { id -> hives.firstOrNull { it.id == id } }
-                                val resolvedHive = assignedHive ?: payloadHive
+                                val resolvedHiveId = NfcTagResolution.resolveHiveId(assignedHive?.id)
+                                val resolvedHive = assignedHive?.takeIf { it.id == resolvedHiveId }
                                 if (resolvedHive != null) {
                                     checkHiveLocation(resolvedHive)
-                                    onSpeakHiveNumber(resolvedHive.number)
+                                    if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
                                     vm.openHive(resolvedHive.id)
                                     selectedHiveOpen = true
                                     screen = Screen.HOME
-                                    snackbarHostState.showSnackbar("Hive ${resolvedHive.number} recognized")
+                                    pendingAutoStartVoiceHiveId = resolvedHive.id
+                                    pendingInspectionHiveId = resolvedHive.id
+                                    snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready")
                                 } else {
+                                    unassignedTagOrigin = Screen.HOME
                                     unassignedTagUid = result.uid
                                 }
                             }
@@ -755,6 +940,24 @@ fun BeeKeepApp(
                     }
                 }
                 scanning = nfc.isScanning()
+            }
+        )
+        return
+    }
+    if (screen == Screen.PREMADE_SETUP) {
+        PreMadeHiveSetupScreen(
+            vm = vm,
+            onBack = {
+                screen = Screen.HOME
+                firstRunPromptVisible = !autoVoicePrefs.getBoolean("initial_setup_completed", false)
+            },
+            onComplete = { createdApiaries, createdHives ->
+                autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
+                firstRunPromptVisible = false
+                screen = Screen.HOME
+                scope.launch {
+                    snackbarHostState.showSnackbar("Created $createdApiaries apiaries and $createdHives hives.")
+                }
             }
         )
         return
@@ -778,29 +981,111 @@ fun BeeKeepApp(
     Scaffold(
         snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
         bottomBar = {
-            NavigationBar(containerColor = if (darkMode) NavBarDark else NavBarLight, contentColor = OnNavBar, tonalElevation = 0.dp) {
-                NavItem("Home", Icons.Rounded.Home, screen == Screen.HOME) { screen = Screen.HOME }
+            NavigationBar(
+                modifier = Modifier.clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)),
+                containerColor = if (darkMode) NavBarDark else NavBarLight,
+                contentColor = OnNavBar,
+                tonalElevation = 0.dp
+            ) {
+                NavItem("Home", Icons.Rounded.Home, screen == Screen.HOME || screen == Screen.HIVES) { screen = Screen.HOME }
                 NavItem("Apiaries", Icons.Rounded.Yard, screen == Screen.APIARIES || screen == Screen.APIARY_HIVES) { selectedApiaryName = null; screen = Screen.APIARIES }
-                NavItem("Scan", Icons.Rounded.Nfc, screen == Screen.SCAN) { screen = Screen.SCAN }
-                NavItem("More", Icons.Rounded.Settings, screen == Screen.MORE) { screen = Screen.MORE }
+                NavItem("Map", Icons.Rounded.Map, screen == Screen.MAP) {
+                    mapOrigin = Screen.HOME
+                    mapFocusApiaryId = null
+                    screen = Screen.MAP
+                }
+                NavItem("Settings", Icons.Rounded.Settings, screen == Screen.MORE || screen == Screen.SETTINGS) { screen = Screen.SETTINGS }
             }
         }
     ) { padding ->
         when (screen) {
-            Screen.HOME -> HomeScreen(hives, padding, onScan = { screen = Screen.SCAN })
-            Screen.APIARIES -> ApiariesScreen(apiaries, hives, padding, onAddApiary = { addApiary = true }, onEditApiary = { editingApiary = it }, onOpenApiary = { selectedApiaryName = it; screen = Screen.APIARY_HIVES })
-            Screen.MORE -> MoreScreen(padding, darkMode, onDarkModeChange, onTagManager = { screen = Screen.TAG_MANAGER }, onColonyHistory = { screen = Screen.COLONY_HISTORY }, deadCount = deadHives.size, activity, cloud)
+            Screen.HOME -> HomeScreen(
+                hives = hives,
+                apiaries = apiaries,
+                padding = padding,
+                nfcEnabled = nfcEnabledForIndicator,
+                onOpenHives = { screen = Screen.HIVES },
+                onOpenApiaries = {
+                    selectedApiaryName = null
+                    screen = Screen.APIARIES
+                }
+            )
+            Screen.HIVES -> AllHivesScreen(
+                hives = hives,
+                padding = padding,
+                onBack = { screen = Screen.HOME },
+                onAddHive = { selectedApiaryName = null; addHive = true },
+                onOpenHive = { hiveId -> vm.openHive(hiveId); selectedHiveOpen = true }
+            )
+            Screen.APIARIES -> ApiariesScreen(
+                apiaries, hives, padding,
+                onAddApiary = { addApiary = true },
+                onEditApiary = { editingApiary = it },
+                onOpenMap = { apiary ->
+                    mapOrigin = Screen.APIARIES
+                    mapFocusApiaryId = apiary.id
+                    screen = Screen.MAP
+                },
+                onOpenApiary = { selectedApiaryName = it; screen = Screen.APIARY_HIVES }
+            )
+            Screen.MAP -> ApiaryMapScreen(
+                apiaries = apiaries,
+                padding = padding,
+                initialFocusApiaryId = mapFocusApiaryId,
+                locationController = locationController,
+                onBack = { screen = mapOrigin; mapFocusApiaryId = null }
+            )
+            Screen.MORE -> MoreScreen(
+                padding = padding,
+                onBack = { screen = Screen.SETTINGS },
+                onTagManager = { tagManagerReturnScreen = Screen.MORE; screen = Screen.TAG_MANAGER },
+                onColonyHistory = { screen = Screen.COLONY_HISTORY },
+                deadCount = deadHives.size,
+                activity = activity,
+                cloud = cloud
+            )
+            Screen.SETTINGS -> SettingsScreen(
+                padding = padding,
+                activity = activity,
+                preferences = autoVoicePrefs,
+                darkMode = darkMode,
+                onDarkModeChange = onDarkModeChange,
+                autoVoiceEnabled = autoVoiceEnabled,
+                onAutoVoiceEnabledChange = { enabled ->
+                    autoVoiceEnabled = enabled
+                    autoVoicePrefs.edit { putBoolean("auto_voice_on_nfc", enabled) }
+                },
+                largeFieldText = largeFieldText,
+                onLargeFieldTextChange = onLargeFieldTextChange,
+                cloud = cloud,
+                onBack = { screen = Screen.HOME },
+                onOpenMore = { screen = Screen.MORE }
+            )
             Screen.TAG_MANAGER -> TagManagementScreen(
                 padding = padding,
                 hives = hives,
                 nfc = nfc,
                 activity = activity,
                 pendingUid = pendingTagUid,
+                confirmBeforeTagRemoval = autoVoicePrefs.getBoolean("confirm_tag_removal", true),
                 onPendingUidConsumed = { pendingTagUid = null },
-                onBack = { screen = Screen.MORE },
+                onBack = { screen = tagManagerReturnScreen },
                 onOpenHive = { vm.openHive(it); selectedHiveOpen = true; screen = Screen.HOME },
+                onScanOpenHive = { hiveId ->
+                    if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(hives.firstOrNull { it.id == hiveId }?.number.orEmpty())
+                    vm.openHive(hiveId)
+                    selectedHiveOpen = true
+                    screen = Screen.HOME
+                    pendingAutoStartVoiceHiveId = hiveId
+                    pendingInspectionHiveId = hiveId
+                },
                 onAssignTag = { hiveId, uid, reassign, onResult -> vm.assignTagToHive(hiveId, uid, reassign, onResult) },
-                onClearTag = { hiveId -> vm.clearTagForHive(hiveId) }
+                onClearTag = { hiveId, onResult -> vm.clearTagForHive(hiveId, onResult) },
+                onUnassignedTag = { uid ->
+                    unassignedTagOrigin = Screen.TAG_MANAGER
+                    unassignedTagUid = uid
+                },
+                onIsTagUnassigned = { uid -> vm.isNfcTagUnassigned(uid) }
             )
             Screen.COLONY_HISTORY -> ColonyHistoryScreen(
                 deadHives = deadHives,
@@ -808,8 +1093,41 @@ fun BeeKeepApp(
                 onBack = { screen = Screen.MORE },
                 onOpenHive = { vm.openHive(it); selectedHiveOpen = true }
             )
-            Screen.SCAN, Screen.APIARY_HIVES -> Unit
+            Screen.SCAN, Screen.APIARY_HIVES, Screen.PREMADE_SETUP -> Unit
         }
+    }
+
+    if (firstRunPromptVisible && screen == Screen.HOME) {
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            ),
+            title = { Text("Welcome to BeeKeep", fontWeight = FontWeight.ExtraBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("How would you like to get started?")
+                    Button(
+                        onClick = {
+                            firstRunPromptVisible = false
+                            screen = Screen.PREMADE_SETUP
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp)
+                    ) { Text("Load Pre-made Hives") }
+                    OutlinedButton(
+                        onClick = {
+                            autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
+                            firstRunPromptVisible = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp)
+                    ) { Text("Start from Scratch") }
+                }
+            },
+            confirmButton = {}
+        )
     }
 }
 
@@ -831,186 +1149,80 @@ private fun androidx.compose.foundation.layout.RowScope.NavItem(label: String, i
 }
 
 @Composable
-private fun MetricCard(title: String, value: String, modifier: Modifier = Modifier, supporting: String? = null) {
-    Card(
-        modifier = modifier,
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-    ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
-            Text(title, color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.labelLarge)
-            supporting?.let { Text(it, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .75f), style = MaterialTheme.typography.bodySmall) }
-        }
-    }
-}
-
-@Composable
-private fun LandscapeCanvas(modifier: Modifier, palette: com.beekeep.app.ui.theme.LandscapePalette) {
-    Canvas(modifier) {
-        val w = size.width
-        val h = size.height
-        drawRect(palette.sky)
-        drawCircle(palette.sun, radius = h * 0.15f, center = Offset(w * 0.80f, h * 0.26f))
-        drawPath(Path().apply {
-            moveTo(0f, h * 0.60f)
-            cubicTo(w * 0.16f, h * 0.42f, w * 0.30f, h * 0.54f, w * 0.44f, h * 0.38f)
-            cubicTo(w * 0.60f, h * 0.22f, w * 0.74f, h * 0.46f, w, h * 0.34f)
-            lineTo(w, h); lineTo(0f, h); close()
-        }, palette.hillBack)
-        drawPath(Path().apply {
-            moveTo(0f, h * 0.76f)
-            cubicTo(w * 0.22f, h * 0.58f, w * 0.38f, h * 0.72f, w * 0.55f, h * 0.56f)
-            cubicTo(w * 0.74f, h * 0.42f, w * 0.86f, h * 0.64f, w, h * 0.54f)
-            lineTo(w, h); lineTo(0f, h); close()
-        }, palette.hillMid)
-        drawPath(Path().apply {
-            moveTo(0f, h * 0.90f)
-            cubicTo(w * 0.25f, h * 0.76f, w * 0.45f, h * 0.94f, w * 0.68f, h * 0.80f)
-            cubicTo(w * 0.84f, h * 0.72f, w * 0.94f, h * 0.84f, w, h * 0.78f)
-            lineTo(w, h); lineTo(0f, h); close()
-        }, palette.hillFront)
-        listOf(w * 0.62f to h * 0.88f, w * 0.72f to h * 0.82f, w * 0.90f to h * 0.80f).forEach { (cx, base) ->
-            val ph = h * 0.30f
-            for (tier in 0..2) {
-                val top = base - ph + tier * ph * 0.26f
-                val half = ph * 0.16f * (0.6f + tier * 0.4f)
-                drawPath(Path().apply {
-                    moveTo(cx, top)
-                    lineTo(cx + half, top + ph * 0.45f)
-                    lineTo(cx - half, top + ph * 0.45f)
-                    close()
-                }, palette.tree)
-            }
-            drawRect(palette.tree, Offset(cx - w * 0.005f, base - ph * 0.08f), Size(w * 0.010f, ph * 0.10f))
-        }
-    }
-}
-
-@Composable
-private fun HomeScreen(
+private fun AllHivesScreen(
     hives: List<Hive>,
-    padding: androidx.compose.foundation.layout.PaddingValues,
-    onScan: () -> Unit
+    padding: PaddingValues,
+    onBack: () -> Unit,
+    onAddHive: () -> Unit,
+    onOpenHive: (Long) -> Unit
 ) {
-    val flagged = hives.count { it.mitePercent >= 3.0 || it.queenStatus == "Queenless" }
-    LazyColumn(
-        Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 16.dp, bottom = 28.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            val landscape = if (MaterialTheme.colorScheme.background.luminance() < 0.35f) LandscapeDusk else LandscapeDay
-            Box(Modifier.fillMaxWidth().height(176.dp).clip(RoundedCornerShape(24.dp))) {
-                LandscapeCanvas(Modifier.fillMaxSize(), landscape)
-                Column(Modifier.align(Alignment.TopStart).padding(horizontal = 20.dp, vertical = 16.dp)) {
-                    Text("GOOD FIELD DAY", style = MaterialTheme.typography.labelLarge, color = landscape.ink.copy(alpha = .8f))
-                    Text("BeeKeep", style = MaterialTheme.typography.headlineLarge, color = landscape.ink)
-                    Text("Your operation at a glance", color = landscape.ink.copy(alpha = .72f))
-                }
-            }
-        }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                MetricCard("Hives", hives.size.toString(), Modifier.weight(1f))
-                MetricCard("Watch", flagged.toString(), Modifier.weight(1f))
-            }
-        }
-        item {
-            Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary)) {
-                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text("Fast field scan", color = MaterialTheme.colorScheme.onPrimary, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-                        Text("Tap a hive tag and jump straight to its record.", color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .88f))
-                    }
-                    Button(onClick = onScan, shape = RoundedCornerShape(16.dp), colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onPrimary)) {
-                        Icon(Icons.Rounded.Nfc, null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(6.dp))
-                        Text("SCAN", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.ExtraBold)
-                    }
-                }
-            }
-        }
-        item {
-            Card(shape = RoundedCornerShape(24.dp)) {
-                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Hive lists are organized by apiary", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-                    Text("Open Apiaries to choose a yard, then see only the hives belonging to that apiary.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ApiariesScreen(
-    apiaries: List<Apiary>,
-    hives: List<Hive>,
-    padding: androidx.compose.foundation.layout.PaddingValues,
-    onAddApiary: () -> Unit,
-    onEditApiary: (Apiary) -> Unit,
-    onOpenApiary: (String) -> Unit
-) {
-    val context = LocalContext.current
+    BackHandler { onBack() }
     var query by rememberSaveable { mutableStateOf("") }
-    val filtered = apiaries.filter { it.name.contains(query, ignoreCase = true) }
-
-    Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
-        Row(Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("Apiaries", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
-                Text("${filtered.size} ${if (filtered.size == 1) "apiary" else "apiaries"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            IconButton(onClick = onAddApiary, modifier = Modifier.size(52.dp)) { Icon(Icons.Rounded.Add, "Add apiary") }
+    val filtered = hives
+        .filter { hive ->
+            query.isBlank() ||
+                hive.number.contains(query, ignoreCase = true) ||
+                hiveDisplayName(hive.number).contains(query, ignoreCase = true) ||
+                hive.apiary.contains(query, ignoreCase = true)
         }
-        OutlinedTextField(
-            value = query,
-            onValueChange = { query = it },
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("Search apiaries") },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
-            singleLine = true,
-            shape = RoundedCornerShape(16.dp)
-        )
-        Spacer(Modifier.height(10.dp))
-        if (filtered.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                EmptyState(
-                    if (apiaries.isEmpty()) "No apiaries yet" else "No matching apiaries",
-                    if (apiaries.isEmpty()) "Create an apiary first, then add hives inside it." else "Try a different apiary name.",
-                    if (apiaries.isEmpty()) "ADD APIARY" else null,
-                    if (apiaries.isEmpty()) onAddApiary else null
-                )
+        .sortedWith(compareBy<Hive>({ it.apiary.lowercase(Locale.ROOT) }, { it.number.toIntOrNull() ?: Int.MAX_VALUE }, { it.number }))
+
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
+        Column(
+            Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBack, "Back to home") }
+                Column(Modifier.weight(1f)) {
+                    Text("Hives", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        "${hives.size} ${if (hives.size == 1) "hive" else "hives"} across all apiaries",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onAddHive, modifier = Modifier.size(52.dp)) {
+                    Icon(Icons.Rounded.Add, "Add hive")
+                }
             }
-        } else {
-            LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(filtered, key = { it.id }) { apiary ->
-                    val count = hives.count { it.apiary.equals(apiary.name, ignoreCase = true) }
-                    Card(onClick = { onOpenApiary(apiary.name) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
-                        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(52.dp)) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Rounded.Yard, "Apiary", tint = MaterialTheme.colorScheme.onPrimaryContainer)
-                                }
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                Text(apiary.name, fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
-                                Text("$count ${if (count == 1) "hive" else "hives"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                apiary.notes.takeIf { it.isNotBlank() }?.let { Text(it, maxLines = 2, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
-                            }
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                IconButton(onClick = { onEditApiary(apiary) }) { Icon(Icons.Rounded.Edit, "Edit apiary ${apiary.name}") }
-                                if (apiary.latitude != null && apiary.longitude != null) {
-                                    IconButton(onClick = {
-                                        val uri = android.net.Uri.parse("geo:${apiary.latitude},${apiary.longitude}?q=${apiary.latitude},${apiary.longitude}(${android.net.Uri.encode(apiary.name)})")
-                                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
-                                    }) { Icon(Icons.Rounded.LocationOn, "Open apiary location in maps") }
-                                } else {
-                                    Icon(Icons.Rounded.ChevronRight, "Open apiary", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(12.dp))
-                                }
-                            }
-                        }
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Search hives or apiaries", color = Color(0xFF78350F)) },
+                leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Color(0xFF78350F)) },
+                singleLine = true,
+                shape = RoundedCornerShape(16.dp),
+                colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surface,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                    focusedBorderColor = Color(0xFFD97706),
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                    cursorColor = Color(0xFFD97706)
+                )
+            )
+            Spacer(Modifier.height(10.dp))
+            if (filtered.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    EmptyState(
+                        if (hives.isEmpty()) "No hives yet" else "No matching hives",
+                        if (hives.isEmpty()) "Create an apiary and add hives to see them here." else "Try another hive number or apiary name.",
+                        if (hives.isEmpty()) "ADD HIVE" else null,
+                        if (hives.isEmpty()) onAddHive else null
+                    )
+                }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(bottom = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(filtered, key = { it.id }) { hive ->
+                        HiveRow(hive) { onOpenHive(hive.id) }
                     }
                 }
             }
@@ -1031,6 +1243,8 @@ private fun ApiaryHivesScreen(
     var query by rememberSaveable(apiaryName) { mutableStateOf("") }
     val filtered = hives.filter { it.number.contains(query, ignoreCase = true) }
 
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        InspectionHoneycombBackground(Modifier.matchParentSize())
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(padding).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBack, "Back to apiaries") }
@@ -1044,10 +1258,19 @@ private fun ApiaryHivesScreen(
             value = query,
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Search hive number") },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
+            label = { Text("Search hive number", color = Color(0xFF78350F)) },
+            leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Color(0xFF78350F)) },
             singleLine = true,
-            shape = RoundedCornerShape(16.dp)
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surface,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                focusedBorderColor = Color(0xFFD97706),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                cursorColor = Color(0xFFD97706)
+            )
         )
         Spacer(Modifier.height(10.dp))
         if (filtered.isEmpty()) {
@@ -1067,1053 +1290,6 @@ private fun ApiaryHivesScreen(
             }
         }
     }
-}
-
-@Composable
-private fun HiveRow(hive: Hive, supporting: String? = null, onClick: () -> Unit) {
-    val attention = hive.mitePercent >= 3.0 || hive.queenStatus == "Queenless"
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), border = if (attention) androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = .35f)) else null) {
-        Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text("Hive ${hive.number}", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
-                Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("Queen ${hive.queenStatus} • Strength ${hive.strength}/10", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                supporting?.let { Text(it, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
-            }
-            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("${String.format(Locale.US, "%.1f", hive.mitePercent)}%", fontWeight = FontWeight.ExtraBold, color = if (attention) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-                Icon(Icons.Rounded.ChevronRight, "Open hive", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ColonyHistoryScreen(deadHives: List<Hive>, padding: androidx.compose.foundation.layout.PaddingValues, onBack: () -> Unit, onOpenHive: (Long) -> Unit) {
-    BackHandler { onBack() }
-    Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
-        Row(Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
-            Column(Modifier.weight(1f)) {
-                Text("Colony history", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
-                Text("${deadHives.size} dead ${if (deadHives.size == 1) "colony" else "colonies"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        if (deadHives.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                EmptyState("No dead colonies", "When a colony dies, mark it dead to keep its history here and release its NFC tag.", null, null)
-            }
-        } else {
-            LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(deadHives, key = { it.id }) { hive ->
-                    Card(onClick = { onOpenHive(hive.id) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
-                        Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                Text("Hive ${hive.number}", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
-                                Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(
-                                    "Dead: ${hive.deadAt?.let { DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(it)) } ?: "date unknown"}",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                            Icon(Icons.Rounded.ChevronRight, "Open colony history", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun EmptyState(title: String, message: String, actionLabel: String?, onAction: (() -> Unit)?) {
-    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-            Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (actionLabel != null && onAction != null) OutlinedButton(onClick = onAction) { Text(actionLabel, fontWeight = FontWeight.Bold) }
-        }
-    }
-}
-
-@Composable
-private fun CompactStatItem(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f))
-    }
-}
-
-@Composable
-private fun HiveDetailScreen(
-    hive: Hive,
-    inspections: List<Inspection>,
-    events: List<ActivityEvent>,
-    feedings: List<com.beekeep.app.data.Feeding>,
-    treatments: List<Treatment>,
-    harvests: List<Harvest>,
-    nfc: NfcController,
-    activity: ComponentActivity,
-    onBack: () -> Unit,
-    onInspect: () -> Unit,
-    onFeed: () -> Unit,
-    onTreat: () -> Unit,
-    onHarvest: () -> Unit,
-    onTag: (String, (Boolean, String?) -> Unit) -> Unit,
-    onClearTag: () -> Unit,
-    onVerifyTag: () -> Unit,
-    onEditQueen: (String, String, String, Int?, Int) -> Unit,
-    onMarkDead: () -> Unit,
-    onRestore: () -> Unit,
-    onDelete: () -> Unit
-) {
-    var writeStatus by rememberSaveable { mutableStateOf("") }
-    var editQueen by rememberSaveable { mutableStateOf(false) }
-    var confirmDead by rememberSaveable { mutableStateOf(false) }
-    var confirmDelete by rememberSaveable { mutableStateOf(false) }
-    BackHandler { onBack() }
-    val recent = inspections.take(6).reversed()
-    val photoInspections = inspections.filter { !it.photoPath.isNullOrBlank() }.take(6)
-
-    if (editQueen) {
-        QueenProfileDialog(
-            hive = hive,
-            onDismiss = { editQueen = false },
-            onSave = { status, mark, origin, age, temperament ->
-                onEditQueen(status, mark, origin, age, temperament)
-                editQueen = false
-            }
-        )
-        return
-    }
-
-    if (confirmDead) {
-        AlertDialog(
-            onDismissRequest = { confirmDead = false },
-            title = { Text("Mark colony dead?", fontWeight = FontWeight.ExtraBold) },
-            text = { Text("Hive ${hive.number} will move to colony history. All inspections, treatments, feedings, harvests and photos stay attached. Its NFC tag is released for reuse.") },
-            confirmButton = { TextButton(onClick = { confirmDead = false; onMarkDead() }) { Text("MARK DEAD", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.error) } },
-            dismissButton = { TextButton(onClick = { confirmDead = false }) { Text("CANCEL") } }
-        )
-    }
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete Hive ${hive.number} permanently?", fontWeight = FontWeight.ExtraBold) },
-            text = { Text("This removes the hive and all of its associated history. This cannot be undone. To preserve history, mark the colony dead instead.") },
-            confirmButton = { TextButton(onClick = { confirmDelete = false; onDelete() }) { Text("DELETE PERMANENTLY", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.error) } },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("CANCEL") } }
-        )
-    }
-
-    Column(
-        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
-            Column(Modifier.weight(1f)) {
-                Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-            }
-            HiveStatusPill(hive)
-        }
-
-        if (hive.isDead) {
-            Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-                Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Colony marked dead", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onErrorContainer, style = MaterialTheme.typography.labelLarge)
-                    Text(
-                        "Died ${hive.deadAt?.let { DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it)) } ?: "on an unknown date"}. History is preserved below and the NFC tag was released.",
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            }
-        }
-
-        if (!hive.isDead) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Button(
-                    onClick = onInspect,
-                    modifier = Modifier.weight(1.3f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(horizontal = 6.dp)
-                ) {
-                    Icon(Icons.Rounded.TaskAlt, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("INSPECT", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                }
-                OutlinedButton(
-                    onClick = onFeed,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("FEED", style = MaterialTheme.typography.labelMedium) }
-                OutlinedButton(
-                    onClick = onTreat,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("TREAT", style = MaterialTheme.typography.labelMedium) }
-                OutlinedButton(
-                    onClick = onHarvest,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("HARVEST", style = MaterialTheme.typography.labelMedium) }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    CompactStatItem("Strength", "${hive.strength}/10", Modifier.weight(1f))
-                    CompactStatItem("Mites", "${String.format(Locale.US, "%.2f", hive.mitePercent)}%", Modifier.weight(1f))
-                    CompactStatItem("Inspections", inspections.size.toString(), Modifier.weight(1f))
-                }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("Queen profile", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                        Text("• ${hive.queenStatus}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
-                    }
-                    Text(
-                        "${hive.queenMarkColor.ifBlank { "No mark" }} • ${hive.queenOrigin.ifBlank { "Origin n/a" }} • ${hive.queenAgeMonths?.let { "${it}mo" } ?: "Age n/a"} • Temp ${hive.queenTemperament}/5",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                OutlinedButton(
-                    onClick = { editQueen = true },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                    modifier = Modifier.height(32.dp),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text("EDIT", style = MaterialTheme.typography.labelSmall)
-                }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Strength & mite trend", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                if (recent.isEmpty()) {
-                    Text("Complete a few inspections to see trends.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                } else {
-                    Row(Modifier.fillMaxWidth().height(80.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        recent.forEach { item ->
-                            val height = (16 + item.strength.coerceIn(0, 10) * 5).dp
-                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
-                                Text("${item.strength}", style = MaterialTheme.typography.labelSmall)
-                                Box(Modifier.width(20.dp).height(height).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp)))
-                                Text(DateFormat.getDateInstance(DateFormat.SHORT).format(Date(item.createdAt)), style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                    }
-                    val latestMite = recent.last().mitePercent
-                    Text("Latest mite rate ${String.format(Locale.US, "%.2f", latestMite)}%", style = MaterialTheme.typography.bodySmall, color = if (latestMite >= 3.0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-
-        if (photoInspections.isNotEmpty()) {
-            Text("Recent photos", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                photoInspections.forEach { inspection ->
-                    rememberPhotoBitmap(inspection.photoPath, 480)?.let { bitmap ->
-                        Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.size(90.dp).clip(RoundedCornerShape(16.dp)))
-                    }
-                }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Records", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                Text("Feedings: ${feedings.size} • Treatments: ${treatments.size} • Harvests: ${harvests.size}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                feedings.firstOrNull()?.let { Text("Last feed: ${it.amount} ${it.unit} • ${it.feedType}", style = MaterialTheme.typography.bodySmall) }
-                treatments.firstOrNull()?.let { Text("Last treatment: ${it.product}", style = MaterialTheme.typography.bodySmall) }
-                harvests.firstOrNull()?.let { Text("Last dry harvest: ${it.dryHoneyWeight} ${it.weightUnit}", style = MaterialTheme.typography.bodySmall) }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("NFC hive tag", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                if (hive.isDead) {
-                    Text("Released", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                    Text("The physical tag was released when the colony died.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                } else {
-                    Text(hive.tagUid ?: "Not assigned", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = onVerifyTag,
-                            enabled = hive.tagUid != null,
-                            modifier = Modifier.weight(1f).height(42.dp),
-                            shape = RoundedCornerShape(16.dp)
-                        ) {
-                            Icon(Icons.Rounded.Nfc, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(5.dp)); Text("VERIFY", style = MaterialTheme.typography.labelMedium)
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                nfc.startWrite(
-                                    activity = activity,
-                                    text = BeeKeepNfcPayload.forHive(hive.id),
-                                    allowOverwriteOtherHive = hive.tagUid != null,
-                                    onResult = { result ->
-                                        when (result) {
-                                            is NfcResult.Written -> onTag(result.uid) { success, error ->
-                                                writeStatus = if (success) "Tag written • ${result.uid}" else (error ?: "Could not assign tag.")
-                                            }
-                                            is NfcResult.Error -> writeStatus = result.message
-                                            is NfcResult.Read -> Unit
-                                        }
-                                    }
-                                )
-                            },
-                            modifier = Modifier.weight(1f).height(42.dp),
-                            shape = RoundedCornerShape(16.dp)
-                        ) { Text(if (hive.tagUid == null) "WRITE TAG" else "REPLACE", style = MaterialTheme.typography.labelMedium) }
-                    }
-                    if (hive.tagUid != null) {
-                        TextButton(onClick = onClearTag, modifier = Modifier.fillMaxWidth().height(36.dp)) { Text("REMOVE TAG", style = MaterialTheme.typography.labelSmall) }
-                    }
-                    if (writeStatus.isNotBlank()) Text(writeStatus, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-
-        Card(shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Colony lifecycle", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                if (hive.isDead) {
-                    OutlinedButton(onClick = onRestore, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("RESTORE COLONY", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
-                } else {
-                    OutlinedButton(onClick = { confirmDead = true }, modifier = Modifier.fillMaxWidth().height(42.dp), shape = RoundedCornerShape(16.dp)) { Text("MARK COLONY DEAD", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium) }
-                }
-                TextButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth().height(36.dp)) { Text("DELETE HIVE PERMANENTLY", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
-            }
-        }
-
-        Text("Recent activity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        if (events.isEmpty()) Text("No events yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-        for (event in events.take(15)) { EventCard(event) }
-        inspections.firstOrNull()?.let { InspectionSnapshot(it) }
-    }
-}
-
-@Composable
-private fun HiveStatusPill(hive: Hive) {
-    if (hive.isDead) {
-        Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-            Text("DEAD", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onErrorContainer)
-        }
-        return
-    }
-    val flagged = hive.queenStatus == "Queenless" || hive.mitePercent >= 3.0
-    Card(shape = RoundedCornerShape(50), colors = CardDefaults.cardColors(containerColor = if (flagged) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer)) {
-        Text(if (flagged) "CHECK" else "OK", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), fontWeight = FontWeight.ExtraBold, color = if (flagged) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer)
-    }
-}
-
-@Composable
-private fun QueenProfileDialog(
-    hive: Hive,
-    onDismiss: () -> Unit,
-    onSave: (String, String, String, Int?, Int) -> Unit
-) {
-    var status by rememberSaveable { mutableStateOf(hive.queenStatus) }
-    var mark by rememberSaveable { mutableStateOf(hive.queenMarkColor) }
-    var origin by rememberSaveable { mutableStateOf(hive.queenOrigin) }
-    var age by rememberSaveable { mutableStateOf(hive.queenAgeMonths?.toString() ?: "") }
-    var temperament by rememberSaveable { mutableIntStateOf(hive.queenTemperament.coerceIn(1, 5)) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Queen profile") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Status", fontWeight = FontWeight.Bold)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    for (st in listOf("Laying", "Spotted", "Unspotted", "Queenless", "Virgin")) {
-                        FilterChip(status == st, { status = st }, { Text(st) })
-                    }
-                }
-                OutlinedTextField(mark, { mark = it }, Modifier.fillMaxWidth(), label = { Text("Mark color") }, singleLine = true)
-                OutlinedTextField(origin, { origin = it }, Modifier.fillMaxWidth(), label = { Text("Origin") }, singleLine = true)
-                OutlinedTextField(age, { age = it.filter(Char::isDigit) }, Modifier.fillMaxWidth(), label = { Text("Age (months)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-                Text("Temperament ${temperament}/5", fontWeight = FontWeight.Bold)
-                Counter("Temperament", temperament, 1..5) { temperament = it }
-            }
-        },
-        confirmButton = { TextButton(onClick = { onSave(status, mark, origin, age.toIntOrNull(), temperament) }) { Text("SAVE") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL") } }
-    )
-}
-
-@Composable private fun EventCard(event:ActivityEvent){Card(shape=RoundedCornerShape(16.dp)){Row(Modifier.fillMaxWidth().padding(14.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)){Icon(Icons.Rounded.Yard,null);Column{Text(event.title,fontWeight=FontWeight.Bold);Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM,DateFormat.SHORT).format(Date(event.createdAt)),color=MaterialTheme.colorScheme.onSurfaceVariant);if(event.detail.isNotBlank())Text(event.detail)}}}}
-@Composable
-private fun InspectionSnapshot(i: Inspection) {
-    Card(shape = RoundedCornerShape(16.dp)) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("${i.strength}/10 strength • ${i.queenStatus}")
-            Text("Mites ${i.miteCount}/${i.sampleSize} = ${String.format(Locale.US, "%.2f", i.mitePercent)}%")
-            Text("Brood: eggs ${i.eggs}, open ${i.openBrood}, capped ${i.cappedBrood}")
-            Text("Stores: honey ${i.honeyStores}, pollen ${i.pollen}")
-            if (i.diseaseFlags.isNotBlank()) {
-                Text("Flags: ${i.diseaseFlags}", color = MaterialTheme.colorScheme.error)
-            }
-            if (i.notes.isNotBlank()) {
-                Text("FIELD NOTES", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.ExtraBold)
-                Text(i.notes, style = MaterialTheme.typography.bodyMedium)
-            }
-        }
-    }
-}
-
-@Composable
-private fun InspectionScreen(
-    activity: ComponentActivity,
-    photoStore: PhotoStore,
-    locationController: LocationController,
-    hive: Hive,
-    priorInspections: List<Inspection>,
-    onBack: () -> Unit,
-    onSave: suspend (Inspection) -> Unit
-) {
-    val haptic = LocalHapticFeedback.current
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val noteDraftPrefs = remember(context) {
-        context.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
-    }
-    val formDraftPrefs = remember(context) {
-        context.getSharedPreferences(INSPECTION_FORM_DRAFTS, android.content.Context.MODE_PRIVATE)
-    }
-    val noteDraftKey = remember(hive.id) { "hive_${hive.id}" }
-    val lastInspection = remember(priorInspections) { priorInspections.maxByOrNull { it.createdAt } }
-    // Load unfinished field values for this specific hive; if none exist, use the last saved inspection.
-    val formDraft = remember(hive.id) { readInspectionFormDraft(formDraftPrefs, hive.id) }
-    val formStateKey = formDraft?.updatedAt ?: 0L
-    val hasSavedNoteDraft = remember(hive.id) { noteDraftPrefs.contains(noteDraftKey) }
-    val savedNoteDraft = remember(hive.id) { noteDraftPrefs.getString(noteDraftKey, "").orEmpty() }
-    // A stored empty string means the beekeeper deliberately cleared the notes; don't restore older text.
-    val startingNotes = remember(hive.id, hasSavedNoteDraft, savedNoteDraft, lastInspection?.id, lastInspection?.notes) {
-        if (hasSavedNoteDraft) savedNoteDraft else lastInspection?.notes.orEmpty()
-    }
-
-    var strength by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.strength ?: lastInspection?.strength ?: hive.strength)
-    }
-    var queen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableStateOf(formDraft?.queenStatus ?: lastInspection?.queenStatus ?: hive.queenStatus)
-    }
-    var mites by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.miteCount ?: lastInspection?.miteCount ?: 0)
-    }
-    var sample by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.sampleSize ?: lastInspection?.sampleSize ?: 300)
-    }
-    var notes by rememberSaveable(hive.id) { mutableStateOf(startingNotes) }
-    var noteSaveStatus by rememberSaveable(hive.id) {
-        mutableStateOf(if (startingNotes.isBlank()) "" else if (hasSavedNoteDraft) "Auto-saved note restored" else "Saved notes loaded")
-    }
-    var eggs by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.eggs ?: lastInspection?.eggs ?: 0)
-    }
-    var openBrood by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.openBrood ?: lastInspection?.openBrood ?: 0)
-    }
-    var cappedBrood by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.cappedBrood ?: lastInspection?.cappedBrood ?: 0)
-    }
-    var honey by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.honeyStores ?: lastInspection?.honeyStores ?: 0)
-    }
-    var pollen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.pollen ?: lastInspection?.pollen ?: 0)
-    }
-    var emptyComb by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.emptyDrawnComb ?: lastInspection?.emptyDrawnComb ?: 0)
-    }
-    var emergency by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.emergencyCells ?: lastInspection?.emergencyCells ?: 0)
-    }
-    var supercedure by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.supercedureCells ?: lastInspection?.supercedureCells ?: 0)
-    }
-    var swarm by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.swarmCells ?: lastInspection?.swarmCells ?: 0)
-    }
-    var diseasesCsv by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableStateOf(formDraft?.diseaseFlags ?: lastInspection?.diseaseFlags.orEmpty())
-    }
-    var photoPath by rememberSaveable { mutableStateOf<String?>(null) }
-    var cameraOpen by rememberSaveable { mutableStateOf(false) }
-    var lat by rememberSaveable { mutableStateOf<Double?>(null) }
-    var lon by rememberSaveable { mutableStateOf<Double?>(null) }
-    var locationStatus by rememberSaveable { mutableStateOf("No GPS captured") }
-    var voiceStatus by rememberSaveable { mutableStateOf("") }
-    var cameraStatus by rememberSaveable { mutableStateOf("") }
-    var saving by rememberSaveable { mutableStateOf(false) }
-    var photoCaptured by rememberSaveable { mutableStateOf(false) }
-    var photoProcessing by rememberSaveable { mutableStateOf(false) }
-    var pendingPhotoPath by rememberSaveable { mutableStateOf<String?>(null) }
-
-    val currentFormDraft = InspectionFormDraft(
-        strength = strength,
-        queenStatus = queen,
-        miteCount = mites,
-        sampleSize = sample,
-        eggs = eggs,
-        openBrood = openBrood,
-        cappedBrood = cappedBrood,
-        honeyStores = honey,
-        pollen = pollen,
-        emptyDrawnComb = emptyComb,
-        emergencyCells = emergency,
-        supercedureCells = supercedure,
-        swarmCells = swarm,
-        diseaseFlags = diseasesCsv,
-        updatedAt = formStateKey
-    )
-    val latestFormDraft by rememberUpdatedState(currentFormDraft)
-
-    androidx.compose.runtime.LaunchedEffect(
-        hive.id, strength, queen, mites, sample, eggs, openBrood, cappedBrood,
-        honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv
-    ) {
-        saveInspectionFormDraft(formDraftPrefs, hive.id, currentFormDraft)
-    }
-    DisposableEffect(hive.id) {
-        onDispose {
-            saveInspectionFormDraft(formDraftPrefs, hive.id, latestFormDraft)
-        }
-    }
-
-    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) {
-            cameraStatus = ""
-            cameraOpen = true
-        } else {
-            pendingPhotoPath?.let { File(it).delete() }
-            pendingPhotoPath = null
-            cameraStatus = "Camera permission denied"
-        }
-    }
-    val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
-        val granted = r[Manifest.permission.ACCESS_FINE_LOCATION] == true || r[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        if (!granted) {
-            locationStatus = "Location permission denied"
-            return@rememberLauncherForActivityResult
-        }
-        locationController.current { loc ->
-            if (loc != null) {
-                lat = loc.latitude
-                lon = loc.longitude
-                locationStatus = "GPS captured • ${"%.5f".format(Locale.US, loc.latitude)}, ${"%.5f".format(Locale.US, loc.longitude)}"
-            } else locationStatus = "Could not get a location"
-        }
-    }
-    val voiceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { spokenText ->
-            // Each completed dictation is a separate note entry. Keep earlier notes and add this one below.
-            val cleanSpokenText = spokenText.trim()
-            val updatedNotes = if (notes.isBlank()) cleanSpokenText else "${notes.trimEnd()}\n$cleanSpokenText"
-            notes = updatedNotes
-            // Save immediately when Android returns the finished speech transcription.
-            noteDraftPrefs.edit { putString(noteDraftKey, updatedNotes) }
-            noteSaveStatus = "Note auto-saved"
-            voiceStatus = "Voice added"
-        }
-    }
-    val voicePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) {
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Describe what you see in Hive ${hive.number}")
-            }
-            runCatching { voiceLauncher.launch(intent) }.onFailure { voiceStatus = "Voice input unavailable" }
-        } else voiceStatus = "Microphone permission denied"
-    }
-
-    androidx.compose.runtime.LaunchedEffect(hive.id, notes) {
-        // Debounce edits so a longer note is stored when the user pauses typing.
-        delay(400)
-        // Store blank too: it records an intentional manual clear rather than reviving old notes later.
-        noteDraftPrefs.edit { putString(noteDraftKey, notes) }
-        noteSaveStatus = if (notes.isBlank()) "" else "Note auto-saved"
-    }
-
-    BackHandler {
-        if (cameraOpen && pendingPhotoPath != null) {
-            if (!photoCaptured) File(pendingPhotoPath!!).delete()
-            pendingPhotoPath = null
-            cameraOpen = false
-        } else {
-            photoPath?.let { File(it).delete() }
-            pendingPhotoPath?.let { File(it).delete() }
-            onBack()
-        }
-    }
-
-    if (cameraOpen && pendingPhotoPath != null) {
-        val pendingFile = File(pendingPhotoPath!!)
-        CameraCaptureView(
-            outputFile = pendingFile,
-            onCaptured = {
-                val previousPhoto = photoPath
-                photoPath = pendingFile.absolutePath
-                if (!previousPhoto.isNullOrBlank() && previousPhoto != pendingFile.absolutePath) {
-                    File(previousPhoto).delete()
-                }
-                photoCaptured = true
-                photoProcessing = true
-                cameraOpen = false
-                pendingPhotoPath = null
-                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                    val optimized = photoStore.optimizeInPlace(pendingFile)
-                    withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        photoProcessing = false
-                        cameraStatus = if (optimized) "Photo ready" else "Photo saved; optimization unavailable"
-                    }
-                }
-            },
-            onClose = {
-                if (!photoCaptured) pendingFile.delete()
-                pendingPhotoPath = null
-                cameraOpen = false
-            },
-            onError = { message ->
-                cameraStatus = message
-                if (!photoCaptured) pendingFile.delete()
-                pendingPhotoPath = null
-                cameraOpen = false
-            }
-        )
-        return
-    }
-
-    val miteRate = if (sample > 0) mites * 100.0 / sample else 0.0
-    val previousForComparison = remember(priorInspections) {
-        priorInspections.sortedByDescending { it.createdAt }.getOrNull(1)
-    }
-
-    Scaffold(
-        topBar = {
-            Surface(shadowElevation = 2.dp) {
-                Row(
-                    Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 8.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    IconButton(onBack) { Icon(Icons.Rounded.ArrowBack, "Back") }
-                    Column(Modifier.weight(1f)) {
-                        Text("Hive ${hive.number}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                        Text("FIELD INSPECTION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-            }
-        },
-
-    ) { padding ->
-        LazyColumn(
-            Modifier.fillMaxSize().padding(padding),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            item {
-                Card(shape = RoundedCornerShape(18.dp)) {
-                    Column(
-                        Modifier.fillMaxWidth().padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FieldActionButton(Icons.Rounded.CameraAlt, "PHOTO", Modifier.weight(1f)) {
-                                val file = photoStore.createInspectionPhoto(hive.id).file
-                                pendingPhotoPath = file.absolutePath
-                                photoCaptured = false
-                                cameraStatus = ""
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                                    cameraOpen = true
-                                } else cameraPermission.launch(Manifest.permission.CAMERA)
-                            }
-                            FieldActionButton(Icons.Rounded.Mic, "VOICE", Modifier.weight(1f)) {
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                                        putExtra(RecognizerIntent.EXTRA_PROMPT, "Describe Hive ${hive.number}")
-                                    }
-                                    runCatching { voiceLauncher.launch(intent) }.onFailure { voiceStatus = "Voice input unavailable" }
-                                } else voicePermission.launch(Manifest.permission.RECORD_AUDIO)
-                            }
-                        }
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FieldActionButton(Icons.Rounded.GpsFixed, "GPS", Modifier.weight(1f)) {
-                                if (locationController.hasPermission()) {
-                                    locationController.current { loc ->
-                                        if (loc != null) {
-                                            lat = loc.latitude
-                                            lon = loc.longitude
-                                            locationStatus = "GPS captured • ${"%.5f".format(Locale.US, loc.latitude)}, ${"%.5f".format(Locale.US, loc.longitude)}"
-                                        } else locationStatus = "Could not get a location"
-                                    }
-                                } else locationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
-                            }
-                            Button(
-                                onClick = {
-                                    if (!saving && !photoProcessing) {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        saving = true
-                                        val now = System.currentTimeMillis()
-                                        val inspection = Inspection(
-                                            IdGenerator.nextLong(), hive.id, now, strength, queen, mites,
-                                            sample.coerceAtLeast(1), notes.trim(), photoPath, lat, lon,
-                                            emergency, supercedure, swarm, eggs, openBrood, cappedBrood,
-                                            honey, pollen, emptyComb, diseasesCsv
-                                        )
-                                        scope.launch {
-                                            onSave(inspection)
-                                            saving = false
-                                        }
-                                    }
-                                },
-                                enabled = !saving && !photoProcessing,
-                                modifier = Modifier.weight(1f).height(54.dp),
-                                shape = RoundedCornerShape(16.dp),
-                                contentPadding = PaddingValues(horizontal = 8.dp)
-                            ) {
-                                Icon(Icons.Rounded.Check, null)
-                                Spacer(Modifier.width(5.dp))
-                                Text(if (saving) "SAVING…" else "SAVE", fontWeight = FontWeight.ExtraBold, maxLines = 1)
-                            }
-                        }
-                        if (photoProcessing) {
-                            Text("Preparing photo…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-
-            item {
-                SectionHeader("QUEEN")
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    for (option in listOf("Laying", "Spotted", "Unspotted", "Queenless", "Virgin")) {
-                        FilterChip(
-                            selected = queen == option,
-                            onClick = {
-                                queen = option
-                                haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
-                            },
-                            label = { Text(option) }
-                        )
-                    }
-                }
-            }
-
-            item {
-                Card(shape = RoundedCornerShape(24.dp)) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("FIELD NOTES", fontWeight = FontWeight.ExtraBold)
-                        OutlinedTextField(
-                            value = notes,
-                            onValueChange = {
-                                notes = it
-                                noteSaveStatus = if (it.isBlank()) "" else "Saving note…"
-                            },
-                            modifier = Modifier.fillMaxWidth().height(124.dp),
-                            label = { Text("What did you see?") }
-                        )
-                        if (noteSaveStatus.isNotBlank()) {
-                            Text(
-                                noteSaveStatus,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (voiceStatus.isNotBlank()) Text(voiceStatus, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-                            if (locationStatus != "No GPS captured") Text(locationStatus, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-                        }
-                    }
-                }
-            }
-
-            item {
-                ComparisonCounter("Colony strength", strength, previousForComparison?.strength, 0..10, haptic) { strength = it }
-            }
-            item {
-                Card(shape = RoundedCornerShape(24.dp)) {
-                    Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                Text("Mite wash", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
-                                Text("${mites} / ${sample} bees", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            Text(String.format(Locale.US, "%.2f%%", miteRate), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            NumberField("Mites", mites, Modifier.weight(1f)) { mites = it.coerceIn(0, sample) }
-                            NumberField("Sample", sample, Modifier.weight(1f)) {
-                                sample = it.coerceAtLeast(1)
-                                mites = mites.coerceAtMost(sample)
-                            }
-                        }
-                        val priorMite = previousForComparison?.mitePercent
-                        if (priorMite != null) {
-                            Text(
-                                "Previous ${String.format(Locale.US, "%.2f%%", priorMite)} • Change ${String.format(Locale.US, "%+.2f%%", miteRate - priorMite)}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (miteRate > priorMite) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-            }
-
-            item {
-                SectionHeader("BROOD & STORES")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Eggs", eggs, 0..30, haptic, Modifier.weight(1f)) { eggs = it }
-                    CompactCounter("Open", openBrood, 0..30, haptic, Modifier.weight(1f)) { openBrood = it }
-                }
-            }
-            item {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Capped", cappedBrood, 0..30, haptic, Modifier.weight(1f)) { cappedBrood = it }
-                    CompactCounter("Honey", honey, 0..30, haptic, Modifier.weight(1f)) { honey = it }
-                }
-            }
-            item {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Pollen", pollen, 0..30, haptic, Modifier.weight(1f)) { pollen = it }
-                    CompactCounter("Empty comb", emptyComb, 0..30, haptic, Modifier.weight(1f)) { emptyComb = it }
-                }
-            }
-
-            item {
-                SectionHeader("QUEEN CELLS")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Emergency", emergency, 0..20, haptic, Modifier.weight(1f)) { emergency = it }
-                    CompactCounter("Supercedure", supercedure, 0..20, haptic, Modifier.weight(1f)) { supercedure = it }
-                }
-            }
-            item {
-                CompactCounter("Swarm", swarm, 0..20, haptic, Modifier.fillMaxWidth()) { swarm = it }
-            }
-
-            item {
-                SectionHeader("HEALTH FLAGS")
-                val activeDiseases = remember(diseasesCsv) { diseasesCsv.split(",").map(String::trim).filter(String::isNotBlank).toSet() }
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    for (flag in listOf("AFB", "EFB", "Chalkbrood", "Small Hive Beetle", "Wax Moth", "Nosema")) {
-                        val active = activeDiseases.contains(flag)
-                        FilterChip(
-                            selected = active,
-                            onClick = {
-                                val current = activeDiseases.toMutableSet()
-                                if (active) current.remove(flag) else current.add(flag)
-                                diseasesCsv = current.joinToString(", ")
-                                haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
-                            },
-                            label = { Text(flag) }
-                        )
-                    }
-                }
-            }
-
-
-
-            item {
-                photoPath?.let { path ->
-                    Card(shape = RoundedCornerShape(24.dp)) {
-                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("PHOTO", fontWeight = FontWeight.ExtraBold)
-                            rememberPhotoBitmap(path, 1200)?.let { bitmap ->
-                                Image(bitmap.asImageBitmap(), "Inspection photo", Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 280.dp).clip(RoundedCornerShape(16.dp)))
-                            }
-                            if (photoProcessing) Text("Preparing photo…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            if (cameraStatus.isNotBlank()) Text(cameraStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-
-        }
-    }
-}
-
-@Composable
-private fun FieldActionButton(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    label: String,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    OutlinedButton(
-        onClick = onClick,
-        modifier = modifier.height(54.dp),
-        shape = RoundedCornerShape(16.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp)
-    ) {
-        Icon(icon, contentDescription = label)
-        Spacer(Modifier.width(3.dp))
-        Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, maxLines = 1)
-    }
-}
-
-@Composable
-private fun SectionHeader(title: String) {
-    Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 2.dp, vertical = 2.dp))
-}
-
-@Composable
-private fun ComparisonCounter(
-    label: String,
-    value: Int,
-    previous: Int?,
-    range: IntRange,
-    haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
-    onChange: (Int) -> Unit
-) {
-    Card(shape = RoundedCornerShape(16.dp)) {
-        Column(
-            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(1.dp)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
-                previous?.let {
-                    val delta = value - it
-                    Text(
-                        "Prev $it • ${if (delta >= 0) "+$delta" else delta}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (delta < 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-            Row(
-                Modifier.fillMaxWidth().height(38.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
-                    modifier = Modifier.size(36.dp)
-                ) { Text("−", style = MaterialTheme.typography.titleMedium) }
-                Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                IconButton(
-                    onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
-                    modifier = Modifier.size(36.dp)
-                ) { Text("+", style = MaterialTheme.typography.titleMedium) }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CompactCounter(
-    label: String,
-    value: Int,
-    range: IntRange,
-    haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
-    modifier: Modifier = Modifier,
-    onChange: (Int) -> Unit
-) {
-    Card(modifier = modifier, shape = RoundedCornerShape(12.dp)) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 5.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(1.dp)
-        ) {
-            Text(
-                label,
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1
-            )
-            IconButton(
-                onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value - 1).coerceIn(range)) },
-                modifier = Modifier.size(32.dp)
-            ) { Text("−", style = MaterialTheme.typography.bodyMedium) }
-            Text(value.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
-            IconButton(
-                onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
-                modifier = Modifier.size(32.dp)
-            ) { Text("+", style = MaterialTheme.typography.bodyMedium) }
-        }
-    }
-}
-
-@Composable
-private fun rememberPhotoBitmap(path: String?, maxDimension: Int): Bitmap? {
-    val currentPath = path
-    return produceState<Bitmap?>(initialValue = null, key1 = currentPath, key2 = maxDimension) {
-        value = withContext(kotlinx.coroutines.Dispatchers.IO) { PhotoStore.decodeSampled(currentPath, maxDimension) }
-        awaitDispose { value?.recycle() }
-    }.value
-}
-
-@Composable private fun Counter(label:String,value:Int,range:IntRange,onChange:(Int)->Unit){Card(shape=RoundedCornerShape(16.dp)){Row(Modifier.fillMaxWidth().padding(10.dp),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Text(label,fontWeight=FontWeight.Bold)};IconButton({onChange((value-1).coerceIn(range))}){Text("−",style=MaterialTheme.typography.headlineMedium)};Text(value.toString(),style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold);IconButton({onChange((value+1).coerceIn(range))}){Text("+",style=MaterialTheme.typography.headlineMedium)}}}}
-@Composable private fun NumberField(label:String,value:Int,mod:Modifier,onChange:(Int)->Unit){OutlinedTextField(value.toString(),{it.filter(Char::isDigit).toIntOrNull()?.let(onChange)},mod,label={Text(label)},keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number),singleLine=true)}
-
-@Composable private fun AddHiveScreen(apiaries:List<Apiary>, initialApiary: String?, onBack:()->Unit, onCreate:(String,String,String,Int)->Unit){BackHandler{onBack()};var number by rememberSaveable{mutableStateOf("")};var apiary by rememberSaveable(initialApiary) { mutableStateOf(initialApiary ?: apiaries.firstOrNull()?.name ?: "Home Yard") };var queen by rememberSaveable{mutableStateOf("Laying")};var strength by rememberSaveable{mutableIntStateOf(5)};Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){Row(verticalAlignment=Alignment.CenterVertically){IconButton(onBack){Icon(Icons.Rounded.ArrowBack,"Back")};Text("Add Hive",style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold)};OutlinedTextField(number,{number=it},Modifier.fillMaxWidth(),label={Text("Hive number")},singleLine=true);OutlinedTextField(apiary,{ if (initialApiary == null) apiary=it },Modifier.fillMaxWidth(),label={Text("Apiary / Yard")},singleLine=true,readOnly=initialApiary != null);Text("Queen status",fontWeight=FontWeight.Bold);Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){for(status in listOf("Laying","Spotted","Unspotted","Queenless","Virgin")){FilterChip(queen==status,{queen=status},{Text(status)})}};Counter("Starting strength",strength,0..10){strength=it};Button({onCreate(number,apiary,queen,strength)},Modifier.fillMaxWidth().height(60.dp),enabled=number.isNotBlank(),shape=RoundedCornerShape(24.dp)){Text("CREATE HIVE",fontWeight=FontWeight.ExtraBold)}}}
-
-@Composable
-private fun AddApiaryScreen(
-    locationController: LocationController,
-    existingApiary: Apiary?,
-    onBack: () -> Unit,
-    onSave: (Long?, String, String, Double?, Double?, String, String) -> Unit
-) {
-    var name by rememberSaveable(existingApiary?.id) { mutableStateOf(existingApiary?.name.orEmpty()) }
-    var notes by rememberSaveable(existingApiary?.id) { mutableStateOf(existingApiary?.notes.orEmpty()) }
-    var forage by rememberSaveable(existingApiary?.id) { mutableStateOf(existingApiary?.forageNotes.orEmpty()) }
-    var water by rememberSaveable(existingApiary?.id) { mutableStateOf(existingApiary?.waterNotes.orEmpty()) }
-    var lat by rememberSaveable(existingApiary?.id) { mutableStateOf(existingApiary?.latitude) }
-    var lon by rememberSaveable(existingApiary?.id) { mutableStateOf(existingApiary?.longitude) }
-    var gpsStatus by rememberSaveable { mutableStateOf("") }
-    val context = LocalContext.current
-    BackHandler { onBack() }
-    val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        if (result[Manifest.permission.ACCESS_FINE_LOCATION] == true || result[Manifest.permission.ACCESS_COARSE_LOCATION] == true) {
-            locationController.current { r ->
-                if (r != null) { lat = r.latitude; lon = r.longitude; gpsStatus = "GPS captured" }
-                else gpsStatus = "Could not get a location"
-            }
-        } else gpsStatus = "Location permission denied"
-    }
-    Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(18.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-        Row(verticalAlignment=Alignment.CenterVertically){IconButton(onBack){Icon(Icons.Rounded.ArrowBack,"Back")};Text(if (existingApiary == null) "Add Apiary" else "Edit Apiary",style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.ExtraBold)}
-        OutlinedTextField(name,{name=it},Modifier.fillMaxWidth(),label={Text("Apiary name")},singleLine=true)
-        OutlinedTextField(notes,{notes=it},Modifier.fillMaxWidth(),label={Text("Site notes")})
-        OutlinedTextField(forage,{forage=it},Modifier.fillMaxWidth(),label={Text("Forage notes")})
-        OutlinedTextField(water,{water=it},Modifier.fillMaxWidth(),label={Text("Water notes")})
-        OutlinedButton(onClick={
-            if(locationController.hasPermission()) locationController.current { r ->
-                if(r != null){lat=r.latitude;lon=r.longitude;gpsStatus="GPS captured"} else gpsStatus="Could not get a location"
-            } else locationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION,Manifest.permission.ACCESS_COARSE_LOCATION))
-        },Modifier.fillMaxWidth().height(54.dp)){Icon(Icons.Rounded.LocationOn,null);Spacer(Modifier.width(6.dp));Text(if(lat==null)"CAPTURE CURRENT GPS" else "GPS CAPTURED")}
-        if (lat != null && lon != null) {
-            Text("Saved GPS: ${"%.5f".format(Locale.US, lat)}, ${"%.5f".format(Locale.US, lon)}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
-            TextButton(onClick = { lat = null; lon = null; gpsStatus = "GPS location removed" }) { Text("REMOVE GPS LOCATION") }
-        }
-        if(gpsStatus.isNotBlank()) Text(gpsStatus,color=if(gpsStatus.startsWith("Could") || gpsStatus.startsWith("Location permission denied"))MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,fontWeight=FontWeight.Bold)
-        Button({onSave(existingApiary?.id, name.trim(),notes.trim(),lat,lon,forage.trim(),water.trim())},Modifier.fillMaxWidth().height(60.dp),enabled=name.isNotBlank(),shape=RoundedCornerShape(24.dp)){Text(if (existingApiary == null) "SAVE APIARY" else "SAVE CHANGES",fontWeight=FontWeight.ExtraBold)}
     }
 }
 
@@ -2188,16 +1364,22 @@ private fun TagManagementScreen(
     nfc: NfcController,
     activity: ComponentActivity,
     pendingUid: String?,
+    confirmBeforeTagRemoval: Boolean = true,
     onPendingUidConsumed: () -> Unit,
     onBack: () -> Unit,
     onOpenHive: (Long) -> Unit,
+    onScanOpenHive: (Long) -> Unit,
     onAssignTag: (Long, String, Boolean, (Boolean, String?) -> Unit) -> Unit,
-    onClearTag: (Long) -> Unit
+    onClearTag: (Long, (Boolean, String?) -> Unit) -> Unit,
+    onUnassignedTag: (String) -> Unit,
+    onIsTagUnassigned: suspend (String) -> Boolean
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var status by rememberSaveable { mutableStateOf("") }
     var assigningHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var reassignPrompt by rememberSaveable { mutableStateOf<Pair<Long, String>?>(null) }
+    var pendingRemoveHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var launchWriteHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var launchWriteUid by rememberSaveable { mutableStateOf<String?>(null) }
     var launchWriteOverwrite by rememberSaveable { mutableStateOf(false) }
@@ -2211,14 +1393,55 @@ private fun TagManagementScreen(
         allowOverwriteOtherHive: Boolean = false,
         updateStatus: (String) -> Unit
     ) {
-        // Do not immediately re-arm the NFC reader here: the user's first tap
-        // may still be against the phone. Show an explicit prompt first, then
-        // start a fresh write scan only after they confirm they are ready.
-        updateStatus("Tag $uid assigned. One more tap is needed to write BeeKeep launch data.")
+        // This fallback is retained for confirmed reassignment and legacy pending-tag flows.
+        updateStatus("Tag $uid assigned. Tap the tag again to finish writing BeeKeep launch data.")
         launchWriteHiveId = hiveId
         launchWriteUid = uid
         launchWriteOverwrite = allowOverwriteOtherHive
         launchWriteStatusHandler = updateStatus
+    }
+
+    fun assignAndWriteOnScan(
+        hiveId: Long,
+        expectedUid: String? = null,
+        consumePending: Boolean = false,
+        updateStatus: (String) -> Unit
+    ) {
+        nfc.startAssignAndWrite(
+            activity = activity,
+            text = BeeKeepNfcPayload.TAG_PAYLOAD,
+            expectedUid = expectedUid,
+            isAssignedElsewhere = { uid ->
+                hives.any { it.id != hiveId && it.tagUid.equals(uid, ignoreCase = true) }
+            },
+            onResult = { result ->
+                when (result) {
+                    is NfcResult.Written -> {
+                        onAssignTag(hiveId, result.uid, false) { success, error ->
+                            if (success) {
+                                if (consumePending) onPendingUidConsumed()
+                                val hiveNumber = hives.firstOrNull { it.id == hiveId }?.number ?: hiveId.toString()
+                                updateStatus("Tag assigned and launch data written. With BeeKeep closed, tapping this tag should open Hive ${hiveNumber}.")
+                            } else {
+                                updateStatus(error ?: "Payload was written, but BeeKeep could not save the tag assignment.")
+                            }
+                        }
+                    }
+                    is NfcResult.Read -> {
+                        val owner = hives.firstOrNull { it.tagUid.equals(result.uid, ignoreCase = true) }
+                        val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
+                        when {
+                            owner != null && owner.id != hiveId -> {
+                                reassignPrompt = hiveId to result.uid
+                                updateStatus("Tag ${result.uid} is assigned to ${hiveReferenceName(owner.number)}. Confirm REASSIGN before changing it.")
+                            }
+                            else -> updateStatus("Could not write this tag automatically. Use WRITE TAG from the hive details to retry.")
+                        }
+                    }
+                    is NfcResult.Error -> updateStatus(result.message)
+                }
+            }
+        )
     }
 
     if (launchWriteHiveId != null && launchWriteUid != null) {
@@ -2252,7 +1475,7 @@ private fun TagManagementScreen(
                     if (hiveId != null && uid != null) {
                         nfc.startWrite(
                             activity = activity,
-                            text = BeeKeepNfcPayload.forHive(hiveId),
+                            text = BeeKeepNfcPayload.TAG_PAYLOAD,
                             allowOverwriteOtherHive = allowOverwrite,
                             expectedUid = uid,
                             onResult = { result ->
@@ -2273,6 +1496,29 @@ private fun TagManagementScreen(
                     launchWriteUid = null
                     launchWriteStatusHandler = null
                 }) { Text("NOT NOW") }
+            }
+        )
+    }
+
+    pendingRemoveHiveId?.let { hiveId ->
+        val hiveNumber = hives.firstOrNull { it.id == hiveId }?.number ?: hiveId.toString()
+        AlertDialog(
+            onDismissRequest = { pendingRemoveHiveId = null },
+            title = { Text("Remove NFC tag?", fontWeight = FontWeight.ExtraBold) },
+            text = {
+                Text("Release the tag assignment from Hive $hiveNumber? The physical tag is not erased; you can assign it to another hive later.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRemoveHiveId = null
+                    status = "Removing NFC tag from Hive $hiveNumber…"
+                    onClearTag(hiveId) { success, error ->
+                        status = if (success) "Tag removed from Hive $hiveNumber • available for reuse" else (error ?: "Could not remove the tag from Hive $hiveNumber.")
+                    }
+                }) { Text("REMOVE TAG", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRemoveHiveId = null }) { Text("CANCEL") }
             }
         )
     }
@@ -2311,7 +1557,7 @@ private fun TagManagementScreen(
         Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("How BeeKeep tags work", fontWeight = FontWeight.Bold)
-                Text("Assign links the tag UID to a hive. BeeKeep then asks you to tap the same tag again to write its launch data. That small NDEF payload lets Android open BeeKeep directly when the app is closed; hive history stays in BeeKeep, not on the tag.", color = MaterialTheme.colorScheme.onPrimaryContainer)
+                Text("Choose a hive and tap ASSIGN/REPLACE. BeeKeep links the tag's UID in its database and writes a generic marker plus Android app-launch record. No hive ID or hive history is stored on the physical tag.", color = MaterialTheme.colorScheme.onPrimaryContainer)
                 Text("Tags are reusable: when a colony dies its tag is released and can be assigned to another hive. Scanning always opens the colony the tag is currently assigned to.", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.bodySmall)
                 Text("Use durable, weather-resistant NFC tags on the hive lid or another protected surface.", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.bodySmall)
             }
@@ -2330,17 +1576,21 @@ private fun TagManagementScreen(
         Button(
             onClick = {
                 assigningHiveId = null
-                nfc.startRead(activity) { result ->
+                nfc.startReadAndPrepareForBeeKeep(activity) { result ->
                     when (result) {
-                        is NfcResult.Read -> {
+                        is NfcResult.Read -> scope.launch {
+                            result.launchPreparationError?.let { status = it }
                             val hiveByUid = hives.firstOrNull { it.tagUid.equals(result.uid, ignoreCase = true) }
-                            val hiveByPayload = BeeKeepNfcPayload.hiveId(result.text)?.let { id -> hives.firstOrNull { it.id == id } }
-                            status = when {
-                                hiveByUid != null -> "Hive ${hiveByUid.number} • tag verified"
-                                hiveByPayload != null -> "Hive ${hiveByPayload.number} • tag payload recognized"
-                                else -> "Unassigned tag • ${result.uid}"
+                            val tagWasReleased = onIsTagUnassigned(result.uid)
+                            val resolvedHiveId = NfcTagResolution.resolveHiveId(hiveByUid?.id)
+                            val resolvedHive = hiveByUid?.takeIf { it.id == resolvedHiveId }
+                            status = if (resolvedHive != null) {
+                                "${hiveReferenceName(resolvedHive.number)} • tag verified by UID"
+                            } else {
+                                "Unassigned tag • ${result.uid}"
                             }
-                            hiveByUid?.let { onOpenHive(it.id) } ?: hiveByPayload?.let { onOpenHive(it.id) }
+                            if (resolvedHive != null) onScanOpenHive(resolvedHive.id)
+                            else onUnassignedTag(result.uid)
                         }
                         is NfcResult.Error -> status = result.message
                         is NfcResult.Written -> Unit
@@ -2365,7 +1615,7 @@ private fun TagManagementScreen(
                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text("Hive ${hive.number}", fontWeight = FontWeight.Bold)
+                            Text(hiveDisplayName(hive.number), fontWeight = FontWeight.Bold)
                             Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                         }
                         Text(if (hive.tagUid.isNullOrBlank()) "UNASSIGNED" else "TAGGED", fontWeight = FontWeight.Bold, color = if (hive.tagUid.isNullOrBlank()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
@@ -2375,43 +1625,14 @@ private fun TagManagementScreen(
                         OutlinedButton(onClick = { onOpenHive(hive.id) }, modifier = Modifier.weight(1f)) { Text("OPEN") }
                         OutlinedButton(
                             onClick = {
-                                if (pendingUid != null) {
-                                    onAssignTag(hive.id, pendingUid, false) { success, error ->
-                                        if (success) {
-                                            onPendingUidConsumed()
-                                            writeLaunchDataAfterAssignment(hive.id, pendingUid) { verifyText = it }
-                                        } else if (error?.contains("already assigned") == true) {
-                                            reassignPrompt = hive.id to pendingUid
-                                        } else {
-                                            verifyText = error ?: "Could not assign tag."
-                                        }
-                                    }
-                                    return@OutlinedButton
-                                }
                                 assigningHiveId = hive.id
-                                nfc.startRead(activity) { result ->
-                                    when (result) {
-                                        is NfcResult.Read -> {
-                                            val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
-                                            if (payloadHiveId != null && payloadHiveId != hive.id) {
-                                                verifyText = "Tag payload belongs to another hive. Use REPLACE/WRITE on the destination hive."
-                                                assigningHiveId = null
-                                            } else {
-                                                onAssignTag(hive.id, result.uid, false) { success, error ->
-                                                    if (success) {
-                                                        writeLaunchDataAfterAssignment(hive.id, result.uid) { verifyText = it }
-                                                    } else if (error?.contains("already assigned") == true) {
-                                                        reassignPrompt = hive.id to result.uid
-                                                    } else {
-                                                        verifyText = error ?: "Could not assign tag."
-                                                    }
-                                                    assigningHiveId = null
-                                                }
-                                            }
-                                        }
-                                        is NfcResult.Error -> { verifyText = result.message; assigningHiveId = null }
-                                        is NfcResult.Written -> Unit
-                                    }
+                                assignAndWriteOnScan(
+                                    hiveId = hive.id,
+                                    expectedUid = pendingUid,
+                                    consumePending = pendingUid != null
+                                ) { message ->
+                                    verifyText = message
+                                    assigningHiveId = null
                                 }
                             },
                             enabled = nfc.isAvailable() && nfc.isEnabled(),
@@ -2424,12 +1645,13 @@ private fun TagManagementScreen(
                                 nfc.startRead(activity) { result ->
                                     when (result) {
                                         is NfcResult.Read -> {
-                                            val payloadId = BeeKeepNfcPayload.hiveId(result.text)
+                                            val matchesUid = result.uid.equals(hive.tagUid, true)
+                                            val currentMarker = BeeKeepNfcPayload.isTagPayload(result.text) && result.info.hasBeeKeepLaunchRecord
                                             verifyText = when {
-                                                !result.uid.equals(hive.tagUid, true) -> "⚠ Tag ${result.uid} does not match Hive ${hive.number}"
-                                                payloadId == hive.id -> "✓ Tag matches Hive ${hive.number} and has BeeKeep launch data"
-                                                payloadId == null -> "UID matches, but this tag has no BeeKeep launch data. Use WRITE TAG from hive details."
-                                                else -> "⚠ Tag payload belongs to another hive"
+                                                !matchesUid -> "⚠ Tag ${result.uid} does not match ${hiveReferenceName(hive.number)}"
+                                                currentMarker -> "✓ Tag matches ${hiveReferenceName(hive.number)}; no hive data is stored on the tag"
+                                                BeeKeepNfcPayload.hiveId(result.text) != null -> "UID matches, but this tag still has old hive data. Scan it in BeeKeep to upgrade it."
+                                                else -> "UID matches, but the BeeKeep app-launch marker is missing. Use WRITE TAG from hive details."
                                             }
                                         }
                                         is NfcResult.Error -> verifyText = result.message
@@ -2437,7 +1659,19 @@ private fun TagManagementScreen(
                                     }
                                 }
                             }, modifier = Modifier.weight(1f)) { Text("VERIFY") }
-                            TextButton(onClick = { onClearTag(hive.id); verifyText = "Tag removed" }, modifier = Modifier.weight(1f)) { Text("REMOVE") }
+                            TextButton(
+                                onClick = {
+                                    if (confirmBeforeTagRemoval) {
+                                        pendingRemoveHiveId = hive.id
+                                    } else {
+                                        verifyText = "Removing NFC tag…"
+                                        onClearTag(hive.id) { success, error ->
+                                            verifyText = if (success) "Tag removed • available for reuse" else (error ?: "Could not remove tag.")
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("REMOVE") }
                         }
                     }
                     verifyText.takeIf { it.isNotBlank() }?.let { Text(it, color = if (it.startsWith("⚠")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -2451,14 +1685,14 @@ private fun TagManagementScreen(
 @Composable
 private fun MoreScreen(
     padding: PaddingValues,
-    darkMode: Boolean,
-    onDarkModeChange: (Boolean) -> Unit,
+    onBack: () -> Unit,
     onTagManager: () -> Unit,
     onColonyHistory: () -> Unit,
     deadCount: Int,
     activity: ComponentActivity,
     cloud: SupabaseGateway
 ) {
+    BackHandler { onBack() }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val account by cloud.account.collectAsStateWithLifecycle()
@@ -2467,15 +1701,13 @@ private fun MoreScreen(
     var authMessage by rememberSaveable { mutableStateOf("") }
 
     Column(Modifier.fillMaxSize().padding(padding).padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("More", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
-
-        Card(shape = RoundedCornerShape(24.dp)) {
-            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Yellow + black field mode", fontWeight = FontWeight.Bold)
-                    Text("High-contrast controls for bright outdoor conditions", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                }
-                Switch(checked = darkMode, onCheckedChange = onDarkModeChange)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Rounded.ArrowBack, contentDescription = "Back to Settings")
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("More", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
+                Text("Additional tools and account controls", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
         }
 
@@ -2566,7 +1798,17 @@ private fun MoreScreen(
                             enabled = !account.syncing
                         ) { Text("SYNC NOW") }
                         OutlinedButton(
-                            onClick = { scope.launch { cloud.signOut(); authMessage = "Signed out. Your phone data is still available offline." } },
+                            onClick = {
+                                scope.launch {
+                                    authMessage = ""
+                                    authMessage = when (val result = cloud.signOut()) {
+                                        CloudResult.Success -> "Signed out. Your phone data is still available offline."
+                                        CloudResult.NotConfigured -> "Cloud is not configured."
+                                        CloudResult.NotSignedIn -> "You are already signed out."
+                                        is CloudResult.Failure -> result.message
+                                    }
+                                }
+                            },
                             modifier = Modifier.weight(1f)
                         ) { Text("SIGN OUT") }
                     }
@@ -2583,115 +1825,8 @@ private fun MoreScreen(
         Card(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.padding(16.dp)) {
                 Text("Native Android • Kotlin + Compose", fontWeight = FontWeight.Bold)
-                Text("Room offline database • NFC • CameraX • GPS • Voice • WorkManager • cloud sync outbox", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Room offline database • NFC • GPS • Voice • WorkManager • cloud sync outbox", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
-}
-
-@Composable
-private fun FeedDialog(onDismiss: () -> Unit, onSave: (String, String, Double, String, String) -> Unit) {
-    var type by rememberSaveable { mutableStateOf("Syrup") }
-    var ratio by rememberSaveable { mutableStateOf("1:1") }
-    var amount by rememberSaveable { mutableStateOf("1") }
-    var unit by rememberSaveable { mutableStateOf("gal") }
-    var notes by rememberSaveable { mutableStateOf("") }
-    var error by rememberSaveable { mutableStateOf("") }
-    SimpleLogDialog("Log Feeding", onDismiss, {
-        val value = amount.trim().toDoubleOrNull()
-        when {
-            type.isBlank() -> error = "Enter a feed type."
-            value == null || !value.isFinite() || value < 0 -> error = "Enter a valid non-negative amount."
-            unit.isBlank() -> error = "Enter a unit."
-            else -> onSave(type.trim(), ratio.trim(), value, unit.trim(), notes.trim())
-        }
-    }, {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(type, { type = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Feed type") }, singleLine = true)
-            OutlinedTextField(ratio, { ratio = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Ratio (optional)") }, singleLine = true)
-            OutlinedTextField(amount, { amount = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Amount") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(unit, { unit = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Unit") }, singleLine = true)
-            OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") })
-            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
-        }
-    })
-}
-
-@Composable
-private fun TreatmentDialog(onDismiss: () -> Unit, onSave: (String, String, Int, Int, String) -> Unit) {
-    var type by rememberSaveable { mutableStateOf("Mite treatment") }
-    var product by rememberSaveable { mutableStateOf("") }
-    var duration by rememberSaveable { mutableStateOf("42") }
-    var withdrawal by rememberSaveable { mutableStateOf("0") }
-    var notes by rememberSaveable { mutableStateOf("") }
-    var error by rememberSaveable { mutableStateOf("") }
-    SimpleLogDialog("Log Treatment", onDismiss, {
-        val removal = duration.trim().toIntOrNull()
-        val withdraw = withdrawal.trim().toIntOrNull()
-        when {
-            type.isBlank() -> error = "Enter a treatment type."
-            product.isBlank() -> error = "Enter a product."
-            removal == null || removal < 0 -> error = "Removal days must be a non-negative whole number."
-            withdraw == null || withdraw < 0 -> error = "Withdrawal days must be a non-negative whole number."
-            else -> onSave(type.trim(), product.trim(), removal, withdraw, notes.trim())
-        }
-    }, {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(type, { type = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Treatment type") }, singleLine = true)
-            OutlinedTextField(product, { product = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Product") }, singleLine = true)
-            OutlinedTextField(duration, { duration = it.filter(Char::isDigit); error = "" }, Modifier.fillMaxWidth(), label = { Text("Removal in days") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
-            OutlinedTextField(withdrawal, { withdrawal = it.filter(Char::isDigit); error = "" }, Modifier.fillMaxWidth(), label = { Text("Extra withdrawal days") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
-            OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") })
-            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
-        }
-    })
-}
-
-@Composable
-private fun HarvestDialog(onDismiss: () -> Unit, onSave: (Int, Double, Double, String, Double, Double, String) -> Unit) {
-    var supers by rememberSaveable { mutableStateOf("0") }
-    var wet by rememberSaveable { mutableStateOf("0") }
-    var dry by rememberSaveable { mutableStateOf("0") }
-    var unit by rememberSaveable { mutableStateOf("lb") }
-    var wax by rememberSaveable { mutableStateOf("0") }
-    var prop by rememberSaveable { mutableStateOf("0") }
-    var notes by rememberSaveable { mutableStateOf("") }
-    var error by rememberSaveable { mutableStateOf("") }
-    SimpleLogDialog("Log Harvest", onDismiss, {
-        val s = supers.trim().toIntOrNull()
-        val w = wet.trim().toDoubleOrNull()
-        val d = dry.trim().toDoubleOrNull()
-        val wx = wax.trim().toDoubleOrNull()
-        val pr = prop.trim().toDoubleOrNull()
-        when {
-            s == null || s < 0 -> error = "Supers pulled must be a non-negative whole number."
-            w == null || !w.isFinite() || w < 0 -> error = "Enter a valid wet honey weight."
-            d == null || !d.isFinite() || d < 0 -> error = "Enter a valid dry honey weight."
-            unit.isBlank() -> error = "Enter a weight unit."
-            wx == null || !wx.isFinite() || wx < 0 -> error = "Enter a valid wax weight."
-            pr == null || !pr.isFinite() || pr < 0 -> error = "Enter a valid propolis weight."
-            else -> onSave(s, w, d, unit.trim(), wx, pr, notes.trim())
-        }
-    }, {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(supers, { supers = it.filter(Char::isDigit); error = "" }, Modifier.fillMaxWidth(), label = { Text("Supers pulled") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
-            OutlinedTextField(wet, { wet = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Wet honey") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(dry, { dry = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Dry honey") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(unit, { unit = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Weight unit") }, singleLine = true)
-            OutlinedTextField(wax, { wax = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Wax") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(prop, { prop = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Propolis") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") })
-            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
-        }
-    })
-}
-
-@Composable private fun SimpleLogDialog(title: String, onDismiss: () -> Unit, onConfirm: () -> Unit, content: @Composable () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title, fontWeight = FontWeight.ExtraBold) },
-        text = { content() },
-        confirmButton = { TextButton(onClick = onConfirm) { Text("SAVE", fontWeight = FontWeight.ExtraBold) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL") } }
-    )
 }

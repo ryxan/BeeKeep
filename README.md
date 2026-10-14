@@ -1,94 +1,45 @@
-# BeeKeep — Native Android v1.7.0
+# BeeKeep — Native Android v1.8.1
 
-BeeKeep is a mobile-first beekeeping log built natively in Kotlin for Android.
+BeeKeep is a mobile-first, native Kotlin app for managing apiaries, hive records, inspections, and NFC hive tags.
 
+## Current app scope
 
-## v1.0.1 — Deep Regression Polish
-- Hardened cloud sync against concurrent runs and stale offline uploads
-- Realtime is limited to signed-in interactive app sessions; background sync workers do not open websockets
-- Debounced realtime sync bursts
-- Hardened task reminders against rescheduled/stale alarms
-- Improved camera failure reporting and photo bitmap lifecycle
-- Hardened NFC reader lifecycle
-- Backfilled inspections no longer regress hive edit timestamps
+- **Apiaries:** create and organize yards, save GPS coordinates, and view saved locations on the in-app satellite map.
+- **Hives:** keep each colony's record inside its apiary, track queen status and colony strength, and access its inspection history.
+- **Inspections:** log mite-wash counts and sample size, queen observations, brood and stores, disease flags, field notes, voice dictation, and GPS where available.
+- **Hive logs:** record feeding, treatments, and harvests.
+- **NFC:** scan tags to open hives, assign or replace tags, verify or remove assignments, and write/read back BeeKeep tag data. Conflicting tag assignments are guarded to avoid silently changing the wrong hive.
+- **Field usability:** high-contrast yellow-and-black mode, large controls, and local records that remain available without a network connection.
+- **Optional cloud sync:** sign in to a configured Supabase backend to synchronize records between devices. Core record entry remains local-first.
 
-## v1.0.0 — Smart Inspection Assistant
-- Added a per-hive BeeKeep Health Score with transparent, heuristic inputs
-- Added “What to check next” recommendations driven by recent hive history
-- Recommendations include queen follow-up, mite trend checks, health flags, queen-cell follow-up, strength drops, low stores, stale queen confirmation, and routine inspection timing
-- Each recommendation can be added to the BeeKeep calendar with one tap
-- Added inspection-to-inspection comparison for strength, mites, honey stores, brood, and queen-status changes
-- Quick Inspect now surfaces the top suggested checks before the field form
-- Added unit-style regression coverage for the smart recommendation engine
+The current app intentionally does **not** include the Calendar, Analytics, camera-capture, photo-album, or PC/browser test-lab features. Legacy records are preserved where supported; these removed UI features are not exposed.
 
-## Product boundary
-This is a native Android-only package. No PC Test Lab or browser companion is included.
+New installations start with an empty apiary list rather than fabricated demo colonies. Existing legacy records are imported where available.
 
-## Build
+## Build and verify
 
-Run the host preflight first:
+Use JDK 17 and the Android SDK required by the project.
 
-```text
-./scripts/verify-build-host.sh
+Build the debug APK:
+
+```bash
+./gradlew :app:assembleDebug
 ```
 
-Then build a real debug APK:
+Run available JVM unit tests and build the APK:
 
-```text
-./scripts/build-debug.sh
+```bash
+./gradlew :app:testDebugUnitTest :app:assembleDebug
 ```
 
-The APK is written to `app/build/outputs/apk/debug/app-debug.apk` and is signature-verified when Android Build Tools are available.
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. GitHub Actions also builds and uploads a debug APK for repository pushes.
 
-Open this project root in Android Studio Rabbit 1 (2026.2.1) with JDK 17. Android Gradle Plugin 9.4.0 requires Gradle 9.6.0, JDK 17, and SDK Build Tools 36.0.0. The project now uses AGP built-in Kotlin and KSP for Room code generation.
+For Windows environment checks and install helpers, see `BUILD_ANDROID.md`, `scripts/verify-build-host.sh`, `scripts/build-debug.sh`, and the Windows build/install scripts in `scripts/`.
 
-For a debug APK, use **Build > Build APK(s)** or run `:app:assembleDebug`. The APK will be under `app/build/outputs/apk/debug/`. See `BUILD_ANDROID.md` and `scripts/doctor.ps1` for setup checks.
+## Data safety notes
 
-
-## v1.3.0 — Advanced Analytics
-- Added unified Hive & Apiary analytics for strength, mites, total brood, honey stores, queen status, and harvest.
-- Added metric and time-range switching with searchable Hive/Apiary scope.
-- Apiary metrics equal-weight inspected hives within each time bucket.
-- Harvest trends are normalized to kilograms and aggregated per producing hive.
-- Added dedicated analytics smoke tests and preserved the existing Health Trends graph.
-
-## v1.2.1 Deep Polish
-- Health graph ranges now use local calendar days, avoiding daylight-saving-time drift.
-- Apiary buckets align to the selected range start.
-- Apiary averages equal-weight inspected hives within each bucket.
-- Latest-average metric is constrained to the selected range.
-- Health scope selection supports search for large apiaries.
-- Chart rendering is clearer on small mobile screens and handles sparse data explicitly.
-- Historical inspection scoring shares the same baseline weighting as Smart Inspection.
-
-
-## v1.5.0
-Native NFC tag management is now production-oriented: scan/open, assign, replace, verify, remove, and NDEF dispatch are built directly on Android NFC APIs.
-
-## v1.5.2 — Deep NFC Polish
-- Atomic one-shot NFC scan sessions prevent duplicate callbacks.
-- Faster foreground reader setup by skipping the redundant platform NDEF check and platform reader sounds.
-- NFC adapter lookup uses Android's `NfcManager` service.
-- Launch-time NDEF handling avoids reconnecting to a tag that may already have left the field.
-- Safe write guard blocks overwriting a BeeKeep tag belonging to another hive unless the user explicitly uses REPLACE.
-- NDEF writes are read back and verified before BeeKeep reports success.
-- UID formatting is normalized byte-by-byte.
-- BeeKeep payload validation rejects malformed and non-positive hive IDs consistently.
-
-
-## v1.6.0 Stability Focus
-This baseline prioritizes data integrity, calendar save feedback, reminder de-duplication, notification settings, and cloud photo synchronization. The Android app remains native Kotlin; no PC test runtime is included.
-
-## v1.7.0 — Build & Install Foundation
-- Migrated Room from KAPT to KSP for compatibility with AGP 9 built-in Kotlin.
-- Added a reproducible Android build checklist and environment doctor script.
-- Added debug-install/update scripts for Windows.
-- Added version 1.7.0 / versionCode 23 for the production-hardening phase.
-
-
-## v1.7.0 — Build & install foundation
-- Migrated Room from KAPT to KSP for AGP 9 built-in Kotlin compatibility.
-- Added an actual Gradle wrapper JAR plus pinned Gradle 9.6.0 checksum verification.
-- Added Windows build/diagnostic scripts and GitHub Actions debug-build validation.
-- Added real-device acceptance checklist.
-- Version 1.7.0 / versionCode 23.
+- Room is the on-device source of truth for local use.
+- Database migrations are explicit to preserve data across supported upgrades.
+- Hive lifecycle changes preserve colony history; permanently deleting a hive is a separate action.
+- NFC UID assignments are stored as a ledger so a released tag can be assigned again without losing its history.
+- Local photo paths are not synced as usable paths on another device; any legacy photo records remain device-local unless their upload was already supported and configured.

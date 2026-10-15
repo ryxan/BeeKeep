@@ -53,7 +53,8 @@ data class HiveEntity(
     @ColumnInfo(name = "status_changed_at", defaultValue = "0") val statusChangedAt: Long = 0L,
     // Last known physical position for this individual hive, independent of its apiary.
     val latitude: Double? = null,
-    val longitude: Double? = null
+    val longitude: Double? = null,
+    @ColumnInfo(name = "bee_count_frames") val beeCountFrames: Double? = null
 )
 
 @Entity(
@@ -91,14 +92,15 @@ data class InspectionEntity(
     @ColumnInfo(name = "emergency_cells") val emergencyCells: Int = 0,
     @ColumnInfo(name = "supercedure_cells") val supercedureCells: Int = 0,
     @ColumnInfo(name = "swarm_cells") val swarmCells: Int = 0,
-    val eggs: Int = 0,
-    @ColumnInfo(name = "open_brood") val openBrood: Int = 0,
-    @ColumnInfo(name = "capped_brood") val cappedBrood: Int = 0,
-    @ColumnInfo(name = "honey_stores") val honeyStores: Int = 0,
-    val pollen: Int = 0,
-    @ColumnInfo(name = "empty_drawn_comb") val emptyDrawnComb: Int = 0,
+    val eggs: Double = 0.0,
+    @ColumnInfo(name = "open_brood") val openBrood: Double = 0.0,
+    @ColumnInfo(name = "capped_brood") val cappedBrood: Double = 0.0,
+    @ColumnInfo(name = "honey_stores") val honeyStores: Double = 0.0,
+    val pollen: Double = 0.0,
+    @ColumnInfo(name = "empty_drawn_comb") val emptyDrawnComb: Double = 0.0,
     @ColumnInfo(name = "disease_flags") val diseaseFlags: String = "",
-    @ColumnInfo(name = "updated_at") val updatedAt: Long = System.currentTimeMillis()
+    @ColumnInfo(name = "updated_at") val updatedAt: Long = System.currentTimeMillis(),
+    @ColumnInfo(name = "bee_count_frames") val beeCountFrames: Double? = null
 ) {
     val mitePercent: Double get() = if (sampleSize > 0) miteCount * 100.0 / sampleSize else 0.0
 }
@@ -222,7 +224,8 @@ data class Hive(
     val status: String = HiveStatus.ACTIVE,
     val deadAt: Long? = null,
     val latitude: Double? = null,
-    val longitude: Double? = null
+    val longitude: Double? = null,
+    val beeCountFrames: Double? = null
 ) {
     val isDead: Boolean get() = status != HiveStatus.ACTIVE
 }
@@ -242,13 +245,14 @@ data class Inspection(
     val emergencyCells: Int = 0,
     val supercedureCells: Int = 0,
     val swarmCells: Int = 0,
-    val eggs: Int = 0,
-    val openBrood: Int = 0,
-    val cappedBrood: Int = 0,
-    val honeyStores: Int = 0,
-    val pollen: Int = 0,
-    val emptyDrawnComb: Int = 0,
-    val diseaseFlags: String = ""
+    val eggs: Double = 0.0,
+    val openBrood: Double = 0.0,
+    val cappedBrood: Double = 0.0,
+    val honeyStores: Double = 0.0,
+    val pollen: Double = 0.0,
+    val emptyDrawnComb: Double = 0.0,
+    val diseaseFlags: String = "",
+    val beeCountFrames: Double? = null
 ) {
     val mitePercent: Double get() = if (sampleSize > 0) miteCount * 100.0 / sampleSize else 0.0
 }

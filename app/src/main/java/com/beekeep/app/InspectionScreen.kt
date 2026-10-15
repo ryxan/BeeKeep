@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -35,14 +36,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.GpsFixed
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -55,10 +59,12 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,6 +90,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import com.beekeep.app.data.ActivityEvent
 import com.beekeep.app.data.Hive
 import com.beekeep.app.data.Inspection
 import com.beekeep.app.location.LocationController
@@ -92,9 +99,18 @@ import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 import org.json.JSONObject
 
 internal const val INSPECTION_NOTE_DRAFTS = "beekeep_inspection_note_drafts"
+
+private fun normalizeBroodStoresGauge(value: Double): Double =
+    (value.coerceIn(0.0, 10.0) * 2.0).roundToInt() / 2.0
+
+private fun formatBroodStoresGauge(value: Double): String {
+    val whole = value.roundToInt()
+    return if (value == whole.toDouble()) whole.toString() else String.format(Locale.US, "%.1f", value)
+}
 private const val INSPECTION_FORM_DRAFTS = "beekeep_inspection_form_drafts"
 
 private data class InspectionFormDraft(
@@ -102,19 +118,20 @@ private data class InspectionFormDraft(
     val queenStatus: String,
     val miteCount: Int,
     val sampleSize: Int,
-    val eggs: Int,
-    val openBrood: Int,
-    val cappedBrood: Int,
-    val honeyStores: Int,
-    val pollen: Int,
-    val emptyDrawnComb: Int,
+    val eggs: Double,
+    val openBrood: Double,
+    val cappedBrood: Double,
+    val honeyStores: Double,
+    val pollen: Double,
+    val emptyDrawnComb: Double,
     val emergencyCells: Int,
     val supercedureCells: Int,
     val swarmCells: Int,
     val diseaseFlags: String,
     val updatedAt: Long,
     val latitude: Double? = null,
-    val longitude: Double? = null
+    val longitude: Double? = null,
+    val beeCountHalfSteps: Int? = null
 )
 
 private fun readInspectionFormDraft(
@@ -129,19 +146,22 @@ private fun readInspectionFormDraft(
             queenStatus = json.optString("queenStatus", "Laying"),
             miteCount = json.optInt("miteCount", 0),
             sampleSize = json.optInt("sampleSize", 300).coerceAtLeast(1),
-            eggs = json.optInt("eggs", 0),
-            openBrood = json.optInt("openBrood", 0),
-            cappedBrood = json.optInt("cappedBrood", 0),
-            honeyStores = json.optInt("honeyStores", 0),
-            pollen = json.optInt("pollen", 0),
-            emptyDrawnComb = json.optInt("emptyDrawnComb", 0),
+            eggs = json.optDouble("eggs", 0.0).coerceIn(0.0, 10.0),
+            openBrood = json.optDouble("openBrood", 0.0).coerceIn(0.0, 10.0),
+            cappedBrood = json.optDouble("cappedBrood", 0.0).coerceIn(0.0, 10.0),
+            honeyStores = json.optDouble("honeyStores", 0.0).coerceIn(0.0, 10.0),
+            pollen = json.optDouble("pollen", 0.0).coerceIn(0.0, 10.0),
+            emptyDrawnComb = json.optDouble("emptyDrawnComb", 0.0).coerceIn(0.0, 10.0),
             emergencyCells = json.optInt("emergencyCells", 0),
             supercedureCells = json.optInt("supercedureCells", 0),
             swarmCells = json.optInt("swarmCells", 0),
             diseaseFlags = json.optString("diseaseFlags", ""),
             updatedAt = json.optLong("updatedAt", 0L),
             latitude = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude") else null,
-            longitude = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null
+            longitude = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null,
+            beeCountHalfSteps = if (json.has("beeCountHalfSteps") && !json.isNull("beeCountHalfSteps")) {
+                json.optInt("beeCountHalfSteps", 1).coerceIn(1, 20)
+            } else null
         )
     }.getOrNull()
 }
@@ -156,12 +176,12 @@ private fun saveInspectionFormDraft(
         .put("queenStatus", draft.queenStatus)
         .put("miteCount", draft.miteCount.coerceAtLeast(0))
         .put("sampleSize", draft.sampleSize.coerceAtLeast(1))
-        .put("eggs", draft.eggs.coerceAtLeast(0))
-        .put("openBrood", draft.openBrood.coerceAtLeast(0))
-        .put("cappedBrood", draft.cappedBrood.coerceAtLeast(0))
-        .put("honeyStores", draft.honeyStores.coerceAtLeast(0))
-        .put("pollen", draft.pollen.coerceAtLeast(0))
-        .put("emptyDrawnComb", draft.emptyDrawnComb.coerceAtLeast(0))
+        .put("eggs", normalizeBroodStoresGauge(draft.eggs))
+        .put("openBrood", normalizeBroodStoresGauge(draft.openBrood))
+        .put("cappedBrood", normalizeBroodStoresGauge(draft.cappedBrood))
+        .put("honeyStores", normalizeBroodStoresGauge(draft.honeyStores))
+        .put("pollen", normalizeBroodStoresGauge(draft.pollen))
+        .put("emptyDrawnComb", normalizeBroodStoresGauge(draft.emptyDrawnComb))
         .put("emergencyCells", draft.emergencyCells.coerceAtLeast(0))
         .put("supercedureCells", draft.supercedureCells.coerceAtLeast(0))
         .put("swarmCells", draft.swarmCells.coerceAtLeast(0))
@@ -169,6 +189,7 @@ private fun saveInspectionFormDraft(
         .put("updatedAt", System.currentTimeMillis())
         .put("latitude", draft.latitude ?: JSONObject.NULL)
         .put("longitude", draft.longitude ?: JSONObject.NULL)
+        .put("beeCountHalfSteps", draft.beeCountHalfSteps ?: JSONObject.NULL)
     prefs.edit { putString("hive_$hiveId", json.toString()) }
 }
 
@@ -231,8 +252,8 @@ internal fun InspectionSnapshot(i: Inspection) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
             Text("${ColonyStrength.labelFromStored(i.strength)} • Queen ${i.queenStatus}")
             Text("Mites ${i.miteCount}/${i.sampleSize} = ${String.format(Locale.US, "%.2f", i.mitePercent)}%")
-            Text("Brood: eggs ${i.eggs}, open ${i.openBrood}, capped ${i.cappedBrood}")
-            Text("Stores: honey ${i.honeyStores}, pollen ${i.pollen}")
+            Text("Brood: eggs ${formatBroodStoresGauge(i.eggs)}, open ${formatBroodStoresGauge(i.openBrood)}, capped ${formatBroodStoresGauge(i.cappedBrood)}")
+            Text("Stores: honey ${formatBroodStoresGauge(i.honeyStores)}, pollen ${formatBroodStoresGauge(i.pollen)}")
             if (i.diseaseFlags.isNotBlank()) {
                 Text("Flags: ${i.diseaseFlags}", color = MaterialTheme.colorScheme.error)
             }
@@ -282,6 +303,7 @@ internal fun InspectionScreen(
     locationController: LocationController,
     hive: Hive,
     priorInspections: List<Inspection>,
+    beeCountHistory: List<ActivityEvent>,
     defaultMiteSampleSize: Int,
     defaultStartingStrength: Int,
     rememberLastInspectionValues: Boolean,
@@ -290,6 +312,7 @@ internal fun InspectionScreen(
     autoVoiceEnabled: Boolean,
     onVoiceAutoStartConsumed: () -> Unit,
     onSaveHiveLocation: (Long, Double, Double, (String?) -> Unit) -> Unit,
+    onRecordBeeCountChange: (Long, Double, Double) -> Unit,
     onBack: () -> Unit,
     onHome: () -> Unit,
     onSave: suspend (Inspection) -> Unit
@@ -342,6 +365,57 @@ internal fun InspectionScreen(
             )
         )
     }
+    val initialBeeCountHalfSteps = run {
+        val previousFrames = if (rememberLastInspectionValues) {
+            lastInspection?.beeCountFrames ?: hive.beeCountFrames
+        } else null
+        (formDraft?.beeCountHalfSteps
+            ?: previousFrames?.let { (it * 2.0).roundToInt() }
+            ?: 1).coerceIn(1, 20)
+    }
+    val beeCountHistoryStartKey = remember(hive.id) { "bee_count_history_start_${hive.id}" }
+    val savedBeeCountHistoryStart = formDraftPrefs.getInt(
+        beeCountHistoryStartKey,
+        initialBeeCountHalfSteps
+    ).coerceIn(1, 20)
+    var beeCountHalfSteps by rememberSaveable(hive.id, formStateKey) {
+        mutableIntStateOf(initialBeeCountHalfSteps)
+    }
+    var beeCountHistoryStartHalfSteps by rememberSaveable(hive.id, formStateKey) {
+        mutableIntStateOf(savedBeeCountHistoryStart)
+    }
+    // Hold the latest values in per-hive state objects so lifecycle/disposal callbacks
+    // can finalize safely even if an NFC scan switches the displayed hive.
+    val latestBeeCountForHistory = remember(hive.id, formStateKey) {
+        mutableIntStateOf(beeCountHalfSteps)
+    }
+    val latestBeeCountStartForHistory = remember(hive.id, formStateKey) {
+        mutableIntStateOf(beeCountHistoryStartHalfSteps)
+    }
+    val latestBeeCountRecorder = rememberUpdatedState(onRecordBeeCountChange)
+    androidx.compose.runtime.SideEffect {
+        latestBeeCountForHistory.intValue = beeCountHalfSteps
+        latestBeeCountStartForHistory.intValue = beeCountHistoryStartHalfSteps
+    }
+    val finalizeBeeCountHistory = remember(hive.id, formStateKey) {
+        {
+            val startingValue = latestBeeCountStartForHistory.intValue
+            val finalValue = latestBeeCountForHistory.intValue
+            if (startingValue != finalValue) {
+                // Move the baseline first so ON_STOP and onDispose cannot record it twice.
+                latestBeeCountStartForHistory.intValue = finalValue
+                beeCountHistoryStartHalfSteps = finalValue
+                formDraftPrefs.edit {
+                    putInt(beeCountHistoryStartKey, finalValue)
+                }
+                latestBeeCountRecorder.value(
+                    hive.id,
+                    startingValue / 2.0,
+                    finalValue / 2.0
+                )
+            }
+        }
+    }
     var queen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.queenStatus ?: (if (rememberLastInspectionValues) lastInspection?.queenStatus else null) ?: hive.queenStatus)
     }
@@ -356,22 +430,22 @@ internal fun InspectionScreen(
         mutableStateOf(if (startingNotes.isBlank()) "" else if (hasSavedNoteDraft) "Auto-saved note restored" else "Saved notes loaded")
     }
     var eggs by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.eggs ?: (if (rememberLastInspectionValues) lastInspection?.eggs else null) ?: 0)
+        mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.eggs ?: (if (rememberLastInspectionValues) lastInspection?.eggs else null) ?: 0.0))
     }
     var openBrood by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.openBrood ?: (if (rememberLastInspectionValues) lastInspection?.openBrood else null) ?: 0)
+        mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.openBrood ?: (if (rememberLastInspectionValues) lastInspection?.openBrood else null) ?: 0.0))
     }
     var cappedBrood by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.cappedBrood ?: (if (rememberLastInspectionValues) lastInspection?.cappedBrood else null) ?: 0)
+        mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.cappedBrood ?: (if (rememberLastInspectionValues) lastInspection?.cappedBrood else null) ?: 0.0))
     }
     var honey by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.honeyStores ?: (if (rememberLastInspectionValues) lastInspection?.honeyStores else null) ?: 0)
+        mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.honeyStores ?: (if (rememberLastInspectionValues) lastInspection?.honeyStores else null) ?: 0.0))
     }
     var pollen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.pollen ?: (if (rememberLastInspectionValues) lastInspection?.pollen else null) ?: 0)
+        mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.pollen ?: (if (rememberLastInspectionValues) lastInspection?.pollen else null) ?: 0.0))
     }
     var emptyComb by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
-        mutableIntStateOf(formDraft?.emptyDrawnComb ?: (if (rememberLastInspectionValues) lastInspection?.emptyDrawnComb else null) ?: 0)
+        mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.emptyDrawnComb ?: (if (rememberLastInspectionValues) lastInspection?.emptyDrawnComb else null) ?: 0.0))
     }
     var emergency by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
         mutableIntStateOf(formDraft?.emergencyCells ?: (if (rememberLastInspectionValues) lastInspection?.emergencyCells else null) ?: 0)
@@ -394,6 +468,7 @@ internal fun InspectionScreen(
     var voicePartialText by rememberSaveable(hive.id) { mutableStateOf("") }
     var saving by rememberSaveable(hive.id) { mutableStateOf(false) }
     var saveError by rememberSaveable(hive.id) { mutableStateOf("") }
+    var showBeeCountHistory by rememberSaveable(hive.id) { mutableStateOf(false) }
 
     val currentFormDraft = InspectionFormDraft(
         strength = strength,
@@ -412,7 +487,8 @@ internal fun InspectionScreen(
         diseaseFlags = diseasesCsv,
         updatedAt = formStateKey,
         latitude = lat,
-        longitude = lon
+        longitude = lon,
+        beeCountHalfSteps = beeCountHalfSteps
     )
     // Keep a separate latest-draft state per hive. A single rememberUpdatedState
     // here was shared while the screen stayed open during NFC cycling, allowing the
@@ -423,16 +499,24 @@ internal fun InspectionScreen(
     }
 
     androidx.compose.runtime.LaunchedEffect(
-        hive.id, strength, queen, mites, sample, eggs, openBrood, cappedBrood,
+        hive.id, strength, beeCountHalfSteps, queen, mites, sample, eggs, openBrood, cappedBrood,
         honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv, lat, lon
     ) {
         saveInspectionFormDraft(formDraftPrefs, hive.id, currentFormDraft)
     }
-    DisposableEffect(hive.id) {
+    androidx.compose.runtime.LaunchedEffect(hive.id, beeCountHistoryStartHalfSteps) {
+        formDraftPrefs.edit {
+            putInt(beeCountHistoryStartKey, beeCountHistoryStartHalfSteps)
+        }
+    }
+
+    DisposableEffect(hive.id, formStateKey) {
         val hiveIdForDraft = hive.id
         val formDraftForThisHive = latestFormDraft
+        val finalizeThisHiveBeeCount = finalizeBeeCountHistory
         onDispose {
             saveInspectionFormDraft(formDraftPrefs, hiveIdForDraft, formDraftForThisHive.value)
+            finalizeThisHiveBeeCount()
         }
     }
 
@@ -629,8 +713,11 @@ internal fun InspectionScreen(
 
     // Do not leave the microphone active if the beekeeper backgrounds BeeKeep or locks the phone.
     val voiceLifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(voiceLifecycleOwner, speechRecognizer) {
+    DisposableEffect(voiceLifecycleOwner, speechRecognizer, hive.id, formStateKey) {
         val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                finalizeBeeCountHistory()
+            }
             if (event == Lifecycle.Event.ON_PAUSE && keepVoiceListening) {
                 voiceListeningRequested = false
                 voicePartialText = ""
@@ -755,7 +842,8 @@ internal fun InspectionScreen(
                                             IdGenerator.nextLong(), hive.id, now, ColonyStrength.storedFromGrade(strength), queen, mites,
                                             sample.coerceAtLeast(1), notes.trim(), null, lat, lon,
                                             emergency, supercedure, swarm, eggs, openBrood, cappedBrood,
-                                            honey, pollen, emptyComb, diseasesCsv
+                                            honey, pollen, emptyComb, diseasesCsv,
+                                            beeCountFrames = beeCountHalfSteps / 2.0
                                         )
                                         scope.launch {
                                             try {
@@ -890,6 +978,37 @@ internal fun InspectionScreen(
                 ) { strength = it }
             }
             item {
+                ComparisonCounter(
+                    label = "Bee Count",
+                    value = beeCountHalfSteps,
+                    previous = previousForComparison?.beeCountFrames?.let { (it * 2.0).roundToInt().coerceIn(1, 20) },
+                    range = 1..20,
+                    haptic = haptic,
+                    valueLabel = "${formatBeeCountFrames(beeCountHalfSteps / 2.0)} Frames",
+                    previousValueLabel = previousForComparison?.beeCountFrames?.let { "${formatBeeCountFrames(it)} Frames" }
+                ) { updatedValue ->
+                    if (updatedValue != beeCountHalfSteps) {
+                        beeCountHalfSteps = updatedValue
+                        latestBeeCountForHistory.intValue = updatedValue
+                    }
+                }
+            }
+            item {
+                OutlinedButton(
+                    onClick = { showBeeCountHistory = true },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(Icons.Rounded.History, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("HISTORY", fontWeight = FontWeight.ExtraBold)
+                    if (beeCountHistory.isNotEmpty()) {
+                        Spacer(Modifier.width(6.dp))
+                        Text("(${beeCountHistory.size})", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+            }
+            item {
                 Card(
                     shape = RoundedCornerShape(24.dp),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
@@ -925,20 +1044,20 @@ internal fun InspectionScreen(
             item {
                 SectionHeader("BROOD & STORES")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Eggs", eggs, 0..30, haptic, Modifier.weight(1f)) { eggs = it }
-                    CompactCounter("Open", openBrood, 0..30, haptic, Modifier.weight(1f)) { openBrood = it }
+                    CompactHalfStepCounter("Eggs", eggs, 0.0..10.0, haptic, Modifier.weight(1f)) { eggs = it }
+                    CompactHalfStepCounter("Open", openBrood, 0.0..10.0, haptic, Modifier.weight(1f)) { openBrood = it }
                 }
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Capped", cappedBrood, 0..30, haptic, Modifier.weight(1f)) { cappedBrood = it }
-                    CompactCounter("Honey", honey, 0..30, haptic, Modifier.weight(1f)) { honey = it }
+                    CompactHalfStepCounter("Capped", cappedBrood, 0.0..10.0, haptic, Modifier.weight(1f)) { cappedBrood = it }
+                    CompactHalfStepCounter("Honey", honey, 0.0..10.0, haptic, Modifier.weight(1f)) { honey = it }
                 }
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Pollen", pollen, 0..30, haptic, Modifier.weight(1f)) { pollen = it }
-                    CompactCounter("Empty comb", emptyComb, 0..30, haptic, Modifier.weight(1f)) { emptyComb = it }
+                    CompactHalfStepCounter("Pollen", pollen, 0.0..10.0, haptic, Modifier.weight(1f)) { pollen = it }
+                    CompactHalfStepCounter("Empty comb", emptyComb, 0.0..10.0, haptic, Modifier.weight(1f)) { emptyComb = it }
                 }
             }
 
@@ -988,6 +1107,57 @@ internal fun InspectionScreen(
 
 
             }
+            if (showBeeCountHistory) {
+                AlertDialog(
+                    onDismissRequest = { showBeeCountHistory = false },
+                    title = { Text("Bee Count History", fontWeight = FontWeight.ExtraBold) },
+                    text = {
+                        if (beeCountHistory.isEmpty()) {
+                            Text("No bee-count changes have been recorded for this hive yet.")
+                        } else {
+                            Column(
+                                modifier = Modifier.fillMaxWidth()
+                                    .heightIn(max = 360.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    "Every change is recorded with its date and time.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                beeCountHistory
+                                    .sortedWith(compareByDescending<ActivityEvent> { it.createdAt }.thenByDescending { it.id })
+                                    .forEach { entry ->
+                                        Column(
+                                            modifier = Modifier.fillMaxWidth()
+                                                .background(
+                                                    MaterialTheme.colorScheme.surfaceVariant,
+                                                    RoundedCornerShape(12.dp)
+                                                )
+                                                .padding(10.dp),
+                                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                                        ) {
+                                            Text(
+                                                DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+                                                    .format(Date(entry.createdAt)),
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Text(entry.detail, style = MaterialTheme.typography.bodyMedium)
+                                        }
+                                    }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showBeeCountHistory = false }) {
+                            Text("CLOSE", fontWeight = FontWeight.ExtraBold)
+                        }
+                    }
+                )
+            }
         }
     }
 }
@@ -1035,6 +1205,7 @@ private fun ComparisonCounter(
     range: IntRange,
     haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
     valueLabel: String? = null,
+    previousValueLabel: String? = null,
     onChange: (Int) -> Unit
 ) {
     Card(
@@ -1050,7 +1221,7 @@ private fun ComparisonCounter(
                 Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 previous?.let {
                     Text(
-                        "Prev: ${ColonyStrength.labelForGrade(it)}",
+                        "Prev: ${previousValueLabel ?: ColonyStrength.labelForGrade(it)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1121,6 +1292,60 @@ private fun CompactCounter(
             Text(value.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
             IconButton(
                 onClick = { haptic.performHapticFeedback(HapticFeedbackType.SegmentTick); onChange((value + 1).coerceIn(range)) },
+                modifier = Modifier.size(32.dp)
+            ) { Text("+", style = MaterialTheme.typography.bodyMedium) }
+        }
+    }
+}
+
+@Composable
+private fun CompactHalfStepCounter(
+    label: String,
+    value: Double,
+    range: ClosedFloatingPointRange<Double>,
+    haptic: androidx.compose.ui.hapticfeedback.HapticFeedback,
+    modifier: Modifier = Modifier,
+    onChange: (Double) -> Unit
+) {
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 5.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(1.dp)
+        ) {
+            Text(
+                label,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
+            IconButton(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                    onChange(normalizeBroodStoresGauge(value - 0.5).coerceIn(range))
+                },
+                enabled = value > range.start,
+                modifier = Modifier.size(32.dp)
+            ) { Text("−", style = MaterialTheme.typography.bodyMedium) }
+            Text(
+                formatBroodStoresGauge(value),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.ExtraBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            IconButton(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                    onChange(normalizeBroodStoresGauge(value + 0.5).coerceIn(range))
+                },
+                enabled = value < range.endInclusive,
                 modifier = Modifier.size(32.dp)
             ) { Text("+", style = MaterialTheme.typography.bodyMedium) }
         }

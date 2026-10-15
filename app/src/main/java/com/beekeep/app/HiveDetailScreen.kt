@@ -42,6 +42,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -56,6 +57,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.foundation.layout.widthIn
 import com.beekeep.app.data.ActivityEvent
 import com.beekeep.app.data.Harvest
 import com.beekeep.app.data.Hive
@@ -64,6 +67,7 @@ import com.beekeep.app.data.Treatment
 import com.beekeep.app.nfc.BeeKeepNfcPayload
 import com.beekeep.app.nfc.NfcController
 import com.beekeep.app.nfc.NfcResult
+import com.beekeep.app.nfc.playNfcAssignmentSuccessFeedback
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -93,9 +97,17 @@ internal fun HiveDetailScreen(
     onTreat: () -> Unit,
     onHarvest: () -> Unit,
     onTag: (String, (Boolean, String?) -> Unit) -> Unit,
+    isTagAssignedElsewhere: (Long, String) -> Boolean = { _, _ -> false },
     onClearTag: (Long, (Boolean, String?) -> Unit) -> Unit,
     confirmBeforeTagRemoval: Boolean = true,
     tagAssignmentSuccessUid: String? = null,
+    nextHiveNumber: String? = null,
+    onNextHive: () -> Unit = {},
+    fastTagAssignmentMode: Boolean = false,
+    autoStartTagWriting: Boolean = false,
+    autoStartTagWritingIgnoreUid: String? = null,
+    onAutoTagWritingStarted: () -> Unit = {},
+    onFastTagAssignmentSuccess: (String) -> Unit = {},
     onVerifyTag: () -> Unit,
     onMarkDead: () -> Unit,
     onRestore: () -> Unit,
@@ -118,6 +130,65 @@ internal fun HiveDetailScreen(
             removingTag = false
             writeStatusType = if (success) "success" else "error"
             writeStatus = if (success) "NFC tag removed • available for reuse" else (error ?: "Could not remove the NFC tag.")
+        }
+    }
+
+    fun startTagWriting(ignoredUid: String? = null) {
+        if (hive.isDead || writeStatusType == "saving" || writeStatusType == "removing") return
+        writeStatusType = "waiting"
+        writeStatus = "Ready to scan. Hold your NFC tag against the back of your phone and keep it still."
+        nfc.startWrite(
+            activity = activity,
+            text = BeeKeepNfcPayload.TAG_PAYLOAD,
+            targetHiveId = hive.id,
+            ignoredUid = ignoredUid,
+            isAssignedElsewhere = { candidateUid -> isTagAssignedElsewhere(hive.id, candidateUid) },
+            onResult = { result ->
+                when (result) {
+                    is NfcResult.Written -> {
+                        writeStatusType = "saving"
+                        writeStatus = "Tag written. Saving its assignment to this hive…"
+                        onTag(result.uid) { success, error ->
+                            writeStatusType = if (success) "success" else "error"
+                            if (success) playNfcAssignmentSuccessFeedback(activity)
+                            writeStatus = if (success) {
+                                "NFC tag successfully assigned • ${result.uid}"
+                            } else {
+                                error ?: "The tag was written, but its hive assignment could not be saved."
+                            }
+                            if (success && fastTagAssignmentMode) onFastTagAssignmentSuccess(result.uid)
+                        }
+                    }
+                    is NfcResult.Error -> {
+                        writeStatusType = "error"
+                        writeStatus = result.message
+                    }
+                    is NfcResult.Read -> {
+                        writeStatusType = "error"
+                        writeStatus = "A tag was detected, but BeeKeep did not confirm a successful write. Please try again."
+                    }
+                }
+            }
+        )
+    }
+
+    LaunchedEffect(hive.id, autoStartTagWriting) {
+        if (!autoStartTagWriting) return@LaunchedEffect
+        if (!fastTagAssignmentMode) {
+            onAutoTagWritingStarted()
+            return@LaunchedEffect
+        }
+        if (hive.isDead) {
+            writeStatusType = "error"
+            writeStatus = "Fast tag assignment skipped this colony because it is marked dead."
+            onAutoTagWritingStarted()
+        } else if (!hive.tagUid.isNullOrBlank()) {
+            writeStatusType = "error"
+            writeStatus = "Fast tag assignment stopped because this hive already has an NFC tag. No tag was overwritten."
+            onAutoTagWritingStarted()
+        } else {
+            startTagWriting(autoStartTagWritingIgnoreUid)
+            onAutoTagWritingStarted()
         }
     }
 
@@ -384,7 +455,45 @@ internal fun HiveDetailScreen(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
         ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("NFC hive tag", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
+                val tagAssignmentSucceeded = writeStatusType == "success" || !tagAssignmentSuccessUid.isNullOrBlank()
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "NFC hive tag",
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    if (!fastTagAssignmentMode && tagAssignmentSucceeded && nextHiveNumber != null) {
+                        OutlinedButton(
+                            onClick = onNextHive,
+                            modifier = Modifier.height(32.dp).widthIn(max = 170.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 7.dp, vertical = 0.dp)
+                        ) {
+                            Text(
+                                "NEXT ${hiveDisplayName(nextHiveNumber)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Icon(
+                                Icons.Rounded.ChevronRight,
+                                contentDescription = "Open next hive in this apiary",
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    } else if (!fastTagAssignmentMode && tagAssignmentSucceeded && nextHiveNumber == null) {
+                        Text(
+                            "LAST HIVE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
                 if (hive.isDead) {
                     Text("Released", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                     Text("The physical tag was released when the colony died.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
@@ -405,38 +514,8 @@ internal fun HiveDetailScreen(
                                     nfc.stop(activity)
                                     writeStatus = ""
                                     writeStatusType = "idle"
-                                } else if (writeStatusType != "saving" && writeStatusType != "removing") {
-                                    writeStatusType = "waiting"
-                                    writeStatus = "Ready to scan. Hold your NFC tag against the back of your phone and keep it still."
-                                    nfc.startWrite(
-                                        activity = activity,
-                                        text = BeeKeepNfcPayload.TAG_PAYLOAD,
-                                        allowOverwriteOtherHive = hive.tagUid != null,
-                                        onResult = { result ->
-                                            when (result) {
-                                                is NfcResult.Written -> {
-                                                    writeStatusType = "saving"
-                                                    writeStatus = "Tag written. Saving its assignment to this hive…"
-                                                    onTag(result.uid) { success, error ->
-                                                        writeStatusType = if (success) "success" else "error"
-                                                        writeStatus = if (success) {
-                                                            "NFC tag successfully assigned • ${result.uid}"
-                                                        } else {
-                                                            error ?: "The tag was written, but its hive assignment could not be saved."
-                                                        }
-                                                    }
-                                                }
-                                                is NfcResult.Error -> {
-                                                    writeStatusType = "error"
-                                                    writeStatus = result.message
-                                                }
-                                                is NfcResult.Read -> {
-                                                    writeStatusType = "error"
-                                                    writeStatus = "A tag was detected, but BeeKeep did not confirm a successful write. Please try again."
-                                                }
-                                            }
-                                        }
-                                    )
+                                } else {
+                                    startTagWriting()
                                 }
                             },
                             enabled = writeStatusType != "saving" && writeStatusType != "removing",

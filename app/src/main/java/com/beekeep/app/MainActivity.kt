@@ -1,7 +1,10 @@
 package com.beekeep.app
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
+import android.nfc.NfcAdapter
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.content.pm.PackageManager
@@ -152,6 +155,9 @@ import com.beekeep.app.nfc.NfcController
 import com.beekeep.app.nfc.BeeKeepNfcPayload
 import com.beekeep.app.nfc.NfcResult
 import com.beekeep.app.nfc.NfcTagResolution
+import com.beekeep.app.nfc.NfcUid
+import com.beekeep.app.nfc.NfcUidIndex
+import com.beekeep.app.nfc.playNfcAssignmentSuccessFeedback
 import com.beekeep.app.ui.theme.BeeKeepTheme
 import com.beekeep.app.ui.theme.BeeKeepAccent
 import com.beekeep.app.ui.theme.NavBarDark
@@ -209,6 +215,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         setContent {
             var darkMode by rememberSaveable { mutableStateOf(prefs.getBoolean("dark_mode", false)) }
             var largeFieldText by rememberSaveable { mutableStateOf(prefs.getBoolean("large_field_text", false)) }
+            var compactHiveRows by rememberSaveable { mutableStateOf(prefs.getBoolean("compact_hive_rows", true)) }
             BeeKeepTheme(darkMode = darkMode) {
                 val baseDensity = androidx.compose.ui.platform.LocalDensity.current
                 androidx.compose.runtime.CompositionLocalProvider(
@@ -229,6 +236,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         onLargeFieldTextChange = { value ->
                             largeFieldText = value
                             prefs.edit { putBoolean("large_field_text", value) }
+                        },
+                        compactHiveRows = compactHiveRows,
+                        onCompactHiveRowsChange = { value ->
+                            compactHiveRows = value
+                            prefs.edit { putBoolean("compact_hive_rows", value) }
                         },
                         onDarkModeChange = { value ->
                             darkMode = value
@@ -352,6 +364,8 @@ fun BeeKeepApp(
     onSpeakHiveNumber: (String) -> Unit,
     largeFieldText: Boolean,
     onLargeFieldTextChange: (Boolean) -> Unit,
+    compactHiveRows: Boolean,
+    onCompactHiveRowsChange: (Boolean) -> Unit,
     onDarkModeChange: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
@@ -360,6 +374,9 @@ fun BeeKeepApp(
     }
     var autoVoiceEnabled by rememberSaveable {
         mutableStateOf(autoVoicePrefs.getBoolean("auto_voice_on_nfc", true))
+    }
+    var fastTagAssignmentMode by rememberSaveable {
+        mutableStateOf(autoVoicePrefs.getBoolean("fast_tag_assignment_mode", false))
     }
     var screen by rememberSaveable { mutableStateOf(Screen.HOME) }
     var selectedHiveOpen by rememberSaveable { mutableStateOf(false) }
@@ -370,6 +387,8 @@ fun BeeKeepApp(
     var addHive by rememberSaveable { mutableStateOf(false) }
     var logType by rememberSaveable { mutableStateOf<HiveLogType?>(null) }
     var addApiary by rememberSaveable { mutableStateOf(false) }
+    var addApiaryOptionsVisible by rememberSaveable { mutableStateOf(false) }
+    var addingApiariesWithHives by rememberSaveable { mutableStateOf(false) }
     var editingApiary by remember { mutableStateOf<Apiary?>(null) }
     var unassignedTagUid by rememberSaveable { mutableStateOf<String?>(null) }
     var lastHiveTagSuccessHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
@@ -379,9 +398,12 @@ fun BeeKeepApp(
     var pendingTagUid by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingInspectionHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var pendingAutoStartVoiceHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var pendingAutoTagWriteHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var pendingAutoTagWriteIgnoredUid by rememberSaveable { mutableStateOf<String?>(null) }
     var scanning by remember { mutableStateOf(false) }
     var firstRunPromptVisible by rememberSaveable { mutableStateOf(false) }
     var firstRunPromptChecked by rememberSaveable { mutableStateOf(false) }
+    var pendingResetWarning by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingLocationHive by remember { mutableStateOf<Hive?>(null) }
     var pendingApiaryMove by remember { mutableStateOf<Pair<Hive, Apiary>?>(null) }
     var locationCheckCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -399,11 +421,56 @@ fun BeeKeepApp(
     val harvests by vm.harvests.collectAsStateWithLifecycle()
     val ready by vm.ready.collectAsStateWithLifecycle()
 
+    fun advanceToNextUntaggedHiveForFastAssignment(currentHive: Hive, justAssignedUid: String) {
+        if (!fastTagAssignmentMode) return
+        val apiaryHives = hives.filter {
+            it.apiary.equals(currentHive.apiary, ignoreCase = true) && !it.isDead
+        }
+        val currentIndex = apiaryHives.indexOfFirst { it.id == currentHive.id }
+        val nextUntaggedHive = currentIndex
+            .takeIf { it >= 0 }
+            ?.let { apiaryHives.drop(it + 1).firstOrNull { hive -> hive.tagUid.isNullOrBlank() } }
+
+        if (nextUntaggedHive == null) {
+            pendingAutoTagWriteHiveId = null
+            pendingAutoTagWriteIgnoredUid = null
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    "Fast tag assignment complete for ${currentHive.apiary}: no untagged hives remain after ${hiveReferenceName(currentHive.number)}."
+                )
+            }
+            return
+        }
+
+        lastHiveTagSuccessHiveId = null
+        lastHiveTagSuccessUid = null
+        pendingAutoTagWriteHiveId = nextUntaggedHive.id
+        pendingAutoTagWriteIgnoredUid = justAssignedUid
+        selectedHiveOpen = true
+        vm.openHive(nextUntaggedHive.id)
+        scope.launch {
+            snackbarHostState.showSnackbar(
+                "Fast tag assignment: ready for ${hiveReferenceName(nextUntaggedHive.number)}. Present the next tag to write it."
+            )
+        }
+    }
+
     val lifecycleOwner = LocalLifecycleOwner.current
     var nfcEnabledForIndicator by remember(nfc) {
         mutableStateOf(nfc.isAvailable() && nfc.isEnabled())
     }
-    DisposableEffect(lifecycleOwner, nfc) {
+    DisposableEffect(lifecycleOwner, nfc, context) {
+        // NFC state broadcasts keep the Home indicator in sync while Settings is
+        // open; ON_RESUME also refreshes it if the app returns from system settings.
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(receiveContext: android.content.Context?, intent: Intent?) {
+                if (intent?.action == NfcAdapter.ACTION_ADAPTER_STATE_CHANGED) {
+                    nfcEnabledForIndicator = nfc.isAvailable() && nfc.isEnabled()
+                }
+            }
+        }
+        val filter = IntentFilter(NfcAdapter.ACTION_ADAPTER_STATE_CHANGED)
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 nfcEnabledForIndicator = nfc.isAvailable() && nfc.isEnabled()
@@ -411,7 +478,10 @@ fun BeeKeepApp(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         nfcEnabledForIndicator = nfc.isAvailable() && nfc.isEnabled()
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            runCatching { context.unregisterReceiver(receiver) }
+        }
     }
 
     // Offer first-run setup only after every record stream has hydrated. Existing
@@ -424,6 +494,15 @@ fun BeeKeepApp(
             firstRunPromptVisible = true
         } else if (!setupAlreadyCompleted) {
             autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
+        }
+    }
+
+    // Show any cloud-reset warning after the user dismisses the fresh-start prompt.
+    androidx.compose.runtime.LaunchedEffect(firstRunPromptVisible, pendingResetWarning, screen) {
+        val warning = pendingResetWarning ?: return@LaunchedEffect
+        if (!firstRunPromptVisible && screen == Screen.HOME) {
+            snackbarHostState.showSnackbar(warning)
+            pendingResetWarning = null
         }
     }
 
@@ -442,12 +521,11 @@ fun BeeKeepApp(
             nfc.updateKnownHiveTags(emptyMap(), ready)
             return@LaunchedEffect
         }
-        // Include inactive colonies too; their current tags must never be treated as blank.
-        val assignments = (hives + deadHives).mapNotNull { hive ->
-            hive.tagUid?.trim()?.takeIf { it.isNotBlank() }?.let { it to hive.id }
-        }.toMap()
-        val releasedTagUids = vm.getUnassignedNfcTagUids()
-        nfc.updateKnownHiveTags(assignments, ready, releasedTagUids)
+        // Blend the assignment ledger with legacy hive cache values. Any disagreement
+        // or duplicate UID stays ambiguous; do not choose a hive by query order.
+        val assignments = vm.getAllKnownNfcTagAssignments()
+        val index = NfcUidIndex.fromAssignments(assignments)
+        nfc.updateKnownHiveTags(index.uniqueHiveIdByUid, ready, index.ambiguousUids)
     }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
@@ -538,15 +616,28 @@ fun BeeKeepApp(
             return@LaunchedEffect
         }
 
-        val assignedHive = vm.findHiveByTag(result.uid)
+        val normalizedUid = NfcUid.normalize(result.uid)
+        if (normalizedUid == null) {
+            (activity as? MainActivity)?.pendingNfcResult?.value = null
+            scope.launch { snackbarHostState.showSnackbar("This tag has an invalid NFC UID. No hive was opened or assigned.") }
+            return@LaunchedEffect
+        }
+        if (vm.isNfcTagAmbiguous(normalizedUid)) {
+            (activity as? MainActivity)?.pendingNfcResult?.value = null
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    "NFC tag identity conflict: this UID is linked to multiple hive records. No hive was opened or assigned. Repair the duplicate in More > NFC tag management."
+                )
+            }
+            return@LaunchedEffect
+        }
+
+        val assignedHive = vm.findHiveByTag(normalizedUid)
         val resolvedHiveId = NfcTagResolution.resolveHiveId(assignedHive?.id)
         val resolvedHive = assignedHive?.takeIf { it.id == resolvedHiveId }
-        val openHiveForTagAssignment = selected?.takeIf { selectedHiveOpen && !it.isDead }
         if (resolvedHive != null) {
             checkHiveLocation(resolvedHive)
-            // Announce every accepted tag read, even when this hive is already open.
             if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
-            // Field NFC scans go directly to Inspect so the beekeeper can keep gloves on.
             val alreadyOpen = selectedHiveOpen && selected?.id == resolvedHive.id
             val alreadyInspectingThisHive = inspecting && selected?.id == resolvedHive.id
             if (!alreadyInspectingThisHive) pendingAutoStartVoiceHiveId = resolvedHive.id
@@ -561,38 +652,12 @@ fun BeeKeepApp(
                 pendingInspectionHiveId = resolvedHive.id
             }
             if (!alreadyOpen) scope.launch { snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready") }
-        } else if (openHiveForTagAssignment != null) {
-            // When a hive is already open, treat a newly scanned unassigned tag as
-            // belonging to that hive. Keep the beekeeper on this page instead of
-            // showing the generic "assign or create" dialog.
-            val targetHive = openHiveForTagAssignment
-            lastHiveTagSuccessHiveId = null
-            lastHiveTagSuccessUid = null
-            if (result.launchPreparationError != null) {
-                scope.launch {
-                    snackbarHostState.showSnackbar(
-                        "Tag was not assigned because BeeKeep could not prepare it for app launch. " +
-                            result.launchPreparationError + " Use WRITE TAG on this hive to retry."
-                    )
-                }
-            } else {
-                vm.assignTagToHive(targetHive.id, result.uid) { success, error ->
-                    if (success) {
-                        lastHiveTagSuccessHiveId = targetHive.id
-                        lastHiveTagSuccessUid = result.uid
-                    }
-                    scope.launch {
-                        snackbarHostState.showSnackbar(
-                            if (success) "NFC tag assigned to ${hiveReferenceName(targetHive.number)}"
-                            else error ?: "Could not assign the NFC tag to ${hiveReferenceName(targetHive.number)}."
-                        )
-                    }
-                }
-            }
         } else {
+            // Even when a hive is open, an unassigned physical tag must go through
+            // an explicit assignment choice. Never infer ownership from current screen.
             screen = Screen.SCAN
             unassignedTagOrigin = Screen.HOME
-            unassignedTagUid = result.uid
+            unassignedTagUid = normalizedUid
         }
         (activity as? MainActivity)?.pendingNfcResult?.value = null
     }
@@ -753,6 +818,7 @@ fun BeeKeepApp(
         InspectionScreen(
             activity, locationController, hiveForInspection,
             priorInspections = inspections,
+            beeCountHistory = events.filter { it.type == "bee_count_change" && it.hiveId == hiveForInspection.id && it.detail.startsWith("Frames of bees changed from ") },
             defaultMiteSampleSize = autoVoicePrefs.getInt("default_mite_sample_size", 300).coerceIn(1, 10000),
             defaultStartingStrength = autoVoicePrefs.getInt("default_starting_strength", 3).coerceIn(1, 5),
             rememberLastInspectionValues = autoVoicePrefs.getBoolean("remember_last_inspection_values", true),
@@ -764,6 +830,9 @@ fun BeeKeepApp(
             },
             onSaveHiveLocation = { hiveId, latitude, longitude, onResult ->
                 vm.updateHiveLocation(hiveId, latitude, longitude, onResult)
+            },
+            onRecordBeeCountChange = { hiveId, previousFrames, newFrames ->
+                vm.recordBeeCountChange(hiveId, previousFrames, newFrames)
             },
             onBack = { pendingAutoStartVoiceHiveId = null; inspecting = false },
             onHome = {
@@ -834,8 +903,37 @@ fun BeeKeepApp(
             }
             return
         }
+        val hivesInThisApiary = hives.filter {
+            it.apiary.equals(hiveForDetail.apiary, ignoreCase = true) && !it.isDead
+        }
+        // Use the same list order as the Apiary Hives screen, so NEXT follows the
+        // order the beekeeper sees in that apiary instead of jumping to another yard.
+        val currentApiaryHiveIndex = hivesInThisApiary.indexOfFirst { it.id == hiveForDetail.id }
+        val nextHiveInApiary = currentApiaryHiveIndex
+            .takeIf { it >= 0 }
+            ?.let { hivesInThisApiary.getOrNull(it + 1) }
         HiveDetailScreen(
             hive = hiveForDetail,
+            fastTagAssignmentMode = fastTagAssignmentMode,
+            autoStartTagWriting = pendingAutoTagWriteHiveId == hiveForDetail.id,
+            autoStartTagWritingIgnoreUid = if (pendingAutoTagWriteHiveId == hiveForDetail.id) pendingAutoTagWriteIgnoredUid else null,
+            onAutoTagWritingStarted = {
+                if (pendingAutoTagWriteHiveId == hiveForDetail.id) {
+                    pendingAutoTagWriteHiveId = null
+                    pendingAutoTagWriteIgnoredUid = null
+                }
+            },
+            onFastTagAssignmentSuccess = { assignedUid ->
+                advanceToNextUntaggedHiveForFastAssignment(hiveForDetail, assignedUid)
+            },
+            nextHiveNumber = nextHiveInApiary?.number,
+            onNextHive = {
+                nextHiveInApiary?.let { nextHive ->
+                    lastHiveTagSuccessHiveId = null
+                    lastHiveTagSuccessUid = null
+                    vm.openHive(nextHive.id)
+                }
+            },
             inspections = inspections,
             events = events,
             feedings = feedings,
@@ -858,6 +956,9 @@ fun BeeKeepApp(
             onTreat = { logType = HiveLogType.TREAT },
             onHarvest = { logType = HiveLogType.HARVEST },
             onTag = { uid, onResult -> vm.assignTag(uid, onResult) },
+            isTagAssignedElsewhere = { targetHiveId, uid ->
+                (hives + deadHives).any { it.id != targetHiveId && NfcUid.matches(it.tagUid, uid) }
+            },
             onClearTag = { hiveId, onResult -> vm.clearTagForHive(hiveId, onResult) },
             confirmBeforeTagRemoval = autoVoicePrefs.getBoolean("confirm_tag_removal", true),
             tagAssignmentSuccessUid = if (lastHiveTagSuccessHiveId == hiveForDetail.id) lastHiveTagSuccessUid else null,
@@ -865,13 +966,15 @@ fun BeeKeepApp(
                 nfc.startRead(activity) { result ->
                     when (result) {
                         is NfcResult.Read -> {
-                            val matchesUid = result.uid.equals(hiveForDetail.tagUid, ignoreCase = true)
+                            val matchesUid = NfcUid.matches(result.uid, hiveForDetail.tagUid)
                             val currentMarker = BeeKeepNfcPayload.isTagPayload(result.text) && result.info.hasBeeKeepLaunchRecord
                             scope.launch {
+                                val ambiguous = vm.isNfcTagAmbiguous(result.uid)
                                 snackbarHostState.showSnackbar(
                                     when {
+                                        ambiguous -> "IDENTITY CONFLICT • this NFC UID is linked to multiple hives. It cannot be verified until the duplicate is repaired."
                                         !matchesUid -> "Tag read • ${result.uid} • does not match this hive"
-                                        currentMarker -> "NFC tag verified • no hive data stored on tag"
+                                        currentMarker -> "NFC tag verified • UID matches this hive and the BeeKeep launch marker is present"
                                         BeeKeepNfcPayload.hiveId(result.text) != null -> "UID matches, but this tag still has old hive data. Scan it in BeeKeep to upgrade it."
                                         else -> "UID matches, but the BeeKeep app-launch marker is missing. Use WRITE TAG to repair it."
                                     }
@@ -917,7 +1020,16 @@ fun BeeKeepApp(
                                 scope.launch { snackbarHostState.showSnackbar(message) }
                             }
                             scope.launch {
-                                val assignedHive = vm.findHiveByTag(result.uid)
+                                val normalizedUid = NfcUid.normalize(result.uid)
+                                if (normalizedUid == null) {
+                                    snackbarHostState.showSnackbar("This tag has an invalid NFC UID. No hive was opened or assigned.")
+                                    return@launch
+                                }
+                                if (vm.isNfcTagAmbiguous(normalizedUid)) {
+                                    snackbarHostState.showSnackbar("NFC tag identity conflict: this UID is linked to multiple hives. No hive was opened. Repair it in NFC tag management.")
+                                    return@launch
+                                }
+                                val assignedHive = vm.findHiveByTag(normalizedUid)
                                 val resolvedHiveId = NfcTagResolution.resolveHiveId(assignedHive?.id)
                                 val resolvedHive = assignedHive?.takeIf { it.id == resolvedHiveId }
                                 if (resolvedHive != null) {
@@ -931,7 +1043,7 @@ fun BeeKeepApp(
                                     snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready")
                                 } else {
                                     unassignedTagOrigin = Screen.HOME
-                                    unassignedTagUid = result.uid
+                                    unassignedTagUid = normalizedUid
                                 }
                             }
                         }
@@ -945,18 +1057,33 @@ fun BeeKeepApp(
         return
     }
     if (screen == Screen.PREMADE_SETUP) {
+        val isAddingToExistingWorkspace = addingApiariesWithHives
         PreMadeHiveSetupScreen(
             vm = vm,
+            existingApiaryNames = if (isAddingToExistingWorkspace) apiaries.map { it.name } else emptyList(),
+            existingHiveCount = if (isAddingToExistingWorkspace) hives.size + deadHives.size else 0,
+            addToExistingWorkspace = isAddingToExistingWorkspace,
             onBack = {
-                screen = Screen.HOME
-                firstRunPromptVisible = !autoVoicePrefs.getBoolean("initial_setup_completed", false)
+                if (isAddingToExistingWorkspace) {
+                    addingApiariesWithHives = false
+                    screen = Screen.APIARIES
+                } else {
+                    screen = Screen.HOME
+                    firstRunPromptVisible = !autoVoicePrefs.getBoolean("initial_setup_completed", false)
+                }
             },
             onComplete = { createdApiaries, createdHives ->
                 autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
                 firstRunPromptVisible = false
-                screen = Screen.HOME
+                addingApiariesWithHives = false
+                screen = if (isAddingToExistingWorkspace) Screen.APIARIES else Screen.HOME
                 scope.launch {
-                    snackbarHostState.showSnackbar("Created $createdApiaries apiaries and $createdHives hives.")
+                    val message = if (isAddingToExistingWorkspace) {
+                        "Added $createdApiaries apiaries and $createdHives hives."
+                    } else {
+                        "Created $createdApiaries apiaries and $createdHives hives."
+                    }
+                    snackbarHostState.showSnackbar(message)
                 }
             }
         )
@@ -971,6 +1098,7 @@ fun BeeKeepApp(
         ApiaryHivesScreen(
             apiaryName = apiaryName,
             hives = hives.filter { it.apiary.equals(apiaryName, ignoreCase = true) },
+            compactHiveRows = compactHiveRows,
             padding = androidx.compose.foundation.layout.PaddingValues(),
             onBack = { selectedApiaryName = null; screen = Screen.APIARIES },
             onAddHive = { addHive = true },
@@ -1004,7 +1132,6 @@ fun BeeKeepApp(
                 apiaries = apiaries,
                 padding = padding,
                 nfcEnabled = nfcEnabledForIndicator,
-                onOpenHives = { screen = Screen.HIVES },
                 onOpenApiaries = {
                     selectedApiaryName = null
                     screen = Screen.APIARIES
@@ -1012,6 +1139,7 @@ fun BeeKeepApp(
             )
             Screen.HIVES -> AllHivesScreen(
                 hives = hives,
+                compactHiveRows = compactHiveRows,
                 padding = padding,
                 onBack = { screen = Screen.HOME },
                 onAddHive = { selectedApiaryName = null; addHive = true },
@@ -1019,7 +1147,7 @@ fun BeeKeepApp(
             )
             Screen.APIARIES -> ApiariesScreen(
                 apiaries, hives, padding,
-                onAddApiary = { addApiary = true },
+                onAddApiary = { addApiaryOptionsVisible = true },
                 onEditApiary = { editingApiary = it },
                 onOpenMap = { apiary ->
                     mapOrigin = Screen.APIARIES
@@ -1055,15 +1183,48 @@ fun BeeKeepApp(
                     autoVoiceEnabled = enabled
                     autoVoicePrefs.edit { putBoolean("auto_voice_on_nfc", enabled) }
                 },
+                fastTagAssignmentMode = fastTagAssignmentMode,
+                onFastTagAssignmentModeChange = { enabled ->
+                    fastTagAssignmentMode = enabled
+                    autoVoicePrefs.edit { putBoolean("fast_tag_assignment_mode", enabled) }
+                    if (!enabled) {
+                        pendingAutoTagWriteHiveId = null
+                        pendingAutoTagWriteIgnoredUid = null
+                    }
+                },
                 largeFieldText = largeFieldText,
                 onLargeFieldTextChange = onLargeFieldTextChange,
+                compactHiveRows = compactHiveRows,
+                onCompactHiveRowsChange = onCompactHiveRowsChange,
                 cloud = cloud,
                 onBack = { screen = Screen.HOME },
-                onOpenMore = { screen = Screen.MORE }
+                onOpenMore = { screen = Screen.MORE },
+                onResetApiaries = { warning ->
+                    vm.clearHive()
+                    nfc.stop(activity)
+                    scanning = false
+                    inspecting = false
+                    selectedHiveOpen = false
+                    selectedApiaryName = null
+                    addApiary = false
+                    addHive = false
+                    editingApiary = null
+                    pendingApiaryMove = null
+                    pendingLocationHive = null
+                    pendingTagUid = null
+                    unassignedTagUid = null
+                    pendingInspectionHiveId = null
+                    pendingAutoStartVoiceHiveId = null
+                    pendingResetWarning = warning
+                    firstRunPromptChecked = true
+                    firstRunPromptVisible = true
+                    screen = Screen.HOME
+                }
             )
             Screen.TAG_MANAGER -> TagManagementScreen(
                 padding = padding,
                 hives = hives,
+                deadHives = deadHives,
                 nfc = nfc,
                 activity = activity,
                 pendingUid = pendingTagUid,
@@ -1085,7 +1246,9 @@ fun BeeKeepApp(
                     unassignedTagOrigin = Screen.TAG_MANAGER
                     unassignedTagUid = uid
                 },
-                onIsTagUnassigned = { uid -> vm.isNfcTagUnassigned(uid) }
+                onIsTagUnassigned = { uid -> vm.isNfcTagUnassigned(uid) },
+                onIsTagAmbiguous = { uid -> vm.isNfcTagAmbiguous(uid) },
+                onFindHiveForTag = { uid -> vm.findHiveByTag(uid) }
             )
             Screen.COLONY_HISTORY -> ColonyHistoryScreen(
                 deadHives = deadHives,
@@ -1095,6 +1258,49 @@ fun BeeKeepApp(
             )
             Screen.SCAN, Screen.APIARY_HIVES, Screen.PREMADE_SETUP -> Unit
         }
+    }
+
+    if (addApiaryOptionsVisible && screen == Screen.APIARIES) {
+        val apiaryLimitReached = apiaries.size >= 50
+        AlertDialog(
+            onDismissRequest = { addApiaryOptionsVisible = false },
+            title = { Text("Add an Apiary", fontWeight = FontWeight.ExtraBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("How would you like to add your next apiary?")
+                    Button(
+                        onClick = {
+                            addApiaryOptionsVisible = false
+                            addingApiariesWithHives = true
+                            screen = Screen.PREMADE_SETUP
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !apiaryLimitReached,
+                        shape = RoundedCornerShape(14.dp)
+                    ) { Text("Add Apiary with Pre-made Hives") }
+                    OutlinedButton(
+                        onClick = {
+                            addApiaryOptionsVisible = false
+                            addApiary = true
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !apiaryLimitReached,
+                        shape = RoundedCornerShape(14.dp)
+                    ) { Text("Create Empty Apiary") }
+                    if (apiaryLimitReached) {
+                        Text(
+                            "BeeKeep supports up to 50 apiaries. Remove an apiary before adding another.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { addApiaryOptionsVisible = false }) { Text("Cancel") }
+            }
+        )
     }
 
     if (firstRunPromptVisible && screen == Screen.HOME) {
@@ -1151,6 +1357,7 @@ private fun androidx.compose.foundation.layout.RowScope.NavItem(label: String, i
 @Composable
 private fun AllHivesScreen(
     hives: List<Hive>,
+    compactHiveRows: Boolean,
     padding: PaddingValues,
     onBack: () -> Unit,
     onAddHive: () -> Unit,
@@ -1222,7 +1429,7 @@ private fun AllHivesScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(filtered, key = { it.id }) { hive ->
-                        HiveRow(hive) { onOpenHive(hive.id) }
+                        HiveRow(hive, compact = compactHiveRows) { onOpenHive(hive.id) }
                     }
                 }
             }
@@ -1234,6 +1441,7 @@ private fun AllHivesScreen(
 private fun ApiaryHivesScreen(
     apiaryName: String,
     hives: List<Hive>,
+    compactHiveRows: Boolean,
     padding: androidx.compose.foundation.layout.PaddingValues,
     onBack: () -> Unit,
     onAddHive: () -> Unit,
@@ -1285,7 +1493,7 @@ private fun ApiaryHivesScreen(
         } else {
             LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(filtered, key = { it.id }) { hive ->
-                    HiveRow(hive) { onOpenHive(hive.id) }
+                    HiveRow(hive, compact = compactHiveRows) { onOpenHive(hive.id) }
                 }
             }
         }
@@ -1361,6 +1569,7 @@ private fun ScanScreen(
 private fun TagManagementScreen(
     padding: PaddingValues,
     hives: List<Hive>,
+    deadHives: List<Hive>,
     nfc: NfcController,
     activity: ComponentActivity,
     pendingUid: String?,
@@ -1372,7 +1581,9 @@ private fun TagManagementScreen(
     onAssignTag: (Long, String, Boolean, (Boolean, String?) -> Unit) -> Unit,
     onClearTag: (Long, (Boolean, String?) -> Unit) -> Unit,
     onUnassignedTag: (String) -> Unit,
-    onIsTagUnassigned: suspend (String) -> Boolean
+    onIsTagUnassigned: suspend (String) -> Boolean,
+    onIsTagAmbiguous: suspend (String) -> Boolean,
+    onFindHiveForTag: suspend (String) -> Hive?
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -1382,7 +1593,6 @@ private fun TagManagementScreen(
     var pendingRemoveHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var launchWriteHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var launchWriteUid by rememberSaveable { mutableStateOf<String?>(null) }
-    var launchWriteOverwrite by rememberSaveable { mutableStateOf(false) }
     var launchWriteStatusHandler by remember { mutableStateOf<((String) -> Unit)?>(null) }
     BackHandler { onBack() }
     val assigned = hives.count { !it.tagUid.isNullOrBlank() }
@@ -1390,14 +1600,12 @@ private fun TagManagementScreen(
     fun writeLaunchDataAfterAssignment(
         hiveId: Long,
         uid: String,
-        allowOverwriteOtherHive: Boolean = false,
         updateStatus: (String) -> Unit
     ) {
         // This fallback is retained for confirmed reassignment and legacy pending-tag flows.
         updateStatus("Tag $uid assigned. Tap the tag again to finish writing BeeKeep launch data.")
         launchWriteHiveId = hiveId
         launchWriteUid = uid
-        launchWriteOverwrite = allowOverwriteOtherHive
         launchWriteStatusHandler = updateStatus
     }
 
@@ -1410,15 +1618,17 @@ private fun TagManagementScreen(
         nfc.startAssignAndWrite(
             activity = activity,
             text = BeeKeepNfcPayload.TAG_PAYLOAD,
+            targetHiveId = hiveId,
             expectedUid = expectedUid,
             isAssignedElsewhere = { uid ->
-                hives.any { it.id != hiveId && it.tagUid.equals(uid, ignoreCase = true) }
+                (hives + deadHives).any { it.id != hiveId && NfcUid.matches(it.tagUid, uid) }
             },
             onResult = { result ->
                 when (result) {
                     is NfcResult.Written -> {
                         onAssignTag(hiveId, result.uid, false) { success, error ->
                             if (success) {
+                                playNfcAssignmentSuccessFeedback(context)
                                 if (consumePending) onPendingUidConsumed()
                                 val hiveNumber = hives.firstOrNull { it.id == hiveId }?.number ?: hiveId.toString()
                                 updateStatus("Tag assigned and launch data written. With BeeKeep closed, tapping this tag should open Hive ${hiveNumber}.")
@@ -1427,19 +1637,35 @@ private fun TagManagementScreen(
                             }
                         }
                     }
-                    is NfcResult.Read -> {
-                        val owner = hives.firstOrNull { it.tagUid.equals(result.uid, ignoreCase = true) }
-                        val payloadHiveId = BeeKeepNfcPayload.hiveId(result.text)
+                    is NfcResult.Read -> scope.launch {
+                        val normalizedUid = NfcUid.normalize(result.uid)
+                        if (normalizedUid == null) {
+                            updateStatus("This tag has an invalid NFC UID. Nothing was assigned.")
+                            return@launch
+                        }
+                        val ambiguous = onIsTagAmbiguous(normalizedUid)
+                        val owner = (hives + deadHives).firstOrNull { NfcUid.matches(it.tagUid, normalizedUid) }
                         when {
+                            ambiguous -> {
+                                // Never pick one owner from a conflict. The user explicitly
+                                // chooses this hive, then confirms a full ledger repair.
+                                reassignPrompt = hiveId to normalizedUid
+                                updateStatus("Identity conflict: tag $normalizedUid is linked to multiple hive records. Confirm REASSIGN to make this hive the sole owner.")
+                            }
                             owner != null && owner.id != hiveId -> {
-                                reassignPrompt = hiveId to result.uid
-                                updateStatus("Tag ${result.uid} is assigned to ${hiveReferenceName(owner.number)}. Confirm REASSIGN before changing it.")
+                                reassignPrompt = hiveId to normalizedUid
+                                updateStatus("Tag $normalizedUid is assigned to ${hiveReferenceName(owner.number)}. Confirm REASSIGN before changing it.")
                             }
                             else -> updateStatus("Could not write this tag automatically. Use WRITE TAG from the hive details to retry.")
                         }
                     }
                     is NfcResult.Error -> updateStatus(result.message)
                 }
+            },
+            isAmbiguousAssignment = { uid ->
+                val normalized = NfcUid.normalize(uid)
+                normalized != null && NfcUidIndex.fromAssignments((hives + deadHives).map { it.tagUid to it.id })
+                    .ambiguousUids.contains(normalized)
             }
         )
     }
@@ -1467,7 +1693,6 @@ private fun TagManagementScreen(
                 Button(onClick = {
                     val hiveId = launchWriteHiveId
                     val uid = launchWriteUid
-                    val allowOverwrite = launchWriteOverwrite
                     val updateStatus = launchWriteStatusHandler
                     launchWriteHiveId = null
                     launchWriteUid = null
@@ -1476,11 +1701,22 @@ private fun TagManagementScreen(
                         nfc.startWrite(
                             activity = activity,
                             text = BeeKeepNfcPayload.TAG_PAYLOAD,
-                            allowOverwriteOtherHive = allowOverwrite,
+                            targetHiveId = hiveId,
                             expectedUid = uid,
+                            // The UID is locked to the tag that was just explicitly assigned;
+                            // re-check current cache state in case sync changed ownership meanwhile.
+                            isAssignedElsewhere = { candidateUid ->
+                                (hives + deadHives).any { it.id != hiveId && NfcUid.matches(it.tagUid, candidateUid) }
+                            },
+                            // The DB assignment was just explicitly confirmed. This only writes
+                            // generic launch metadata, never a hive ID; expectedUid locks the tag.
+                            allowConfirmedAssignment = true,
                             onResult = { result ->
                                 when (result) {
-                                    is NfcResult.Written -> updateStatus?.invoke("Tag assigned and written. Tapping it with BeeKeep closed can now open Hive $targetNumber.")
+                                    is NfcResult.Written -> {
+                                        playNfcAssignmentSuccessFeedback(context)
+                                        updateStatus?.invoke("Tag assigned and written. Tapping it with BeeKeep closed can now open Hive $targetNumber.")
+                                    }
                                     is NfcResult.Error -> updateStatus?.invoke("Tag $uid is assigned, but launch data was not written: ${result.message} Open this hive and use WRITE TAG to retry.")
                                     is NfcResult.Read -> Unit
                                 }
@@ -1526,14 +1762,14 @@ private fun TagManagementScreen(
     reassignPrompt?.let { (targetHiveId, tagUid) ->
         AlertDialog(
             onDismissRequest = { reassignPrompt = null },
-            title = { Text("Tag already assigned", fontWeight = FontWeight.ExtraBold) },
-            text = { Text("This NFC tag is assigned to another hive. Reassigning will remove it from that hive and attach it to the selected one.") },
+            title = { Text("Confirm tag reassignment", fontWeight = FontWeight.ExtraBold) },
+            text = { Text("This tag is already assigned or has conflicting ownership records. Reassigning will close all existing assignments and make the selected hive the sole owner.") },
             confirmButton = {
                 TextButton(onClick = {
                     onAssignTag(targetHiveId, tagUid, true) { success, error ->
                         if (success) {
                             if (pendingUid != null) onPendingUidConsumed()
-                            writeLaunchDataAfterAssignment(targetHiveId, tagUid, allowOverwriteOtherHive = true) { status = it }
+                            writeLaunchDataAfterAssignment(targetHiveId, tagUid) { status = it }
                         } else {
                             status = error ?: "Could not reassign tag."
                         }
@@ -1579,18 +1815,33 @@ private fun TagManagementScreen(
                 nfc.startReadAndPrepareForBeeKeep(activity) { result ->
                     when (result) {
                         is NfcResult.Read -> scope.launch {
-                            result.launchPreparationError?.let { status = it }
-                            val hiveByUid = hives.firstOrNull { it.tagUid.equals(result.uid, ignoreCase = true) }
-                            val tagWasReleased = onIsTagUnassigned(result.uid)
-                            val resolvedHiveId = NfcTagResolution.resolveHiveId(hiveByUid?.id)
-                            val resolvedHive = hiveByUid?.takeIf { it.id == resolvedHiveId }
-                            status = if (resolvedHive != null) {
-                                "${hiveReferenceName(resolvedHive.number)} • tag verified by UID"
-                            } else {
-                                "Unassigned tag • ${result.uid}"
+                            val normalizedUid = NfcUid.normalize(result.uid)
+                            if (normalizedUid == null) {
+                                status = "This tag has an invalid NFC UID. No hive was opened or assigned."
+                                return@launch
                             }
-                            if (resolvedHive != null) onScanOpenHive(resolvedHive.id)
-                            else onUnassignedTag(result.uid)
+                            if (onIsTagAmbiguous(normalizedUid)) {
+                                status = "Identity conflict: this NFC UID is linked to multiple hives. Nothing was opened or assigned. Repair the duplicate assignment first."
+                                return@launch
+                            }
+
+                            val resolvedHive = onFindHiveForTag(normalizedUid)
+                            val preparationError = result.launchPreparationError
+                            when {
+                                resolvedHive != null -> {
+                                    status = preparationError?.let { "${hiveReferenceName(resolvedHive.number)} identified, but launch setup needs attention: $it" }
+                                        ?: "${hiveReferenceName(resolvedHive.number)} • tag verified by physical UID"
+                                    onScanOpenHive(resolvedHive.id)
+                                }
+                                else -> {
+                                    status = preparationError ?: if (onIsTagUnassigned(normalizedUid)) {
+                                        "Released tag • $normalizedUid. Choose the new hive before assigning it."
+                                    } else {
+                                        "Unassigned tag • $normalizedUid. Choose the hive it belongs to."
+                                    }
+                                    onUnassignedTag(normalizedUid)
+                                }
+                            }
                         }
                         is NfcResult.Error -> status = result.message
                         is NfcResult.Written -> Unit
@@ -1644,12 +1895,14 @@ private fun TagManagementScreen(
                             OutlinedButton(onClick = {
                                 nfc.startRead(activity) { result ->
                                     when (result) {
-                                        is NfcResult.Read -> {
-                                            val matchesUid = result.uid.equals(hive.tagUid, true)
+                                        is NfcResult.Read -> scope.launch {
+                                            val ambiguous = onIsTagAmbiguous(result.uid)
+                                            val matchesUid = NfcUid.matches(result.uid, hive.tagUid)
                                             val currentMarker = BeeKeepNfcPayload.isTagPayload(result.text) && result.info.hasBeeKeepLaunchRecord
                                             verifyText = when {
+                                                ambiguous -> "IDENTITY CONFLICT • this UID is linked to multiple hives. Do not use it until duplicate assignments are repaired."
                                                 !matchesUid -> "⚠ Tag ${result.uid} does not match ${hiveReferenceName(hive.number)}"
-                                                currentMarker -> "✓ Tag matches ${hiveReferenceName(hive.number)}; no hive data is stored on the tag"
+                                                currentMarker -> "✓ Tag UID matches ${hiveReferenceName(hive.number)} and BeeKeep launch data is present"
                                                 BeeKeepNfcPayload.hiveId(result.text) != null -> "UID matches, but this tag still has old hive data. Scan it in BeeKeep to upgrade it."
                                                 else -> "UID matches, but the BeeKeep app-launch marker is missing. Use WRITE TAG from hive details."
                                             }

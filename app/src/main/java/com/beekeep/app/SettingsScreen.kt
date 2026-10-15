@@ -45,6 +45,7 @@ import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
@@ -103,11 +104,16 @@ internal fun SettingsScreen(
     onDarkModeChange: (Boolean) -> Unit,
     autoVoiceEnabled: Boolean,
     onAutoVoiceEnabledChange: (Boolean) -> Unit,
+    fastTagAssignmentMode: Boolean,
+    onFastTagAssignmentModeChange: (Boolean) -> Unit,
     largeFieldText: Boolean,
     onLargeFieldTextChange: (Boolean) -> Unit,
+    compactHiveRows: Boolean,
+    onCompactHiveRowsChange: (Boolean) -> Unit,
     cloud: SupabaseGateway,
     onBack: () -> Unit,
-    onOpenMore: () -> Unit
+    onOpenMore: () -> Unit,
+    onResetApiaries: (String?) -> Unit
 ) {
     val context = LocalContext.current
     BackHandler { onBack() }
@@ -138,6 +144,8 @@ internal fun SettingsScreen(
     var busy by remember { mutableStateOf(false) }
     var pendingBackupJson by remember { mutableStateOf<String?>(null) }
     var pendingBackupPreview by remember { mutableStateOf<DataBackupPreview?>(null) }
+    var confirmResetApiaries by remember { mutableStateOf(false) }
+    var resettingApiaries by remember { mutableStateOf(false) }
     var permissionRevision by remember { mutableIntStateOf(0) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -248,7 +256,7 @@ internal fun SettingsScreen(
                 Text("Settings", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
 }
 
-            SettingsSection("Appearance & field mode", Icons.Rounded.Settings) {
+            SettingsSection("Layout & Appearance", Icons.Rounded.Settings) {
                 SettingsSwitchRow(
                     title = "Yellow + black field mode",
                     checked = darkMode,
@@ -259,6 +267,11 @@ internal fun SettingsScreen(
                     checked = largeFieldText,
                     onCheckedChange = onLargeFieldTextChange
                 )
+                SettingsSwitchRow(
+                    title = "Compact hive list cards",
+                    checked = compactHiveRows,
+                    onCheckedChange = onCompactHiveRowsChange
+                )
             }
 
             SettingsSection("Voice & NFC behaviour", Icons.Rounded.RecordVoiceOver) {
@@ -267,6 +280,18 @@ internal fun SettingsScreen(
                     checked = autoVoiceEnabled,
                     onCheckedChange = onAutoVoiceEnabledChange
                 )
+                SettingsSwitchRow(
+                    title = "Fast tag assignment mode",
+                    checked = fastTagAssignmentMode,
+                    onCheckedChange = onFastTagAssignmentModeChange
+                )
+                if (fastTagAssignmentMode) {
+                    Text(
+                        "Moves through untagged hives in this apiary. The previous tag is ignored; confirm the hive number before each new tag.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 SettingsSwitchRow(
                     title = "Beep when voice is ready",
                     checked = readyBeep,
@@ -518,6 +543,32 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                 }
             }
 
+            Card(
+                onClick = { if (!resettingApiaries) confirmResetApiaries = true },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.32f)
+                )
+            ) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(
+                            "Reset Apiaries",
+                            fontWeight = FontWeight.ExtraBold,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        Text(
+                            "Delete all hives, records, photos and NFC assignments",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error.copy(alpha = 0.86f)
+                        )
+                    }
+                    Icon(Icons.Rounded.Restore, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(26.dp))
+                }
+            }
+
             Card(onClick = onOpenMore, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
                 Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -529,6 +580,73 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
             }
             Spacer(Modifier.height(8.dp))
         }
+    }
+
+    if (confirmResetApiaries) {
+        AlertDialog(
+            onDismissRequest = { if (!resettingApiaries) confirmResetApiaries = false },
+            title = { Text("Reset all apiaries?", fontWeight = FontWeight.ExtraBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("This permanently deletes every apiary and hive, along with inspections, notes, feedings, treatments, harvests, activity history, photos, tasks and all NFC tag assignments.")
+                    Text(
+                        "This cannot be undone. BeeKeep Cloud data for the signed-in account will also be cleared when cloud access is available.",
+                        color = MaterialTheme.colorScheme.error,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "App assignments for all tags will be cleared. Data physically written onto NFC tags cannot be erased remotely; each physical tag would need to be scanned to rewrite it.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !resettingApiaries,
+                    onClick = { confirmResetApiaries = false }
+                ) { Text("CANCEL") }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !resettingApiaries,
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    onClick = {
+                        if (resettingApiaries) return@Button
+                        scope.launch {
+                            resettingApiaries = true
+                            try {
+                                // Pause realtime updates while the workspace and cloud tombstones are reset.
+                                cloud.stopRealtime()
+                                val cloudResult = cloud.resetWorkspace()
+                                repository.resetAllData()
+                                preferences.edit {
+                                    putBoolean("initial_setup_completed", false)
+                                    putLong("last_successful_sync_at", 0L)
+                                }
+                                savedLastSync = 0L
+                                confirmResetApiaries = false
+                                val cloudWarning = when (cloudResult) {
+                                    CloudResult.Success, CloudResult.NotConfigured -> null
+                                    CloudResult.NotSignedIn -> "Local data was reset, but BeeKeep Cloud could not be cleared because you're signed out. Sign in to the same account before syncing."
+                                    is CloudResult.Failure -> "Local data was reset, but the cloud reset failed: ${cloudResult.message}. Reconnect and retry cloud sync."
+                                }
+                                if (account.signedIn) cloud.startRealtime()
+                                onResetApiaries(cloudWarning)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                settingsMessage = "Reset failed: ${error.message ?: "unknown error"}. Your data may not have been fully reset."
+                                cloud.stopRealtime()
+                                if (account.signedIn) cloud.startRealtime()
+                            } finally {
+                                resettingApiaries = false
+                            }
+                        }
+                    }
+                ) { Text(if (resettingApiaries) "RESETTING…" else "RESET EVERYTHING") }
+            }
+        )
     }
 
     val restorePreview = pendingBackupPreview

@@ -37,6 +37,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -112,6 +113,12 @@ internal fun ApiaryMapScreen(
         }
     }
 
+    // When the map is opened from the general Map button, start near the beekeeper.
+    // Keep an explicitly selected apiary as the starting focus when opening its map pin.
+    LaunchedEffect(initialFocusApiaryId) {
+        if (initialFocusApiaryId == null) showMyLocation()
+    }
+
     val locatedApiaries = apiaries.filter { it.latitude != null && it.longitude != null }
     val focusedId = focusedApiaryId?.takeIf { id -> locatedApiaries.any { it.id == id } }
 
@@ -180,7 +187,7 @@ internal fun ApiaryMapScreen(
             Surface(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 150.dp, start = 16.dp, end = 16.dp),
+                    .padding(top = if (locatedApiaries.isEmpty()) 150.dp else 220.dp, start = 16.dp, end = 16.dp),
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
                 tonalElevation = 4.dp
@@ -272,10 +279,10 @@ internal fun ApiaryMapScreen(
         }
         Surface(
             modifier = Modifier
-                .align(Alignment.BottomStart)
+                .align(Alignment.TopStart)
                 .padding(
                     start = 14.dp,
-                    bottom = if (locatedApiaries.isEmpty()) 112.dp else 14.dp
+                    top = if (locatedApiaries.isEmpty()) 84.dp else 150.dp
                 ),
             shape = CircleShape,
             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
@@ -419,8 +426,9 @@ private fun createApiaryMapHtml(
     val initialZoom = when {
         focus != null -> 17
         located.size == 1 -> 16
-        located.size > 1 -> 5
-        else -> 2
+        // Avoid a world-scale flash while the automatic current-location lookup is running.
+        located.size > 1 -> 12
+        else -> 12
     }
     val focusIdJson = focusedApiaryId?.takeIf { id -> located.any { it.id == id } }
         ?.let { JSONObject.quote(it.toString()) } ?: "null"

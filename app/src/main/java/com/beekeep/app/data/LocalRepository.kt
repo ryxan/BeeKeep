@@ -1,5 +1,7 @@
 package com.beekeep.app.data
 
+import com.beekeep.app.nfc.NfcUid
+
 import com.beekeep.app.ColonyStrength
 
 import android.content.Context
@@ -11,6 +13,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.json.JSONArray
+import kotlin.math.roundToInt
 
 class LocalHiveRepository(context: Context) {
     private val appContext = context.applicationContext
@@ -20,6 +23,87 @@ class LocalHiveRepository(context: Context) {
         // Keep real records imported from older BeeKeep versions. Never inject
         // demo hives into an empty production database; an empty apiary is valid.
         LegacyImporter.importIfNeeded(appContext, db)
+    }
+
+    /**
+     * Wipe the local workspace while preserving cloud deletion tombstones. The tombstones
+     * prevent data from returning on a later sync, and this runs as one Room transaction.
+     */
+    suspend fun resetAllData() = withContext(Dispatchers.IO) {
+        var photosToDelete: List<PhotoEntity> = emptyList()
+        db.withTransaction {
+            val apiaries = db.apiaries().allForBackup()
+            val hives = db.hives().allForBackup()
+            val inspections = db.inspections().allForBackup()
+            val feedings = db.feedings().allForBackup()
+            val treatments = db.treatments().allForBackup()
+            val harvests = db.harvests().allForBackup()
+            val events = db.events().allForBackup()
+            val assignments = db.nfcTagAssignments().allForBackup()
+            val photos = db.photos().allForReset()
+            val pendingOutbox = db.outbox().allPendingForReset()
+            photosToDelete = photos
+
+            val resetAt = System.currentTimeMillis()
+            val recordsToDelete = linkedSetOf<Pair<String, Long>>()
+            apiaries.forEach { recordsToDelete.add("apiary" to it.id) }
+            hives.forEach { recordsToDelete.add("hive" to it.id) }
+            inspections.forEach { recordsToDelete.add("inspection" to it.id) }
+            feedings.forEach { recordsToDelete.add("feeding" to it.id) }
+            treatments.forEach { recordsToDelete.add("treatment" to it.id) }
+            harvests.forEach { recordsToDelete.add("harvest" to it.id) }
+            events.forEach { recordsToDelete.add("event" to it.id) }
+            assignments.forEach { recordsToDelete.add("nfc_assignment" to it.id) }
+            photos.forEach { recordsToDelete.add("photo" to it.id) }
+            // Convert queued writes to deletes too, including changes for records already
+            // removed locally, so a pending upload can never recreate a wiped record.
+            pendingOutbox.forEach { recordsToDelete.add(it.entityType to it.entityId) }
+
+            val photoCloudPaths = photos.mapNotNull { photo ->
+                photo.cloudPath?.takeIf(String::isNotBlank)?.let { photo.id to it }
+            }.toMap().toMutableMap()
+            pendingOutbox.filter { it.entityType == "photo" }.forEach { item ->
+                val path = runCatching { JSONObject(item.payload).optString("cloud_path") }
+                    .getOrNull()?.takeIf(String::isNotBlank)
+                if (path != null) photoCloudPaths[item.entityId] = path
+            }
+
+            // Delete children before parent records to respect all Room foreign keys.
+            db.photos().clearAll()
+            db.events().clearAll()
+            db.harvests().clearAll()
+            db.treatments().clearAll()
+            db.feedings().clearAll()
+            db.inspections().clearAll()
+            db.nfcTagAssignments().clearAll()
+            db.tasks().clearAll()
+            db.hives().clearAll()
+            db.apiaries().clearAll()
+            db.outbox().clearAll()
+
+            recordsToDelete.forEach { (type, id) ->
+                val payload = JSONObject()
+                    .put("id", id)
+                    .put("updated_at", resetAt)
+                    .put("deleted", true)
+                if (type == "photo") {
+                    photoCloudPaths[id]?.let { payload.put("cloud_path", it) }
+                }
+                db.outbox().enqueue(
+                    SyncOutboxEntity(
+                        id = IdGenerator.nextLong(),
+                        entityType = type,
+                        entityId = id,
+                        operation = "delete",
+                        payload = payload.toString(),
+                        createdAt = resetAt
+                    )
+                )
+            }
+        }
+
+        // Photo files live outside the Room database.
+        photosToDelete.forEach { photo -> runCatching { java.io.File(photo.localPath).delete() } }
     }
 
     fun observeHives(): Flow<List<Hive>> = db.hives().observeAll().map { it.map(::toHive) }
@@ -37,20 +121,54 @@ class LocalHiveRepository(context: Context) {
     fun observePhotos(hiveId: Long): Flow<List<PhotoEntity>> = db.photos().observeForHive(hiveId)
 
     suspend fun getHive(id: Long): Hive? = withContext(Dispatchers.IO) { db.hives().get(id)?.let(::toHive) }
+    suspend fun getAllKnownNfcTagAssignments(): List<Pair<String?, Long>> = withContext(Dispatchers.IO) {
+        val ledgerAssignments = db.nfcTagAssignments().allActiveAssignments()
+            .map { it.tagUid to it.hiveId }
+        val legacyHiveCache = db.hives().allForBackup()
+            .filter { !it.deleted && !it.tagUid.isNullOrBlank() }
+            .map { it.tagUid to it.id }
+        ledgerAssignments + legacyHiveCache
+    }
+
     suspend fun findHiveByNfc(tag: String): Hive? = withContext(Dispatchers.IO) {
-        val uid = tag.trim()
-        db.nfcTagAssignments().activeByTag(uid)?.let { db.hives().get(it.hiveId) }?.let(::toHive)
-            ?: db.hives().byTag(uid)?.let(::toHive)
+        val uid = NfcUid.normalize(tag) ?: return@withContext null
+        // Normalize stored legacy values in Kotlin as well as incoming scans. SQL NOCASE
+        // handles case but cannot equate old "AA:BB" / "AA-BB" strings with "AABB".
+        val ledgerOwners = db.nfcTagAssignments().allActiveAssignments()
+            .filter { NfcUid.matches(it.tagUid, uid) }
+            .map { it.hiveId }
+        val cachedOwners = db.hives().allForBackup()
+            .filter { !it.deleted && NfcUid.matches(it.tagUid, uid) }
+            .map { it.id }
+        val owners = (ledgerOwners + cachedOwners).distinct()
+        // Refuse ambiguous identifiers rather than choosing a hive by query order.
+        if (owners.size != 1) return@withContext null
+        db.hives().get(owners.single())
+            ?.takeIf { it.status == HiveStatus.ACTIVE && !it.deleted }
+            ?.let(::toHive)
+    }
+
+    suspend fun isNfcTagAmbiguous(uid: String): Boolean = withContext(Dispatchers.IO) {
+        val normalized = NfcUid.normalize(uid) ?: return@withContext false
+        val ledgerOwners = db.nfcTagAssignments().allActiveAssignments()
+            .filter { NfcUid.matches(it.tagUid, normalized) }
+            .map { it.hiveId }
+        val cachedOwners = db.hives().allForBackup()
+            .filter { !it.deleted && NfcUid.matches(it.tagUid, normalized) }
+            .map { it.id }
+        (ledgerOwners + cachedOwners).distinct().size > 1
     }
 
     suspend fun isNfcTagUnassigned(uid: String): Boolean = withContext(Dispatchers.IO) {
-        uid.trim().takeIf { it.isNotBlank() }?.let { db.nfcTagAssignments().isUnassigned(it) } ?: false
+        val normalized = NfcUid.normalize(uid) ?: return@withContext false
+        val history = db.nfcTagAssignments().allForBackup()
+            .filter { NfcUid.matches(it.tagUid, normalized) }
+        history.isNotEmpty() && history.none { it.isActive }
     }
 
     suspend fun getUnassignedNfcTagUids(): Set<String> = withContext(Dispatchers.IO) {
         db.nfcTagAssignments().allUnassignedTagUids()
-            .map { it.trim().uppercase(java.util.Locale.ROOT) }
-            .filter { it.isNotBlank() }
+            .mapNotNull(NfcUid::normalize)
             .toSet()
     }
     suspend fun findHiveByNumberAndApiary(number: String, apiary: String): Hive? = withContext(Dispatchers.IO) {
@@ -63,9 +181,11 @@ class LocalHiveRepository(context: Context) {
      */
     suspend fun createStarterSetup(
         apiaryNames: List<String>,
-        hiveNumbersByApiary: List<List<String>>
+        hiveNumbersByApiary: List<List<String>>,
+        allowExistingWorkspace: Boolean = false
     ) = withContext(Dispatchers.IO) {
         require(apiaryNames.isNotEmpty()) { "Create at least one apiary." }
+        require(apiaryNames.size <= 50) { "Create no more than 50 apiaries at a time." }
         require(apiaryNames.size == hiveNumbersByApiary.size) { "Each apiary needs a hive-name list." }
 
         val cleanApiaryNames = apiaryNames.map(String::trim)
@@ -82,12 +202,51 @@ class LocalHiveRepository(context: Context) {
             }
             clean
         }
-        require(cleanHiveNumbers.sumOf { it.size } <= 1_000) { "Create no more than 1,000 hives at a time." }
+        require(cleanHiveNumbers.sumOf { it.size } <= 5_000) { "Create no more than 5,000 hives at a time." }
 
         db.withTransaction {
-            require(db.apiaries().allForBackup().isEmpty() && db.hives().allForBackup().isEmpty()) {
-                "Starter setup is only available when the workspace is empty. Existing records were left unchanged."
+            val existingApiaries = db.apiaries().allForBackup()
+            val existingHives = db.hives().allForBackup()
+            if (!allowExistingWorkspace) {
+                require(existingApiaries.isEmpty() && existingHives.isEmpty()) {
+                    "Starter setup is only available when the workspace is empty. Existing records were left unchanged."
+                }
+            } else {
+                val existingApiaryNames = existingApiaries
+                    .map { it.name.trim().lowercase(java.util.Locale.ROOT) }
+                    .toSet()
+                val duplicateApiaryName = cleanApiaryNames.firstOrNull {
+                    it.lowercase(java.util.Locale.ROOT) in existingApiaryNames
+                }
+                require(duplicateApiaryName == null) {
+                    "An apiary named \"$duplicateApiaryName\" already exists. Choose a different name."
+                }
+
+                val existingHiveKeys = existingHives
+                    .filter { !it.deleted && it.status == HiveStatus.ACTIVE }
+                    .map {
+                        it.apiaryName.trim().lowercase(java.util.Locale.ROOT) to
+                            it.number.trim().lowercase(java.util.Locale.ROOT)
+                    }
+                    .toSet()
+                cleanApiaryNames.forEachIndexed { index, apiaryName ->
+                    val apiaryKey = apiaryName.lowercase(java.util.Locale.ROOT)
+                    val duplicateHiveNumber = cleanHiveNumbers[index].firstOrNull { hiveNumber ->
+                        (apiaryKey to hiveNumber.lowercase(java.util.Locale.ROOT)) in existingHiveKeys
+                    }
+                    require(duplicateHiveNumber == null) {
+                        "Hive $duplicateHiveNumber already exists in $apiaryName."
+                    }
+                }
             }
+
+            require(existingApiaries.count { !it.deleted } + cleanApiaryNames.size <= 50) {
+                "Your workspace can contain no more than 50 apiaries total."
+            }
+            require(existingHives.count { !it.deleted } + cleanHiveNumbers.sumOf { it.size } <= 5_000) {
+                "Your workspace can contain no more than 5,000 hives total."
+            }
+
             val now = System.currentTimeMillis()
             cleanApiaryNames.forEachIndexed { index, apiaryName ->
                 val apiary = ApiaryEntity(
@@ -148,7 +307,8 @@ class LocalHiveRepository(context: Context) {
             deadAt = existing?.deadAt ?: h.deadAt,
             statusChangedAt = existing?.statusChangedAt ?: now,
             latitude = if (h.latitude != null && h.longitude != null) h.latitude else existing?.latitude,
-            longitude = if (h.latitude != null && h.longitude != null) h.longitude else existing?.longitude
+            longitude = if (h.latitude != null && h.longitude != null) h.longitude else existing?.longitude,
+            beeCountFrames = h.beeCountFrames ?: existing?.beeCountFrames
         )
         db.hives().upsert(entity)
         enqueue("hive", h.id, "upsert", hivePayload(entity))
@@ -186,8 +346,10 @@ class LocalHiveRepository(context: Context) {
             val dead = hive.copy(status = HiveStatus.DEAD, deadAt = now, statusChangedAt = now, tagUid = null, updatedAt = now)
             db.hives().upsert(dead)
             enqueue("hive", hiveId, "upsert", hivePayload(dead))
-            db.nfcTagAssignments().activeForHive(hiveId)?.let { assignment ->
-                val closed = assignment.copy(unassignedAt = now)
+            // A legacy/corrupt ledger can contain more than one active tag for the
+            // same colony. Marking the colony dead must release every one of them.
+            db.nfcTagAssignments().activeAssignmentsForHive(hiveId).forEach { assignment ->
+                val closed = assignment.copy(unassignedAt = maxOf(now, assignment.assignedAt))
                 db.nfcTagAssignments().upsert(closed)
                 enqueue("nfc_assignment", closed.id, "upsert", nfcAssignmentPayload(closed))
             }
@@ -304,34 +466,86 @@ class LocalHiveRepository(context: Context) {
     }
 
     suspend fun assignNfcTag(hiveId: Long, uid: String, reassign: Boolean = false) = withContext(Dispatchers.IO) {
-        val normalized = uid.trim().uppercase()
-        require(normalized.isNotBlank()) { "The NFC tag has no readable UID." }
+        val normalized = NfcUid.normalize(uid)
+            ?: throw IllegalArgumentException("The NFC tag has no valid readable UID.")
         db.withTransaction {
             val hive = db.hives().get(hiveId) ?: throw IllegalArgumentException("Hive not found.")
             require(hive.status == HiveStatus.ACTIVE) { "Cannot assign an NFC tag to a ${hive.status.lowercase()} colony." }
+
+            val tagConflicts = db.nfcTagAssignments().allActiveAssignments()
+                .filter { NfcUid.matches(it.tagUid, normalized) }
+            val cachedOwners = db.hives().allForBackup()
+                .filter { !it.deleted && it.id != hiveId && NfcUid.matches(it.tagUid, normalized) }
+            val ledgerOwners = tagConflicts.map { it.hiveId }.toSet()
+            val legacyOnlyOwners = cachedOwners.filter { it.id !in ledgerOwners }
+            val foreignOwnerIds = (tagConflicts.map { it.hiveId } + cachedOwners.map { it.id })
+                .distinct()
+                .filter { it != hiveId }
+            if (foreignOwnerIds.isNotEmpty() && !reassign) {
+                val ownerHiveId = foreignOwnerIds.first()
+                val ownerHive = db.hives().get(ownerHiveId)
+                throw IllegalArgumentException(
+                    "This NFC tag is already linked to ${ownerHive?.number ?: ownerHiveId}. No assignment was changed."
+                )
+            }
+
+            val targetAssignments = db.nfcTagAssignments().activeAssignmentsForHive(hiveId)
+            val alreadyCorrect = tagConflicts.size == 1 &&
+                tagConflicts.single().hiveId == hiveId &&
+                targetAssignments.size == 1 &&
+                NfcUid.matches(targetAssignments.single().tagUid, normalized) &&
+                cachedOwners.isEmpty()
+            if (alreadyCorrect) return@withTransaction
+
             val now = System.currentTimeMillis()
-            db.nfcTagAssignments().activeByTag(normalized)?.let { owner ->
-                if (owner.hiveId == hiveId) return@withTransaction
-                if (!reassign) {
-                    val ownerHive = db.hives().get(owner.hiveId)
-                    throw IllegalArgumentException("This NFC tag is already assigned to Hive ${ownerHive?.number ?: owner.hiveId}.")
+            // Close every active ledger conflict, rather than trusting LIMIT 1 lookups.
+            val rowsToClose = (tagConflicts + targetAssignments).distinctBy { it.id }
+            rowsToClose.forEach { assignment ->
+                if (!assignment.isActive) return@forEach
+                val closed = assignment.copy(unassignedAt = now)
+                db.nfcTagAssignments().upsert(closed)
+                enqueue("nfc_assignment", closed.id, "upsert", nfcAssignmentPayload(closed))
+            }
+
+            // Some older builds wrote only hives.tag_uid. Preserve those released
+            // identities in the ledger instead of leaving a stale cache owner behind.
+            legacyOnlyOwners.forEach { legacyOwner ->
+                val tombstone = NfcTagAssignmentEntity(
+                    id = IdGenerator.nextLong(),
+                    tagUid = normalized,
+                    hiveId = legacyOwner.id,
+                    assignedAt = legacyOwner.updatedAt.takeIf { it > 0L } ?: now,
+                    unassignedAt = now
+                )
+                db.nfcTagAssignments().upsert(tombstone)
+                enqueue("nfc_assignment", tombstone.id, "upsert", nfcAssignmentPayload(tombstone))
+            }
+
+            val previousOwners = (rowsToClose.map { it.hiveId } + legacyOnlyOwners.map { it.id })
+                .distinct()
+                .filter { it != hiveId }
+            previousOwners.forEach { ownerHiveId ->
+                db.hives().refreshTagCache(ownerHiveId)
+                val ownerHive = db.hives().get(ownerHiveId)
+                if (ownerHive != null) {
+                    enqueue("hive", ownerHiveId, "upsert", hivePayload(ownerHive))
                 }
-                val closed = owner.copy(unassignedAt = now)
-                db.nfcTagAssignments().upsert(closed)
-                enqueue("nfc_assignment", closed.id, "upsert", nfcAssignmentPayload(closed))
-                db.hives().refreshTagCache(owner.hiveId)
-                val stealEvent = ActivityEventEntity(IdGenerator.nextLong(), owner.hiveId, now, "tag", "NFC tag removed", "Tag $normalized reassigned to Hive ${hive.number}")
-                db.events().upsert(stealEvent)
-                enqueue("event", stealEvent.id, "upsert", eventPayload(stealEvent))
+                val ownerNumber = ownerHive?.number ?: ownerHiveId.toString()
+                val event = ActivityEventEntity(
+                    IdGenerator.nextLong(), ownerHiveId, now, "tag", "NFC tag removed",
+                    "Tag $normalized reassigned from Hive $ownerNumber to Hive ${hive.number}"
+                )
+                db.events().upsert(event)
+                enqueue("event", event.id, "upsert", eventPayload(event))
             }
-            db.nfcTagAssignments().activeForHive(hiveId)?.takeIf { !it.tagUid.equals(normalized, ignoreCase = true) }?.let { existing ->
-                val closed = existing.copy(unassignedAt = now)
-                db.nfcTagAssignments().upsert(closed)
-                enqueue("nfc_assignment", closed.id, "upsert", nfcAssignmentPayload(closed))
-            }
+
             val assignment = NfcTagAssignmentEntity(IdGenerator.nextLong(), normalized, hiveId, now)
             db.nfcTagAssignments().upsert(assignment)
             db.hives().refreshTagCache(hiveId)
+            val updatedHive = db.hives().get(hiveId)
+            if (updatedHive != null) {
+                enqueue("hive", hiveId, "upsert", hivePayload(updatedHive))
+            }
             enqueue("nfc_assignment", assignment.id, "upsert", nfcAssignmentPayload(assignment))
             val event = ActivityEventEntity(IdGenerator.nextLong(), hiveId, now, "tag", "NFC tag assigned", "Tag $normalized")
             db.events().upsert(event)
@@ -345,8 +559,9 @@ class LocalHiveRepository(context: Context) {
                 ?: throw IllegalArgumentException("Hive not found.")
             val activeAssignments = db.nfcTagAssignments().activeAssignmentsForHive(hiveId)
             val cachedTag = hive.tagUid?.trim()?.takeIf { it.isNotBlank() }
-            val cachedTagHadActiveLedgerAssignment = cachedTag?.let {
-                db.nfcTagAssignments().activeByTag(it) != null
+            val cachedTagHadActiveLedgerAssignment = cachedTag?.let { rawUid ->
+                NfcUid.normalize(rawUid) != null &&
+                    activeAssignments.any { NfcUid.matches(it.tagUid, rawUid) }
             } == true
 
             // Older app builds could save the tag only in hives.tag_uid without
@@ -369,7 +584,7 @@ class LocalHiveRepository(context: Context) {
             if (cachedTag != null && !cachedTagHadActiveLedgerAssignment) {
                 val legacyTombstone = NfcTagAssignmentEntity(
                     id = IdGenerator.nextLong(),
-                    tagUid = cachedTag.uppercase(java.util.Locale.ROOT),
+                    tagUid = NfcUid.normalize(cachedTag) ?: cachedTag.uppercase(java.util.Locale.ROOT),
                     hiveId = hiveId,
                     assignedAt = hive.updatedAt.takeIf { it > 0L } ?: now,
                     unassignedAt = now
@@ -388,7 +603,7 @@ class LocalHiveRepository(context: Context) {
             enqueue("hive", hiveId, "upsert", hivePayload(clearedHive))
 
             val releasedTags = (activeAssignments.map { it.tagUid } + listOfNotNull(cachedTag))
-                .distinctBy { it.trim().uppercase() }
+                .distinctBy { NfcUid.normalize(it) ?: it.trim().uppercase(java.util.Locale.ROOT) }
             val detail = when (releasedTags.size) {
                 0 -> "NFC tag assignment cleared and available for reuse"
                 1 -> "Tag ${releasedTags.first()} unassigned and available for reuse"
@@ -401,19 +616,47 @@ class LocalHiveRepository(context: Context) {
         }
     }
 
+    suspend fun recordBeeCountChange(
+        hiveId: Long,
+        previousFrames: Double,
+        newFrames: Double,
+        changedAt: Long
+    ) = withContext(Dispatchers.IO) {
+        require(previousFrames.isFinite() && newFrames.isFinite()) { "Bee frame values must be valid numbers." }
+        require(previousFrames in 0.5..10.0 && newFrames in 0.5..10.0) { "Bee frame values must be between 0.5 and 10." }
+        require(previousFrames != newFrames) { "Bee frame count did not change." }
+        db.withTransaction {
+            if (db.hives().get(hiveId) == null) return@withTransaction
+            val event = ActivityEventEntity(
+                id = IdGenerator.nextLong(),
+                hiveId = hiveId,
+                createdAt = changedAt,
+                type = "bee_count_change",
+                title = "Bee count changed",
+                detail = "Frames of bees changed from ${formatBeeCountFrames(previousFrames)} to ${formatBeeCountFrames(newFrames)}"
+            )
+            db.events().upsert(event)
+            enqueue("event", event.id, "upsert", eventPayload(event))
+        }
+    }
+
     suspend fun saveInspection(i: Inspection) = withContext(Dispatchers.IO) {
         requireValidCoordinates(i.latitude, i.longitude, "Inspection")
         db.withTransaction {
             val safeSample = i.sampleSize.coerceAtLeast(1)
             val safeMites = i.miteCount.coerceIn(0, safeSample)
+            val safeBeeCountFrames = i.beeCountFrames?.let {
+                (it * 2.0).roundToInt().coerceIn(1, 20) / 2.0
+            }
             val entity = InspectionEntity(
                 id = i.id, hiveId = i.hiveId, createdAt = i.createdAt, strength = i.strength.coerceIn(0, 10),
                 queenStatus = i.queenStatus.trim().ifBlank { "Laying" }, miteCount = safeMites, sampleSize = safeSample,
                 notes = i.notes.trim(), photoPath = i.photoPath?.trim()?.takeIf { it.isNotBlank() }, latitude = i.latitude, longitude = i.longitude,
                 emergencyCells = i.emergencyCells.coerceAtLeast(0), supercedureCells = i.supercedureCells.coerceAtLeast(0), swarmCells = i.swarmCells.coerceAtLeast(0),
-                eggs = i.eggs.coerceAtLeast(0), openBrood = i.openBrood.coerceAtLeast(0), cappedBrood = i.cappedBrood.coerceAtLeast(0),
-                honeyStores = i.honeyStores.coerceAtLeast(0), pollen = i.pollen.coerceAtLeast(0), emptyDrawnComb = i.emptyDrawnComb.coerceAtLeast(0),
-                diseaseFlags = i.diseaseFlags.trim(), updatedAt = i.createdAt
+                eggs = normalizeBroodStoresGauge(i.eggs), openBrood = normalizeBroodStoresGauge(i.openBrood), cappedBrood = normalizeBroodStoresGauge(i.cappedBrood),
+                honeyStores = normalizeBroodStoresGauge(i.honeyStores), pollen = normalizeBroodStoresGauge(i.pollen), emptyDrawnComb = normalizeBroodStoresGauge(i.emptyDrawnComb),
+                diseaseFlags = i.diseaseFlags.trim(), updatedAt = i.createdAt,
+                beeCountFrames = safeBeeCountFrames
             )
             db.inspections().upsert(entity)
             if (!i.photoPath.isNullOrBlank()) {
@@ -422,7 +665,13 @@ class LocalHiveRepository(context: Context) {
             db.hives().get(i.hiveId)?.let {
                 // The inspection timestamp describes the observation, not when the hive record was edited.
                 // Use wall-clock update time so backfilled inspections cannot make the hive look stale during sync.
-                db.hives().upsert(it.copy(strength = entity.strength, queenStatus = entity.queenStatus, mitePercent = entity.mitePercent, updatedAt = System.currentTimeMillis()))
+                db.hives().upsert(it.copy(
+                    strength = entity.strength,
+                    queenStatus = entity.queenStatus,
+                    mitePercent = entity.mitePercent,
+                    beeCountFrames = entity.beeCountFrames,
+                    updatedAt = System.currentTimeMillis()
+                ))
             }
             val event = ActivityEventEntity(i.id, i.hiveId, i.createdAt, "inspection", "Inspection", "Strength ${ColonyStrength.gradeFromStored(entity.strength)}/5 • ${ColonyStrength.labelFromStored(entity.strength)} • Mites ${String.format(java.util.Locale.US, "%.2f", entity.mitePercent)}%")
             db.events().upsert(event)
@@ -587,18 +836,54 @@ class LocalHiveRepository(context: Context) {
                     deadAt = if (lifecycleWins) json.longOrNull("dead_at") else existing.deadAt,
                     statusChangedAt = if (lifecycleWins) incomingStatusChangedAt else existing.statusChangedAt,
                     latitude = if (json.doubleOrNull("latitude") != null && json.doubleOrNull("longitude") != null) json.doubleOrNull("latitude") else existing?.latitude,
-                    longitude = if (json.doubleOrNull("latitude") != null && json.doubleOrNull("longitude") != null) json.doubleOrNull("longitude") else existing?.longitude
+                    longitude = if (json.doubleOrNull("latitude") != null && json.doubleOrNull("longitude") != null) json.doubleOrNull("longitude") else existing?.longitude,
+                    beeCountFrames = json.doubleOrNull("bee_count_frames")?.let {
+                        (it * 2.0).roundToInt().coerceIn(1, 20) / 2.0
+                    } ?: existing?.beeCountFrames
                 ))
                 // Older BeeKeep builds stored the tag on the hive document. Adopt it
                 // into the assignment ledger so mixed-version fleets still resolve scans.
-                val remoteTag = json.stringOrNull("tag_uid")
+                val remoteTag = json.stringOrNull("tag_uid")?.let(NfcUid::normalize)
                 if (remoteTag != null && status == HiveStatus.ACTIVE) {
-                    val localActive = db.nfcTagAssignments().activeForHive(doc.entity_id)
-                    if (localActive == null || !localActive.tagUid.equals(remoteTag, ignoreCase = true)) {
-                        applyAssignment(NfcTagAssignmentEntity(IdGenerator.nextLong(), remoteTag, doc.entity_id, incomingUpdatedAt))
+                    // Hive.tag_uid is a legacy cache, not the assignment authority. Import
+                    // it only when neither this hive nor this physical UID has any ledger
+                    // history. Otherwise a stale hive document (updated later for an
+                    // unrelated edit) could reclaim a released tag during cloud sync.
+                    val hiveHasLedgerHistory = db.nfcTagAssignments().allAssignmentsForHive(doc.entity_id).isNotEmpty()
+                    val uidHasLedgerHistory = db.nfcTagAssignments().allForBackup()
+                        .any { NfcUid.matches(it.tagUid, remoteTag) }
+                    if (!hiveHasLedgerHistory && !uidHasLedgerHistory) {
+                        applyAssignment(
+                            NfcTagAssignmentEntity(
+                                IdGenerator.nextLong(),
+                                remoteTag,
+                                doc.entity_id,
+                                incomingUpdatedAt
+                            ),
+                            publishIncomingIfNew = true
+                        )
                     }
                 }
+                if (status != HiveStatus.ACTIVE || json.optBoolean("deleted", false)) {
+                    // Older app versions can sync a lifecycle change without closing NFC
+                    // rows. Close every active assignment here too; otherwise a dead hive
+                    // can retain a tag and prevent it from being safely reused.
+                    val lifecycleTime = maxOf(incomingStatusChangedAt, incomingUpdatedAt)
+                    db.nfcTagAssignments().activeAssignmentsForHive(doc.entity_id).forEach { assignment ->
+                        val closed = assignment.copy(unassignedAt = maxOf(lifecycleTime, assignment.assignedAt))
+                        db.nfcTagAssignments().upsert(closed)
+                        enqueue("nfc_assignment", closed.id, "upsert", nfcAssignmentPayload(closed))
+                    }
+                }
+                val tagUidBeforeRefresh = db.hives().get(doc.entity_id)?.tagUid
                 db.hives().refreshTagCache(doc.entity_id)
+                db.hives().get(doc.entity_id)?.let { refreshed ->
+                    if (tagUidBeforeRefresh != refreshed.tagUid) {
+                        // Publish cache-only changes caused by the assignment ledger so old
+                        // clients/cloud documents do not keep broadcasting a released UID.
+                        enqueue("hive", doc.entity_id, "upsert", hivePayload(refreshed))
+                    }
+                }
             }
             "nfc_assignment" -> {
                 val incoming = NfcTagAssignmentEntity(
@@ -614,7 +899,8 @@ class LocalHiveRepository(context: Context) {
                 id=json.optLong("id",doc.entity_id), hiveId=json.optLong("hive_id"), createdAt=json.optLong("created_at",doc.updated_at),
                 strength=json.optInt("strength").coerceIn(0, 10), queenStatus=json.optString("queen_status"), miteCount=json.optInt("mite_count").coerceAtLeast(0), sampleSize=json.optInt("sample_size",1).coerceAtLeast(1),
                 notes=json.optString("notes"), photoPath=json.stringOrNull("photo_path"), latitude=json.doubleOrNull("latitude"), longitude=json.doubleOrNull("longitude"),
-                emergencyCells=json.optInt("emergency_cells").coerceAtLeast(0), supercedureCells=json.optInt("supercedure_cells").coerceAtLeast(0), swarmCells=json.optInt("swarm_cells").coerceAtLeast(0), eggs=json.optInt("eggs").coerceAtLeast(0), openBrood=json.optInt("open_brood").coerceAtLeast(0), cappedBrood=json.optInt("capped_brood").coerceAtLeast(0), honeyStores=json.optInt("honey_stores").coerceAtLeast(0), pollen=json.optInt("pollen").coerceAtLeast(0), emptyDrawnComb=json.optInt("empty_drawn_comb").coerceAtLeast(0), diseaseFlags=json.optString("disease_flags"), updatedAt=json.optLong("updated_at",doc.updated_at)
+                emergencyCells=json.optInt("emergency_cells").coerceAtLeast(0), supercedureCells=json.optInt("supercedure_cells").coerceAtLeast(0), swarmCells=json.optInt("swarm_cells").coerceAtLeast(0), eggs=json.optDouble("eggs", 0.0).coerceAtLeast(0.0), openBrood=json.optDouble("open_brood", 0.0).coerceAtLeast(0.0), cappedBrood=json.optDouble("capped_brood", 0.0).coerceAtLeast(0.0), honeyStores=json.optDouble("honey_stores", 0.0).coerceAtLeast(0.0), pollen=json.optDouble("pollen", 0.0).coerceAtLeast(0.0), emptyDrawnComb=json.optDouble("empty_drawn_comb", 0.0).coerceAtLeast(0.0), diseaseFlags=json.optString("disease_flags"), updatedAt=json.optLong("updated_at",doc.updated_at),
+                beeCountFrames=json.doubleOrNull("bee_count_frames")?.let { (it * 2.0).roundToInt().coerceIn(1, 20) / 2.0 }
             )) else Unit
             "feeding" -> if (db.hives().exists(json.optLong("hive_id"))) db.feedings().upsert(FeedingEntity(json.optLong("id",doc.entity_id),json.optLong("hive_id"),json.optLong("created_at",doc.updated_at),json.optString("feed_type"),json.optString("ratio"),json.optDouble("amount").coerceAtLeast(0.0),json.optString("unit"),json.optString("notes"))) else Unit
             "treatment" -> if (db.hives().exists(json.optLong("hive_id"))) db.treatments().upsert(TreatmentEntity(json.optLong("id",doc.entity_id),json.optLong("hive_id"),json.optLong("created_at",doc.updated_at),json.optString("treatment_type"),json.optString("product"),json.longOrNull("inserted_at"),json.longOrNull("removal_at"),json.longOrNull("withdrawal_until"),json.optString("notes"))) else Unit
@@ -942,16 +1228,66 @@ class LocalHiveRepository(context: Context) {
         }
     }
 
-    private suspend fun applyAssignment(incoming: NfcTagAssignmentEntity) {
+    private suspend fun applyAssignment(
+        incoming: NfcTagAssignmentEntity,
+        publishIncomingIfNew: Boolean = false
+    ) {
+        val normalizedUid = NfcUid.normalize(incoming.tagUid)
         db.withTransaction {
-            val merge = NfcAssignmentResolver.merge(
-                tagConflict = db.nfcTagAssignments().activeByTag(incoming.tagUid),
-                hiveConflict = db.nfcTagAssignments().activeForHive(incoming.hiveId),
-                incoming = incoming
-            )
-            merge.toClose.forEach { db.nfcTagAssignments().upsert(it) }
+            val incomingAlreadyStored = db.nfcTagAssignments().get(incoming.id) != null
+            // Imported/cloud data is not trusted to be normalized. Keep malformed rows
+            // as closed history, never as an active route to a hive.
+            val safeIncoming = if (normalizedUid == null) {
+                incoming.copy(unassignedAt = incoming.unassignedAt ?: incoming.assignedAt)
+            } else {
+                incoming.copy(tagUid = normalizedUid)
+            }
+            val targetHive = db.hives().get(safeIncoming.hiveId)
+            val targetIsUnavailable = safeIncoming.isActive &&
+                (targetHive == null || targetHive.status != HiveStatus.ACTIVE || targetHive.deleted)
+            // Assignment documents can arrive after lifecycle documents or out of order.
+            // A stale active assignment must never resurrect a tag on a dead/deleted hive.
+            val lifecycleSafeIncoming = if (targetIsUnavailable) {
+                safeIncoming.copy(
+                    unassignedAt = maxOf(
+                        safeIncoming.assignedAt,
+                        targetHive?.statusChangedAt ?: 0L,
+                        targetHive?.updatedAt ?: 0L
+                    )
+                )
+            } else safeIncoming
+            val merge = if (normalizedUid == null || !lifecycleSafeIncoming.isActive) {
+                NfcAssignmentResolver.MergeResult(lifecycleSafeIncoming, emptyList())
+            } else {
+                NfcAssignmentResolver.merge(
+                    tagConflicts = db.nfcTagAssignments().allActiveAssignments()
+                        .filter { NfcUid.matches(it.tagUid, normalizedUid) },
+                    hiveConflicts = db.nfcTagAssignments().activeAssignmentsForHive(lifecycleSafeIncoming.hiveId),
+                    incoming = lifecycleSafeIncoming
+                )
+            }
+
+            merge.toClose.forEach { closed ->
+                db.nfcTagAssignments().upsert(closed)
+                enqueue("nfc_assignment", closed.id, "upsert", nfcAssignmentPayload(closed))
+            }
             db.nfcTagAssignments().upsert(merge.incoming)
-            (merge.toClose.map { it.hiveId } + merge.incoming.hiveId).distinct().forEach { db.hives().refreshTagCache(it) }
+            if (merge.incoming != incoming || (publishIncomingIfNew && !incomingAlreadyStored)) {
+                enqueue("nfc_assignment", merge.incoming.id, "upsert", nfcAssignmentPayload(merge.incoming))
+            }
+
+            val affectedHiveIds = (merge.toClose.map { it.hiveId } + merge.incoming.hiveId).distinct()
+            affectedHiveIds.forEach { affectedHiveId ->
+                val beforeTagUid = db.hives().get(affectedHiveId)?.tagUid
+                db.hives().refreshTagCache(affectedHiveId)
+                db.hives().get(affectedHiveId)?.let { updatedHive ->
+                    if (beforeTagUid != updatedHive.tagUid) {
+                        // Keep legacy hive documents aligned with the assignment ledger or an
+                        // older device could re-import a stale cached UID as a new assignment.
+                        enqueue("hive", affectedHiveId, "upsert", hivePayload(updatedHive))
+                    }
+                }
+            }
         }
     }
 
@@ -960,12 +1296,12 @@ class LocalHiveRepository(context: Context) {
         db.outbox().enqueue(SyncOutboxEntity(IdGenerator.nextLong(), type, entityId, operation, payload))
     }
 
-    private fun hivePayload(e: HiveEntity) = JSONObject().put("id",e.id).put("number",e.number).put("apiary",e.apiaryName).put("apiary_id",e.apiaryId).put("queen_status",e.queenStatus).put("queen_mark_color",e.queenMarkColor).put("queen_origin",e.queenOrigin).put("queen_age_months",e.queenAgeMonths).put("queen_temperament",e.queenTemperament).put("strength",e.strength).put("mite_percent",e.mitePercent).put("tag_uid",e.tagUid).put("updated_at",e.updatedAt).put("deleted",e.deleted).put("status",e.status).put("dead_at",e.deadAt).put("status_changed_at",e.statusChangedAt).put("latitude",e.latitude).put("longitude",e.longitude).toString()
+    private fun hivePayload(e: HiveEntity) = JSONObject().put("id",e.id).put("number",e.number).put("apiary",e.apiaryName).put("apiary_id",e.apiaryId).put("queen_status",e.queenStatus).put("queen_mark_color",e.queenMarkColor).put("queen_origin",e.queenOrigin).put("queen_age_months",e.queenAgeMonths).put("queen_temperament",e.queenTemperament).put("strength",e.strength).put("mite_percent",e.mitePercent).put("tag_uid",e.tagUid).put("updated_at",e.updatedAt).put("deleted",e.deleted).put("status",e.status).put("dead_at",e.deadAt).put("status_changed_at",e.statusChangedAt).put("latitude",e.latitude).put("longitude",e.longitude).put("bee_count_frames",e.beeCountFrames).toString()
     private fun nfcAssignmentPayload(e: NfcTagAssignmentEntity) = JSONObject().put("id",e.id).put("tag_uid",e.tagUid).put("hive_id",e.hiveId).put("assigned_at",e.assignedAt).put("unassigned_at",e.unassignedAt).put("updated_at",maxOf(e.assignedAt, e.unassignedAt ?: 0L)).toString()
     private fun apiaryPayload(e: ApiaryEntity) = JSONObject().put("id",e.id).put("name",e.name).put("notes",e.notes).put("latitude",e.latitude).put("longitude",e.longitude).put("forage_notes",e.forageNotes).put("water_notes",e.waterNotes).put("updated_at",e.updatedAt).put("deleted",e.deleted).toString()
     private fun inspectionPayload(e: InspectionEntity) = JSONObject().put("id",e.id).put("hive_id",e.hiveId).put("created_at",e.createdAt).put("strength",e.strength).put("queen_status",e.queenStatus).put("mite_count",e.miteCount).put("sample_size",e.sampleSize).put("notes",e.notes)
         // Local device paths are never valid on another device. Photos sync separately.
-        .put("photo_path", JSONObject.NULL).put("latitude",e.latitude).put("longitude",e.longitude).put("emergency_cells",e.emergencyCells).put("supercedure_cells",e.supercedureCells).put("swarm_cells",e.swarmCells).put("eggs",e.eggs).put("open_brood",e.openBrood).put("capped_brood",e.cappedBrood).put("honey_stores",e.honeyStores).put("pollen",e.pollen).put("empty_drawn_comb",e.emptyDrawnComb).put("disease_flags",e.diseaseFlags).put("updated_at",e.updatedAt).toString()
+        .put("photo_path", JSONObject.NULL).put("latitude",e.latitude).put("longitude",e.longitude).put("emergency_cells",e.emergencyCells).put("supercedure_cells",e.supercedureCells).put("swarm_cells",e.swarmCells).put("eggs",e.eggs).put("open_brood",e.openBrood).put("capped_brood",e.cappedBrood).put("honey_stores",e.honeyStores).put("pollen",e.pollen).put("empty_drawn_comb",e.emptyDrawnComb).put("disease_flags",e.diseaseFlags).put("bee_count_frames",e.beeCountFrames).put("updated_at",e.updatedAt).toString()
     private fun feedingPayload(e: FeedingEntity) = JSONObject().put("id",e.id).put("hive_id",e.hiveId).put("created_at",e.createdAt).put("updated_at",e.createdAt).put("feed_type",e.feedType).put("ratio",e.ratio).put("amount",e.amount).put("unit",e.unit).put("notes",e.notes).toString()
     private fun treatmentPayload(e: TreatmentEntity) = JSONObject().put("id",e.id).put("hive_id",e.hiveId).put("created_at",e.createdAt).put("updated_at",e.createdAt).put("treatment_type",e.treatmentType).put("product",e.product).put("inserted_at",e.insertedAt).put("removal_at",e.removalAt).put("withdrawal_until",e.withdrawalUntil).put("notes",e.notes).toString()
     private fun harvestPayload(e: HarvestEntity) = JSONObject().put("id",e.id).put("hive_id",e.hiveId).put("created_at",e.createdAt).put("updated_at",e.createdAt).put("supers_pulled",e.supersPulled).put("wet_honey_weight",e.wetHoneyWeight).put("dry_honey_weight",e.dryHoneyWeight).put("weight_unit",e.weightUnit).put("wax_weight",e.waxWeight).put("propolis_weight",e.propolisWeight).put("notes",e.notes).toString()
@@ -976,8 +1312,15 @@ class LocalHiveRepository(context: Context) {
     private fun JSONObject.intOrNull(key: String): Int? = if (has(key) && !isNull(key)) optInt(key) else null
     private fun JSONObject.stringOrNull(key: String): String? = if (has(key) && !isNull(key)) optString(key) else null
 
-    private fun toHive(e: HiveEntity) = Hive(e.id, e.number, e.apiaryName, e.queenStatus, e.queenMarkColor, e.queenOrigin, e.queenAgeMonths, e.queenTemperament, e.strength, e.mitePercent, e.tagUid, e.status, e.deadAt, e.latitude, e.longitude)
-    private fun toInspection(e: InspectionEntity) = Inspection(e.id, e.hiveId, e.createdAt, e.strength, e.queenStatus, e.miteCount, e.sampleSize, e.notes, e.photoPath, e.latitude, e.longitude, e.emergencyCells, e.supercedureCells, e.swarmCells, e.eggs, e.openBrood, e.cappedBrood, e.honeyStores, e.pollen, e.emptyDrawnComb, e.diseaseFlags)
+    private fun normalizeBroodStoresGauge(value: Double): Double =
+        (value.coerceIn(0.0, 10.0) * 2.0).roundToInt() / 2.0
+
+    private fun formatBeeCountFrames(value: Double): String =
+        if (value == value.toLong().toDouble()) value.toLong().toString()
+        else String.format(java.util.Locale.US, "%.1f", value)
+
+    private fun toHive(e: HiveEntity) = Hive(e.id, e.number, e.apiaryName, e.queenStatus, e.queenMarkColor, e.queenOrigin, e.queenAgeMonths, e.queenTemperament, e.strength, e.mitePercent, e.tagUid, e.status, e.deadAt, e.latitude, e.longitude, e.beeCountFrames)
+    private fun toInspection(e: InspectionEntity) = Inspection(e.id, e.hiveId, e.createdAt, e.strength, e.queenStatus, e.miteCount, e.sampleSize, e.notes, e.photoPath, e.latitude, e.longitude, e.emergencyCells, e.supercedureCells, e.swarmCells, e.eggs, e.openBrood, e.cappedBrood, e.honeyStores, e.pollen, e.emptyDrawnComb, e.diseaseFlags, e.beeCountFrames)
     private fun toFeeding(e: FeedingEntity) = Feeding(e.id, e.hiveId, e.createdAt, e.feedType, e.ratio, e.amount, e.unit, e.notes)
     private fun toTreatment(e: TreatmentEntity) = Treatment(e.id, e.hiveId, e.createdAt, e.treatmentType, e.product, e.insertedAt, e.removalAt, e.withdrawalUntil, e.notes)
     private fun toHarvest(e: HarvestEntity) = Harvest(e.id, e.hiveId, e.createdAt, e.supersPulled, e.wetHoneyWeight, e.dryHoneyWeight, e.weightUnit, e.waxWeight, e.propolisWeight, e.notes)

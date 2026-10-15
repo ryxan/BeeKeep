@@ -10,7 +10,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import com.beekeep.app.nfc.NfcUid
 import java.time.ZoneId
+import kotlin.math.roundToInt
 
 class BeeKeepViewModel(
     private val repo: LocalHiveRepository,
@@ -88,6 +90,11 @@ class BeeKeepViewModel(
 
     suspend fun findHiveByTag(tag: String): Hive? = repo.findHiveByNfc(tag)
 
+    suspend fun isNfcTagAmbiguous(uid: String): Boolean = repo.isNfcTagAmbiguous(uid)
+
+    suspend fun getAllKnownNfcTagAssignments(): List<Pair<String?, Long>> =
+        repo.getAllKnownNfcTagAssignments()
+
     suspend fun isNfcTagUnassigned(uid: String): Boolean = repo.isNfcTagUnassigned(uid)
 
     suspend fun getUnassignedNfcTagUids(): Set<String> = repo.getUnassignedNfcTagUids()
@@ -117,12 +124,13 @@ class BeeKeepViewModel(
         apiaryNames: List<String>,
         startingHiveNumbers: List<Int>,
         hiveCounts: List<Int>,
+        allowExistingWorkspace: Boolean = false,
         onResult: (Boolean, String?) -> Unit = { _, _ -> }
     ) {
         val cleanPrefix = hivePrefix.trim()
         val cleanApiaryNames = apiaryNames.map(String::trim)
-        if (cleanApiaryNames.isEmpty() || cleanApiaryNames.size > 30) {
-            onResult(false, "Choose between 1 and 30 apiaries.")
+        if (cleanApiaryNames.isEmpty() || cleanApiaryNames.size > 50) {
+            onResult(false, "Choose between 1 and 50 apiaries.")
             return
         }
         if (cleanApiaryNames.size != startingHiveNumbers.size ||
@@ -143,9 +151,24 @@ class BeeKeepViewModel(
             onResult(false, "Starting numbers must be between 1 and 999,999.")
             return
         }
-        if (hiveCounts.any { it !in 0..1_000 } || hiveCounts.sum() > 1_000) {
-            onResult(false, "Choose between 0 and 1,000 hives per apiary, with no more than 1,000 total.")
+        if (hiveCounts.any { it !in 0..5_000 } || hiveCounts.sum() > 5_000) {
+            onResult(false, "Choose between 0 and 5,000 hives per apiary, with no more than 5,000 total.")
             return
+        }
+        if (allowExistingWorkspace && _apiaries.value.size + cleanApiaryNames.size > 50) {
+            onResult(false, "Your workspace can contain no more than 50 apiaries total.")
+            return
+        }
+        if (allowExistingWorkspace && _hives.value.size + _deadHives.value.size + hiveCounts.sum() > 5_000) {
+            onResult(false, "Your workspace can contain no more than 5,000 hives total.")
+            return
+        }
+        if (allowExistingWorkspace) {
+            val existingNames = _apiaries.value.map { it.name.trim().lowercase(java.util.Locale.ROOT) }.toSet()
+            if (cleanApiaryNames.any { it.lowercase(java.util.Locale.ROOT) in existingNames }) {
+                onResult(false, "An apiary with that name already exists. Choose a different name.")
+                return
+            }
         }
         if (startingHiveNumbers.indices.any { i ->
             hiveCounts[i] > 0 &&
@@ -165,7 +188,13 @@ class BeeKeepViewModel(
         }
 
         viewModelScope.launch {
-            runCatching { repo.createStarterSetup(cleanApiaryNames, hiveNumbersByApiary) }
+            runCatching {
+                repo.createStarterSetup(
+                    cleanApiaryNames,
+                    hiveNumbersByApiary,
+                    allowExistingWorkspace = allowExistingWorkspace
+                )
+            }
                 .onSuccess { onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not create the starter apiaries and hives.") }
         }
@@ -244,8 +273,8 @@ class BeeKeepViewModel(
     }
 
     fun assignTagToHive(hiveId: Long, uid: String, reassign: Boolean = false, onResult: (Boolean, String?) -> Unit = { _, _ -> }) {
-        val normalized = uid.trim().uppercase()
-        if (normalized.isBlank()) { onResult(false, "The NFC tag has no readable UID."); return }
+        val normalized = NfcUid.normalize(uid)
+        if (normalized == null) { onResult(false, "The NFC tag has no valid readable UID."); return }
         viewModelScope.launch {
             runCatching {
                 repo.assignNfcTag(hiveId, normalized, reassign)
@@ -287,6 +316,19 @@ class BeeKeepViewModel(
         }
     }
 
+    private fun normalizeBroodStoresGauge(value: Double): Double =
+        (value.coerceIn(0.0, 10.0) * 2.0).roundToInt() / 2.0
+
+    fun recordBeeCountChange(hiveId: Long, previousFrames: Double, newFrames: Double) {
+        if (previousFrames == newFrames || _selected.value?.id != hiveId) return
+        val changedAt = System.currentTimeMillis()
+        viewModelScope.launch {
+            runCatching {
+                repo.recordBeeCountChange(hiveId, previousFrames, newFrames, changedAt)
+            }
+        }
+    }
+
     suspend fun saveInspection(i: Inspection): Boolean {
         val h = _selected.value ?: return false
         if (i.hiveId != h.id) return false
@@ -301,12 +343,12 @@ class BeeKeepViewModel(
             emergencyCells = i.emergencyCells.coerceAtLeast(0),
             supercedureCells = i.supercedureCells.coerceAtLeast(0),
             swarmCells = i.swarmCells.coerceAtLeast(0),
-            eggs = i.eggs.coerceAtLeast(0),
-            openBrood = i.openBrood.coerceAtLeast(0),
-            cappedBrood = i.cappedBrood.coerceAtLeast(0),
-            honeyStores = i.honeyStores.coerceAtLeast(0),
-            pollen = i.pollen.coerceAtLeast(0),
-            emptyDrawnComb = i.emptyDrawnComb.coerceAtLeast(0),
+            eggs = normalizeBroodStoresGauge(i.eggs),
+            openBrood = normalizeBroodStoresGauge(i.openBrood),
+            cappedBrood = normalizeBroodStoresGauge(i.cappedBrood),
+            honeyStores = normalizeBroodStoresGauge(i.honeyStores),
+            pollen = normalizeBroodStoresGauge(i.pollen),
+            emptyDrawnComb = normalizeBroodStoresGauge(i.emptyDrawnComb),
             diseaseFlags = i.diseaseFlags.trim()
         )
         return runCatching {

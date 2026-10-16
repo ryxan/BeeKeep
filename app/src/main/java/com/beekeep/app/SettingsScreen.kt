@@ -256,30 +256,8 @@ internal fun SettingsScreen(
                 Text("Settings", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
 }
 
-            SettingsSection("Layout & Appearance", Icons.Rounded.Settings) {
-                SettingsSwitchRow(
-                    title = "Yellow + black field mode",
-                    checked = darkMode,
-                    onCheckedChange = onDarkModeChange
-                )
-                SettingsSwitchRow(
-                    title = "Larger field text",
-                    checked = largeFieldText,
-                    onCheckedChange = onLargeFieldTextChange
-                )
-                SettingsSwitchRow(
-                    title = "Compact hive list cards",
-                    checked = compactHiveRows,
-                    onCheckedChange = onCompactHiveRowsChange
-                )
-            }
-
-            SettingsSection("Voice & NFC behaviour", Icons.Rounded.RecordVoiceOver) {
-                SettingsSwitchRow(
-                    title = "Auto-start voice after an NFC hive scan",
-                    checked = autoVoiceEnabled,
-                    onCheckedChange = onAutoVoiceEnabledChange
-                )
+            SettingsSection("NFC & Voice behaviour", Icons.Rounded.Nfc) {
+                // Tag-management controls come first.
                 SettingsSwitchRow(
                     title = "Fast tag assignment mode",
                     checked = fastTagAssignmentMode,
@@ -287,11 +265,26 @@ internal fun SettingsScreen(
                 )
                 if (fastTagAssignmentMode) {
                     Text(
-                        "Moves through untagged hives in this apiary. The previous tag is ignored; confirm the hive number before each new tag.",
+                        "TURN THIS SETTING OFF TO CONTINUE NORMAL OPERATION",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.error
                     )
                 }
+                SettingsSwitchRow(
+                    title = "Confirm before removing a tag",
+                    checked = confirmTagRemoval,
+                    onCheckedChange = {
+                        confirmTagRemoval = it
+                        preferences.edit { putBoolean("confirm_tag_removal", it) }
+                    }
+                )
+
+                // Voice controls stay together at the bottom of this section.
+                SettingsSwitchRow(
+                    title = "Auto-start voice after an NFC hive scan",
+                    checked = autoVoiceEnabled,
+                    onCheckedChange = onAutoVoiceEnabledChange
+                )
                 SettingsSwitchRow(
                     title = "Beep when voice is ready",
                     checked = readyBeep,
@@ -308,15 +301,6 @@ internal fun SettingsScreen(
                         preferences.edit { putBoolean("speak_hive_number_on_scan", it) }
                     }
                 )
-                SettingsSwitchRow(
-                    title = "Confirm before removing a tag",
-                    checked = confirmTagRemoval,
-                    onCheckedChange = {
-                        confirmTagRemoval = it
-                        preferences.edit { putBoolean("confirm_tag_removal", it) }
-                    }
-                )
-
             }
 
             SettingsSection("Apiary location", Icons.Rounded.LocationOn) {
@@ -395,6 +379,24 @@ internal fun SettingsScreen(
                         rememberLastInspection = it
                         preferences.edit { putBoolean("remember_last_inspection_values", it) }
                     }
+                )
+            }
+
+            SettingsSection("Layout & Appearance", Icons.Rounded.Settings) {
+                SettingsSwitchRow(
+                    title = "Yellow + black field mode",
+                    checked = darkMode,
+                    onCheckedChange = onDarkModeChange
+                )
+                SettingsSwitchRow(
+                    title = "Larger field text",
+                    checked = largeFieldText,
+                    onCheckedChange = onLargeFieldTextChange
+                )
+                SettingsSwitchRow(
+                    title = "Compact hive list cards",
+                    checked = compactHiveRows,
+                    onCheckedChange = onCompactHiveRowsChange
                 )
             }
 
@@ -560,7 +562,7 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                             color = MaterialTheme.colorScheme.error
                         )
                         Text(
-                            "Delete all hives, records, photos and NFC assignments",
+                            "Delete all hives, records and NFC assignments",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error.copy(alpha = 0.86f)
                         )
@@ -588,7 +590,7 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
             title = { Text("Reset all apiaries?", fontWeight = FontWeight.ExtraBold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("This permanently deletes every apiary and hive, along with inspections, notes, feedings, treatments, harvests, activity history, photos, tasks and all NFC tag assignments.")
+                    Text("This permanently deletes every apiary and hive, along with inspections, notes, feedings, treatments, harvests, activity history, tasks and all NFC tag assignments.")
                     Text(
                         "This cannot be undone. BeeKeep Cloud data for the signed-in account will also be cleared when cloud access is available.",
                         color = MaterialTheme.colorScheme.error,
@@ -674,7 +676,7 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                         val count = restorePreview.counts[key] ?: 0
                         if (count > 0) Text("• $label: $count", style = MaterialTheme.typography.bodySmall)
                     }
-                    Text("This merges records. Newer records already on this phone are kept; local-only records are not deleted. Photo files are not included.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                    Text("This merges records. Newer records already on this phone are kept; local-only records are not deleted.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {

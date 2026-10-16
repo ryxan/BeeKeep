@@ -107,7 +107,9 @@ internal fun HiveDetailScreen(
     autoStartTagWriting: Boolean = false,
     autoStartTagWritingIgnoreUid: String? = null,
     onAutoTagWritingStarted: () -> Unit = {},
+    onFastTagAssignmentStarted: () -> Unit = {},
     onFastTagAssignmentSuccess: (String) -> Unit = {},
+    onFastTagAssignmentSkip: (Long, String) -> Unit = { _, _ -> },
     onVerifyTag: () -> Unit,
     onMarkDead: () -> Unit,
     onRestore: () -> Unit,
@@ -133,8 +135,33 @@ internal fun HiveDetailScreen(
         }
     }
 
+    fun skipHiveInFastAssignment(reason: String) {
+        nfc.beginFastAssignmentFlow(activity)
+        onFastTagAssignmentStarted()
+        writeStatusType = "error"
+        writeStatus = "Skipping ${hiveReferenceName(hive.number)}: $reason."
+        onFastTagAssignmentSkip(hive.id, reason)
+    }
+
     fun startTagWriting(ignoredUid: String? = null) {
-        if (hive.isDead || writeStatusType == "saving" || writeStatusType == "removing") return
+        if (writeStatusType == "saving" || writeStatusType == "removing") return
+        if (fastTagAssignmentMode && hive.isDead) {
+            skipHiveInFastAssignment("the colony is marked dead")
+            return
+        }
+        if (fastTagAssignmentMode && !hive.tagUid.isNullOrBlank()) {
+            skipHiveInFastAssignment("it already has an NFC tag assigned")
+            return
+        }
+        if (hive.isDead) return
+        // Android can dispatch the just-written tag as an Intent while the next
+        // ReaderMode session is being armed. Own both paths for the whole transaction.
+        if (fastTagAssignmentMode) {
+            nfc.beginFastAssignmentFlow(activity)
+            onFastTagAssignmentStarted()
+        } else {
+            nfc.setPassiveReadingEnabled(activity, false)
+        }
         writeStatusType = "waiting"
         writeStatus = "Ready to scan. Hold your NFC tag against the back of your phone and keep it still."
         nfc.startWrite(
@@ -156,7 +183,17 @@ internal fun HiveDetailScreen(
                             } else {
                                 error ?: "The tag was written, but its hive assignment could not be saved."
                             }
-                            if (success && fastTagAssignmentMode) onFastTagAssignmentSuccess(result.uid)
+                            if (success) {
+                                // Suppress the completed tag on both passive and Intent
+                                // dispatch paths while the next hive's scanner is armed.
+                                nfc.rememberHandledUid(result.uid)
+                                nfc.suppressFastAssignmentUid(result.uid)
+                                if (fastTagAssignmentMode) {
+                                    onFastTagAssignmentSuccess(result.uid)
+                                } else {
+                                    nfc.setPassiveReadingEnabled(activity, true)
+                                }
+                            }
                         }
                     }
                     is NfcResult.Error -> {
@@ -172,21 +209,24 @@ internal fun HiveDetailScreen(
         )
     }
 
-    LaunchedEffect(hive.id, autoStartTagWriting) {
+    LaunchedEffect(hive.id, autoStartTagWriting, autoStartTagWritingIgnoreUid, fastTagAssignmentMode) {
         if (!autoStartTagWriting) return@LaunchedEffect
         if (!fastTagAssignmentMode) {
             onAutoTagWritingStarted()
             return@LaunchedEffect
         }
         if (hive.isDead) {
-            writeStatusType = "error"
-            writeStatus = "Fast tag assignment skipped this colony because it is marked dead."
+            skipHiveInFastAssignment("the colony is marked dead")
             onAutoTagWritingStarted()
         } else if (!hive.tagUid.isNullOrBlank()) {
-            writeStatusType = "error"
-            writeStatus = "Fast tag assignment stopped because this hive already has an NFC tag. No tag was overwritten."
+            skipHiveInFastAssignment("it already has an NFC tag assigned")
             onAutoTagWritingStarted()
         } else {
+            // Start the exclusive-flow guard before the delay as well. The old tag
+            // can generate an Android Intent during this gap on some Samsung devices.
+            if (fastTagAssignmentMode) nfc.beginFastAssignmentFlow(activity)
+            // Let the previous tag leave the antenna field before arming the next hive.
+            kotlinx.coroutines.delay(900L)
             startTagWriting(autoStartTagWritingIgnoreUid)
             onAutoTagWritingStarted()
         }
@@ -209,7 +249,7 @@ internal fun HiveDetailScreen(
         AlertDialog(
             onDismissRequest = { confirmDead = false },
             title = { Text("Mark colony dead?", fontWeight = FontWeight.ExtraBold) },
-            text = { Text("${hiveReferenceName(hive.number)} will move to colony history. All inspections, treatments, feedings, harvests and photos stay attached. Its NFC tag is released for reuse.") },
+            text = { Text("${hiveReferenceName(hive.number)} will move to colony history. All inspections, treatments, feedings and harvest records stay attached. Its NFC tag is released for reuse.") },
             confirmButton = { TextButton(onClick = { confirmDead = false; onMarkDead() }) { Text("MARK DEAD", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.error) } },
             dismissButton = { TextButton(onClick = { confirmDead = false }) { Text("CANCEL") } }
         )

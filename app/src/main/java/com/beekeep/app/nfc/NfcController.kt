@@ -33,7 +33,9 @@ sealed interface NfcResult {
     data class Read(
         val info: NfcTagInfo,
         val text: String?,
-        val launchPreparationError: String? = null
+        val launchPreparationError: String? = null,
+        val launchPreparationRetryable: Boolean = false,
+        internal val platformTag: Tag? = null
     ) : NfcResult {
         val uid: String get() = info.uid
     }
@@ -55,6 +57,7 @@ class NfcController {
     private val passiveLock = Any()
     @Volatile private var activityResumed = false
     @Volatile private var passiveReaderActive = false
+    @Volatile private var passiveReadsEnabled = true
     @Volatile private var passiveReadListener: ((NfcResult.Read) -> Unit)? = null
     @Volatile private var knownHiveIdByTagUid: Map<String, Long> = emptyMap()
     @Volatile private var knownAmbiguousTagUids: Set<String> = emptySet()
@@ -62,8 +65,19 @@ class NfcController {
     private var lastHandledUid: String? = null
     private var lastHandledAt = 0L
 
+    // Fast assignment owns the reader handoff between adjacent hives. Keep the UID
+    // just assigned blocked until a different physical tag is discovered.
+    @Volatile private var fastAssignmentIgnoredUid: String? = null
+    @Volatile private var fastAssignmentFlowActive: Boolean = false
+
+    // Unassigned-tag choice is a one-shot event, not an ongoing scan.
+    private var unassignedPromptActive: Boolean = false
+    private var unassignedPromptUid: String? = null
+    private var suppressedUnassignedUid: String? = null
+
     private companion object {
         const val PASSIVE_REPEAT_DELAY_MS = 1_800L
+        const val UNASSIGNED_TAG_REMOVE_DEBOUNCE_MS = 1_200
     }
 
     fun attach(activity: Activity) {
@@ -82,6 +96,179 @@ class NfcController {
         synchronized(passiveLock) {
             lastHandledUid = uid
             lastHandledAt = System.currentTimeMillis()
+        }
+    }
+
+    /** Generation captured before async repository work; stale results are discarded. */
+    fun passiveDeliveryToken(): Long = passiveReadGeneration.get()
+
+    fun canDispatchPassiveRead(token: Long, uid: String?): Boolean {
+        if (token != passiveReadGeneration.get() || !passiveReadsEnabled ||
+            fastAssignmentFlowActive || !activityResumed) return false
+        if (shouldSuppressUnassignedRead(uid)) return false
+        if (shouldIgnoreFastAssignmentUid(uid)) return false
+        return true
+    }
+
+    /**
+     * Start a one-shot unassigned-tag prompt. Invalidate in-flight reads and ask Android
+     * to ignore this physical tag until it has genuinely left the NFC field.
+     */
+    fun beginUnassignedTagPrompt(activity: Activity, uid: String, tag: Tag?) {
+        val normalized = NfcUid.normalize(uid) ?: return
+        synchronized(passiveLock) {
+            unassignedPromptActive = true
+            unassignedPromptUid = normalized
+            suppressedUnassignedUid = normalized
+            lastHandledUid = normalized
+            lastHandledAt = System.currentTimeMillis()
+            passiveReadGeneration.incrementAndGet()
+            passiveReadInFlight.set(false)
+        }
+
+        val nfcAdapter = adapter ?: activity.getSystemService(NfcManager::class.java)?.defaultAdapter
+        if (tag != null && nfcAdapter != null &&
+            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            val ignoreResult = runCatching {
+                nfcAdapter.ignore(
+                    tag,
+                    UNASSIGNED_TAG_REMOVE_DEBOUNCE_MS,
+                    NfcAdapter.OnTagRemovedListener {
+                        synchronized(passiveLock) {
+                            // A late callback for an older tag must not clear newer state.
+                            if (suppressedUnassignedUid == normalized) suppressedUnassignedUid = null
+                            if (lastHandledUid == normalized) {
+                                lastHandledUid = null
+                                lastHandledAt = 0L
+                            }
+                            if (unassignedPromptUid == normalized) unassignedPromptUid = null
+                            passiveReadGeneration.incrementAndGet()
+                        }
+                    },
+                    android.os.Handler(android.os.Looper.getMainLooper())
+                )
+            }
+            // ignore() returns false when the tag has already left the field. In that
+            // case there will be no removal callback, so release the latch now.
+            if (ignoreResult.getOrNull() == false) {
+                synchronized(passiveLock) {
+                    if (suppressedUnassignedUid == normalized) suppressedUnassignedUid = null
+                    if (lastHandledUid == normalized) {
+                        lastHandledUid = null
+                        lastHandledAt = 0L
+                    }
+                    if (unassignedPromptUid == normalized) unassignedPromptUid = null
+                }
+            }
+        }
+        setPassiveReadingEnabled(activity, false)
+    }
+
+    /** Releases the modal lock while preserving UID suppression until tag removal. */
+    fun finishUnassignedTagPrompt() {
+        synchronized(passiveLock) {
+            unassignedPromptActive = false
+            unassignedPromptUid = null
+            passiveReadInFlight.set(false)
+            passiveReadGeneration.incrementAndGet()
+        }
+    }
+
+    /** An explicit Scan tap is an intentional retry of the same physical tag. */
+    fun clearUnassignedPromptSuppressionForExplicitScan() {
+        synchronized(passiveLock) {
+            unassignedPromptActive = false
+            unassignedPromptUid = null
+            suppressedUnassignedUid = null
+            passiveReadInFlight.set(false)
+            passiveReadGeneration.incrementAndGet()
+        }
+    }
+
+    private fun isUnassignedPromptActive(): Boolean =
+        synchronized(passiveLock) { unassignedPromptActive }
+
+    private fun shouldSuppressUnassignedRead(uid: String?): Boolean {
+        val normalized = NfcUid.normalize(uid)
+        return synchronized(passiveLock) {
+            if (unassignedPromptActive) return@synchronized true
+            val blockedUid = suppressedUnassignedUid ?: return@synchronized false
+            if (normalized == blockedUid) {
+                true
+            } else {
+                // A different physical tag has arrived; release the dismissed UID latch.
+                if (normalized != null) suppressedUnassignedUid = null
+                false
+            }
+        }
+    }
+
+    /**
+     * Normal Android NFC intents can fire repeatedly while an unassigned tag remains
+     * against the phone. Share the passive reader's debounce so either delivery path
+     * wins once and duplicate reads refresh the suppression window.
+     *
+     * Returns true when this UID was handled within the repeat window.
+     */
+    fun shouldSuppressDuplicateIncomingRead(uid: String?): Boolean {
+        val normalized = NfcUid.normalize(uid) ?: return false
+        return synchronized(passiveLock) {
+            val now = System.currentTimeMillis()
+            val duplicate = lastHandledUid == normalized &&
+                now - lastHandledAt < PASSIVE_REPEAT_DELAY_MS
+            lastHandledUid = normalized
+            lastHandledAt = now
+            duplicate
+        }
+    }
+
+    fun suppressFastAssignmentUid(uid: String) {
+        val normalized = NfcUid.normalize(uid) ?: return
+        synchronized(passiveLock) {
+            fastAssignmentIgnoredUid = normalized
+        }
+    }
+
+    fun clearFastAssignmentIgnoredUid() {
+        synchronized(passiveLock) {
+            fastAssignmentIgnoredUid = null
+        }
+    }
+
+    /**
+     * Prevent system NFC intents and passive reads from interrupting the continuous
+     * write -> save -> next-hive transaction. This is separate from ReaderMode,
+     * because Android may dispatch an intent while ReaderMode is being re-armed.
+     */
+    fun beginFastAssignmentFlow(activity: Activity) {
+        fastAssignmentFlowActive = true
+        setPassiveReadingEnabled(activity, false)
+    }
+
+    fun finishFastAssignmentFlow(activity: Activity, preserveLastUid: Boolean) {
+        fastAssignmentFlowActive = false
+        if (!preserveLastUid) clearFastAssignmentIgnoredUid()
+        setPassiveReadingEnabled(activity, true)
+    }
+
+    fun shouldSuppressIncomingNfcIntent(uid: String?): Boolean {
+        if (fastAssignmentFlowActive || shouldSuppressUnassignedRead(uid)) return true
+        return shouldIgnoreFastAssignmentUid(uid)
+    }
+
+    private fun shouldIgnoreFastAssignmentUid(uid: String?): Boolean {
+        val normalized = NfcUid.normalize(uid) ?: return false
+        return synchronized(passiveLock) {
+            val blockedUid = fastAssignmentIgnoredUid
+            when {
+                blockedUid == null -> false
+                normalized == blockedUid -> true
+                else -> {
+                    // The next physical tag has arrived. It may now be handled normally.
+                    fastAssignmentIgnoredUid = null
+                    false
+                }
+            }
         }
     }
 
@@ -104,6 +291,33 @@ class NfcController {
     fun isEnabled(): Boolean = adapter?.isEnabled == true
     fun isScanning(): Boolean = active.get()
 
+    /**
+     * Explicit Scan and NFC Tag Management flows own their reads. Temporarily suspend
+     * passive reads there so a held tag cannot silently trigger a second write behind
+     * the retry/assignment UI.
+     */
+    fun setPassiveReadingEnabled(activity: Activity, enabled: Boolean) {
+        // Compose screen effects may request passive reading while a fast-write
+        // transaction is in progress. The transaction must retain exclusive NFC
+        // ownership until it explicitly finishes or is cancelled.
+        val effectiveEnabled = enabled && !fastAssignmentFlowActive
+        if (passiveReadsEnabled == effectiveEnabled) {
+            if (effectiveEnabled) enablePassiveIfNeeded(activity)
+            return
+        }
+        passiveReadsEnabled = effectiveEnabled
+        if (!enabled) {
+            synchronized(passiveLock) {
+                passiveReadGeneration.incrementAndGet()
+                passiveReadInFlight.set(false)
+            }
+            runCatching { adapter?.disableReaderMode(activity) }
+            passiveReaderActive = false
+        } else if (activityResumed) {
+            enablePassiveIfNeeded(activity)
+        }
+    }
+
     /** Update the local UID-to-hive index before automatic tag writes are allowed. */
     fun updateKnownHiveTags(
         hiveIdByTagUid: Map<String, Long>,
@@ -117,7 +331,15 @@ class NfcController {
             }
             .toMap()
         knownHiveTagsReady = ready
-        if (ready) attachedActivity?.takeIf { activityResumed }?.let(::enablePassiveIfNeeded)
+        if (ready) {
+            synchronized(passiveLock) {
+                // Once Create New Hive or Assign Existing succeeds, allow assigned-tag reads.
+                if (suppressedUnassignedUid?.let { knownHiveIdByTagUid.containsKey(it) } == true) {
+                    suppressedUnassignedUid = null
+                }
+            }
+            attachedActivity?.takeIf { activityResumed }?.let(::enablePassiveIfNeeded)
+        }
     }
 
     fun startRead(activity: Activity, onResult: (NfcResult) -> Unit) {
@@ -223,13 +445,20 @@ class NfcController {
         try {
             nfc.enableReaderMode(activity, { tag ->
                 if (!active.get() || sessionGeneration != scanGeneration.get()) return@enableReaderMode
+                val discoveredUid = runCatching { NfcUid.normalize(uid(tag)) }.getOrNull()
+                // Keep a controller-owned guard as well as the per-scan ignored UID, so
+                // a fast scan cannot process the prior hive's tag after a UI handoff.
+                if (shouldIgnoreFastAssignmentUid(discoveredUid)) return@enableReaderMode
                 // During fast assignment, ignore the previous UID without consuming this scan.
                 if (!ignoredUid.isNullOrBlank() &&
                     runCatching { NfcUid.matches(uid(tag), ignoredUid) }.getOrDefault(false)
                 ) return@enableReaderMode
                 if (delivered.compareAndSet(false, true)) {
-                    val result = runCatching { operation(tag) }
+                    val operationResult = runCatching { operation(tag) }
                         .getOrElse { e -> NfcResult.Error(friendlyError(e)) }
+                    val result = if (operationResult is NfcResult.Read) {
+                        operationResult.copy(platformTag = tag)
+                    } else operationResult
                     when (result) {
                         is NfcResult.Read -> rememberHandledUid(result.uid)
                         is NfcResult.Written -> rememberHandledUid(result.uid)
@@ -284,7 +513,7 @@ class NfcController {
             NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS
 
     private fun enablePassiveIfNeeded(activity: Activity) {
-        if (!activityResumed || active.get() || passiveReaderActive || !knownHiveTagsReady ||
+        if (!passiveReadsEnabled || !activityResumed || active.get() || passiveReaderActive || !knownHiveTagsReady ||
             passiveReadListener == null || activity.isFinishing || activity.isDestroyed) return
         val nfc = adapter ?: activity.getSystemService(NfcManager::class.java)?.defaultAdapter ?: return
         if (!nfc.isEnabled) return
@@ -292,21 +521,33 @@ class NfcController {
         try {
             nfc.enableReaderMode(activity, { tag ->
                 val readGeneration = passiveReadGeneration.get()
-                if (!activityResumed || active.get() ||
-                    !passiveReadInFlight.compareAndSet(false, true)) {
+                if (!activityResumed || active.get() || !passiveReadsEnabled || fastAssignmentFlowActive ||
+                    isUnassignedPromptActive() || !passiveReadInFlight.compareAndSet(false, true)) {
                     return@enableReaderMode
                 }
                 try {
-                    val result = runCatching {
+                    // A callback already in flight when passive reading was disabled
+                    // must not clear the fast-assignment UID latch.
+                    if (!passiveReadsEnabled || fastAssignmentFlowActive ||
+                        readGeneration != passiveReadGeneration.get()) {
+                        return@enableReaderMode
+                    }
+                    val discoveredUid = runCatching { NfcUid.normalize(uid(tag)) }.getOrNull()
+                    if (shouldSuppressUnassignedRead(discoveredUid) ||
+                        shouldIgnoreFastAssignmentUid(discoveredUid)) return@enableReaderMode
+                    val preparedResult = runCatching {
                         val readResult = read(tag)
                         if (readResult is NfcResult.Read) prepareTagForBeeKeep(tag, readResult) else readResult
                     }.getOrNull()
+                    val result = if (preparedResult is NfcResult.Read) {
+                        preparedResult.copy(platformTag = tag)
+                    } else preparedResult
                     if (result is NfcResult.Read) {
                         val shouldDeliver = synchronized(passiveLock) {
                             // A manual scan may have started while this passive read was
                             // connecting to the tag. Discard it rather than dispatching a
                             // stale second navigation after the manual result is handled.
-                            if (readGeneration != passiveReadGeneration.get()) {
+                            if (fastAssignmentFlowActive || readGeneration != passiveReadGeneration.get()) {
                                 false
                             } else {
                                 val now = System.currentTimeMillis()
@@ -325,6 +566,7 @@ class NfcController {
                         if (shouldDeliver) {
                             activity.runOnUiThread {
                                 if (readGeneration == passiveReadGeneration.get() &&
+                                    !fastAssignmentFlowActive && passiveReadsEnabled &&
                                     activityResumed && !active.get() &&
                                     !activity.isFinishing && !activity.isDestroyed) {
                                     passiveReadListener?.invoke(result)
@@ -385,11 +627,8 @@ class NfcController {
                 storedPayload = stored,
                 hasBeeKeepLaunchRecord = rawMessages.any(::isGenericBeeKeepLaunchMessage)
             )
-            val result = NfcResult.Read(info, stored)
-            // Cold-start intents should seed passive-repeat suppression, so a tag that
-            // remains at the antenna does not trigger a second navigation once resumed.
-            rememberHandledUid(result.uid)
-            return result
+            // MainActivity gates this event and passes the platform Tag to ignore().
+            return NfcResult.Read(info, stored, platformTag = fallbackTag)
         }
 
         // NDEF_DISCOVERED intents normally include their NDEF messages. If Android
@@ -406,9 +645,8 @@ class NfcController {
             ndefType = null,
             storedPayload = null
         )
-        val result = NfcResult.Read(info, null)
-        rememberHandledUid(result.uid)
-        return result
+        // MainActivity records accepted intents through the shared debounce gate.
+        return NfcResult.Read(info, null, platformTag = fallbackTag)
     }
 
     private fun uid(tag: Tag): String = tag.id.joinToString("") { "%02X".format(it.toInt() and 0xFF) }
@@ -572,7 +810,10 @@ class NfcController {
 
         return when (val written = write(tag, BeeKeepNfcPayload.TAG_PAYLOAD)) {
             is NfcResult.Written -> NfcResult.Read(written.info, BeeKeepNfcPayload.TAG_PAYLOAD)
-            is NfcResult.Error -> result.copy(launchPreparationError = written.message)
+            is NfcResult.Error -> result.copy(
+                launchPreparationError = written.message,
+                launchPreparationRetryable = true
+            )
             is NfcResult.Read -> result
         }
     }

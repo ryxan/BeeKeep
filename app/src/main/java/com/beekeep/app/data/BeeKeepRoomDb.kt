@@ -8,8 +8,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [ApiaryEntity::class, HiveEntity::class, InspectionEntity::class, FeedingEntity::class, TreatmentEntity::class, HarvestEntity::class, ActivityEventEntity::class, SyncOutboxEntity::class, TaskEntity::class, NfcTagAssignmentEntity::class],
-    version = 12,
+    entities = [ApiaryEntity::class, HiveEntity::class, InspectionEntity::class, FeedingEntity::class, TreatmentEntity::class, HarvestEntity::class, ActivityEventEntity::class, SyncOutboxEntity::class, TaskEntity::class, NfcTagAssignmentEntity::class, ActionBatchOutboxEntity::class, WorkspaceActionSettingsEntity::class, WorkspaceActionOutboxEntity::class, LocalDataAttachmentMarkerEntity::class],
+    version = 15,
     exportSchema = false
 )
 abstract class BeeKeepRoomDb : RoomDatabase() {
@@ -21,8 +21,12 @@ abstract class BeeKeepRoomDb : RoomDatabase() {
     abstract fun harvests(): HarvestDao
     abstract fun events(): EventDao
     abstract fun outbox(): OutboxDao
+    abstract fun actionBatchOutbox(): ActionBatchOutboxDao
+    abstract fun workspaceActionOutbox(): WorkspaceActionOutboxDao
+    abstract fun workspaceActionSettings(): WorkspaceActionSettingsDao
     abstract fun nfcTagAssignments(): NfcTagAssignmentDao
     abstract fun tasks(): TaskDao
+    abstract fun localDataAttachmentMarkers(): LocalDataAttachmentMarkerDao
 
     companion object {
         val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -292,13 +296,128 @@ abstract class BeeKeepRoomDb : RoomDatabase() {
             }
         }
 
-        @Volatile private var INSTANCE: BeeKeepRoomDb? = null
-        fun get(context: Context): BeeKeepRoomDb = INSTANCE ?: synchronized(this) {
-            INSTANCE ?: Room.databaseBuilder(context.applicationContext, BeeKeepRoomDb::class.java, "beekeep_room.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
-                .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-                .build()
-                .also { INSTANCE = it }
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Existing history is preserved. Legacy rows receive metadata IDs and retain
+                // created_at as occurred_at; apiary_id and batch_id are intentionally not guessed.
+                listOf("feeding_entries", "treatment_entries", "harvest_entries").forEach { table ->
+                    db.execSQL("ALTER TABLE `$table` ADD COLUMN record_uuid TEXT NOT NULL DEFAULT ''")
+                    db.execSQL("ALTER TABLE `$table` ADD COLUMN apiary_id INTEGER")
+                    db.execSQL("ALTER TABLE `$table` ADD COLUMN batch_id TEXT")
+                    db.execSQL("ALTER TABLE `$table` ADD COLUMN occurred_at INTEGER NOT NULL DEFAULT 0")
+                    db.execSQL("ALTER TABLE `$table` ADD COLUMN created_by TEXT")
+                    db.execSQL("ALTER TABLE `$table` ADD COLUMN device_id TEXT")
+                    db.execSQL("UPDATE `$table` SET occurred_at = created_at")
+                    db.query("SELECT id FROM `$table` WHERE record_uuid = ''").use { cursor ->
+                        while (cursor.moveToNext()) {
+                            db.execSQL(
+                                "UPDATE `$table` SET record_uuid = ? WHERE id = ?",
+                                arrayOf<Any?>(java.util.UUID.randomUUID().toString(), cursor.getLong(0))
+                            )
+                        }
+                    }
+                    db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_${table}_record_uuid` ON `$table` (record_uuid)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS `index_${table}_hive_id_occurred_at` ON `$table` (hive_id, occurred_at)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS `index_${table}_apiary_id_occurred_at` ON `$table` (apiary_id, occurred_at)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS `index_${table}_batch_id` ON `$table` (batch_id)")
+                }
+
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS action_batch_outbox (
+                        batch_id TEXT NOT NULL PRIMARY KEY,
+                        workspace_id TEXT,
+                        schema_version INTEGER NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        last_error TEXT
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_action_batch_outbox_state_created_at ON action_batch_outbox(state, created_at)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_action_batch_outbox_workspace_id_state ON action_batch_outbox(workspace_id, state)")
+
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS workspace_action_settings (
+                        scope_key TEXT NOT NULL PRIMARY KEY,
+                        workspace_id TEXT,
+                        owner_user_id TEXT,
+                        harvest_quantity_mode TEXT NOT NULL DEFAULT 'per_hive',
+                        updated_at INTEGER NOT NULL,
+                        updated_by TEXT,
+                        sync_state TEXT NOT NULL,
+                        last_error TEXT
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_workspace_action_settings_workspace_id ON workspace_action_settings(workspace_id)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_workspace_action_settings_owner_user_id ON workspace_action_settings(owner_user_id)")
+            }
         }
+
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS workspace_action_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        client_action_id TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL,
+                        entity_type TEXT NOT NULL,
+                        entity_id INTEGER NOT NULL,
+                        operation TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        action_at INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        last_error TEXT
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_workspace_action_outbox_client_action_id ON workspace_action_outbox(client_action_id)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_workspace_action_outbox_workspace_id_state_id ON workspace_action_outbox(workspace_id, state, id)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_workspace_action_outbox_workspace_id_entity_type_entity_id_action_at ON workspace_action_outbox(workspace_id, entity_type, entity_id, action_at)")
+            }
+        }
+
+        val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS local_data_attachment_markers (
+                        snapshot_sha256 TEXT NOT NULL PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        applied_at INTEGER NOT NULL
+                    )
+                """.trimIndent())
+            }
+        }
+
+        private val instances = mutableMapOf<String, BeeKeepRoomDb>()
+
+        fun get(context: Context): BeeKeepRoomDb = getNamed(context, "beekeep_room.db")
+
+        /**
+         * Team workspaces use a separate local Room file. The legacy database remains the
+         * personal/offline database, so changing teams never merges personal rows into a team.
+         */
+        fun getForWorkspace(context: Context, workspaceId: String?): BeeKeepRoomDb {
+            val cleanId = workspaceId?.trim()?.takeIf { it.isNotEmpty() } ?: return get(context)
+            require(cleanId.matches(Regex("[A-Za-z0-9-]{1,80}"))) { "Invalid workspace identifier" }
+            return getNamed(context, "beekeep_room_team_${cleanId}.db")
+        }
+
+        private fun getNamed(context: Context, databaseName: String): BeeKeepRoomDb =
+            synchronized(instances) {
+                instances[databaseName] ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    BeeKeepRoomDb::class.java,
+                    databaseName
+                )
+                    .addMigrations(
+                        MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+                        MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
+                        MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
+                        MIGRATION_14_15
+                    )
+                    .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+                    .build()
+                    .also { instances[databaseName] = it }
+            }
     }
 }

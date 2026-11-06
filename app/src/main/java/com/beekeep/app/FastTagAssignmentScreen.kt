@@ -7,14 +7,16 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
@@ -67,12 +69,17 @@ internal fun FastTagAssignmentScreen(
     var writeStage by remember(hive.id) { mutableStateOf("preparing") }
     var retryCount by remember(hive.id) { mutableIntStateOf(0) }
     var canRetry by remember(hive.id) { mutableStateOf(false) }
+    var autoRearmCount by remember(hive.id) { mutableIntStateOf(0) }
+    var rejectedUid by remember(hive.id) { mutableStateOf<String?>(null) }
     var failureTitle by remember(hive.id) { mutableStateOf("⚠ TAG NOT ASSIGNED") }
     // Keep an error latched across NFC-triggered Activity pause/resume events.
     // Otherwise the reader's resume effect can reset a warning before the user sees it.
     var failureSticky by remember(hive.id) { mutableStateOf(false) }
     var resumeGeneration by remember(hive.id) { mutableIntStateOf(0) }
     var skipInProgress by remember(hive.id) { mutableStateOf(false) }
+    // NFC adapter state is owned by Android, not Compose. Poll while this page is visible
+    // so the honeycomb indicator reacts immediately when NFC is toggled in system settings.
+    var nfcEnabled by remember(nfc) { mutableStateOf(nfc.isEnabled()) }
     val lifecycleOwner = LocalLifecycleOwner.current
     // NFC callbacks can outlive a recomposition. Keep the writer connected to the
     // latest hive list/assignment callbacks instead of an old captured snapshot.
@@ -81,6 +88,7 @@ internal fun FastTagAssignmentScreen(
     val latestOnHiveSkipped by rememberUpdatedState(onHiveSkipped)
     val latestOnAssignTag by rememberUpdatedState(onAssignTag)
     val latestOnAssignmentSaved by rememberUpdatedState(onAssignmentSaved)
+    val latestRejectedUid by rememberUpdatedState(rejectedUid)
 
     // NFC ReaderMode is cancelled when Android pauses the activity. If the tag's
     // NDEF launch briefly interrupts BeeKeep, re-arm the writer after we resume.
@@ -97,9 +105,18 @@ internal fun FastTagAssignmentScreen(
 
     BackHandler { onCancel() }
 
+    LaunchedEffect(nfc, lifecycleOwner) {
+        while (true) {
+            if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                nfcEnabled = nfc.isEnabled()
+            }
+            delay(250L)
+        }
+    }
+
     LaunchedEffect(hive.id, ignoredUid, retryCount, resumeGeneration) {
-        // On resume, preserve failures instead of silently re-arming and clearing them.
-        // Only an explicit Retry / Scan Another Tag action may reset this state.
+        // On resume, preserve failures long enough for the beekeeper to see them.
+        // Duplicate-tag warnings are cleared by the automatic re-arm effect below.
         if (skipInProgress || failureSticky) return@LaunchedEffect
         canRetry = false
         failureTitle = "⚠ TAG NOT ASSIGNED"
@@ -133,21 +150,26 @@ internal fun FastTagAssignmentScreen(
         } else {
             "Remove the previous tag, then present a new unassigned tag."
         }
-        delay(900L)
+        delay(if (retryCount == 0) 900L else 350L)
 
         // A tag may have been assigned while the reader handoff delay was running.
         // Recheck immediately before starting the physical NFC writer.
         if (!verifyTargetHive()) return@LaunchedEffect
 
         writeStage = "waiting"
-        // Leave the status area clear while scanning; it is reserved for warnings and results.
-        status = ""
+        // Keep the scanning instruction visible for the entire wait. It should not
+        // disappear after the short NFC handoff delay; the next result replaces it.
+        status = if (ignoredUid.isNullOrBlank()) {
+            "Hold the back of your phone near an unassigned NFC tag."
+        } else {
+            "Remove the previous tag, then hold the back of your phone near a new, unassigned tag."
+        }
         nfc.beginFastAssignmentFlow(activity)
         nfc.startWrite(
             activity = activity,
             text = BeeKeepNfcPayload.TAG_PAYLOAD,
             targetHiveId = hive.id,
-            ignoredUid = ignoredUid,
+            ignoredUid = latestRejectedUid ?: ignoredUid,
             isAssignedElsewhere = { candidateUid -> latestIsTagAssignedElsewhere(hive.id, candidateUid) },
             onResult = { result ->
                 when (result) {
@@ -173,39 +195,51 @@ internal fun FastTagAssignmentScreen(
                     }
                     is NfcResult.Read -> {
                         writeStage = "error"
-                        canRetry = true
                         failureSticky = true
                         val tagAlreadyAssigned = latestIsTagAssignedElsewhere(hive.id, result.uid)
                         failureTitle = if (tagAlreadyAssigned) {
+                            rejectedUid = result.uid
+                            canRetry = false
+                            autoRearmCount++
                             "⚠ TAG ALREADY ASSIGNED"
                         } else {
+                            canRetry = true
                             "⚠ TAG NOT ASSIGNED"
                         }
                         status = if (tagAlreadyAssigned) {
-                            "This tag is already assigned to another hive. Nothing was written or changed. Remove it and present an unassigned tag."
+                            "This tag is already assigned to another hive. Nothing was written or changed. Remove it and present a new, unassigned tag."
                         } else {
                             "The tag was detected but not written. Try a writable, unassigned NFC tag."
                         }
                     }
                     is NfcResult.Error -> {
                         writeStage = "error"
-                        canRetry = true
                         failureSticky = true
                         val tagAlreadyAssigned =
                             result.message.contains("assigned to another hive", ignoreCase = true) ||
                                 result.message.contains("already assigned", ignoreCase = true) ||
                                 result.message.contains("linked to multiple hive records", ignoreCase = true)
                         failureTitle = if (tagAlreadyAssigned) {
+                            if (!result.uid.isNullOrBlank()) {
+                                rejectedUid = result.uid
+                                canRetry = false
+                                autoRearmCount++
+                            } else {
+                                // If the reader could not identify the rejected UID, keep manual recovery
+                                // available rather than risking an immediate repeat of the same tag.
+                                canRetry = true
+                            }
                             "⚠ TAG ALREADY ASSIGNED"
                         } else {
+                            canRetry = true
                             "⚠ TAG NOT ASSIGNED"
                         }
                         status = if (!tagAlreadyAssigned) {
                             result.message
                         } else if (result.message.contains("multiple hive records", ignoreCase = true)) {
-                            "This NFC tag has conflicting hive assignments. Nothing was written. Repair the assignment in NFC Tag Management before using it."
+                            "This NFC tag has conflicting hive assignments. Nothing was written. Remove it and present a new tag; repair the conflict in NFC Tag Management before assigning it."
                         } else {
-                            "This NFC tag is already assigned to another hive. Nothing was written. Remove it and present an unassigned tag."
+                            "This NFC tag is already assigned to another hive. Nothing was written. Remove it and present a new, unassigned tag."
                         }
                     }
                 }
@@ -213,24 +247,68 @@ internal fun FastTagAssignmentScreen(
         )
     }
 
+    // A rejected tag should show its warning briefly, then return to scanning by itself.
+    // The UID stays blocked, so leaving the same tag against the phone cannot loop the warning.
+    LaunchedEffect(hive.id, autoRearmCount) {
+        if (autoRearmCount == 0) return@LaunchedEffect
+        delay(800L)
+        if (!skipInProgress) {
+            failureSticky = false
+            canRetry = false
+            retryCount++
+        }
+    }
+
+    val isFailure = writeStage == "error" || writeStage == "check_error"
+    val isActive = writeStage == "preparing" || writeStage == "waiting" || writeStage == "saving"
+    val statusContainer = when {
+        isFailure -> MaterialTheme.colorScheme.errorContainer
+        writeStage == "done" -> MaterialTheme.colorScheme.primaryContainer
+        writeStage == "waiting" -> MaterialTheme.colorScheme.secondaryContainer
+        else -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    val statusContent = when {
+        isFailure -> MaterialTheme.colorScheme.onErrorContainer
+        writeStage == "done" -> MaterialTheme.colorScheme.onPrimaryContainer
+        writeStage == "waiting" -> MaterialTheme.colorScheme.onSecondaryContainer
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val statusHeading = when (writeStage) {
+        "preparing" -> "CHECKING TARGET HIVE"
+        "waiting" -> "READY FOR TAG"
+        "saving" -> "SAVING ASSIGNMENT"
+        "done" -> "ASSIGNMENT SAVED"
+        "check_error" -> "⚠ HIVE CHECK FAILED"
+        "error" -> failureTitle
+        else -> "FAST TAG ASSIGNMENT"
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .safeDrawingPadding()
             .background(MaterialTheme.colorScheme.background)
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            OutlinedButton(onClick = onCancel) {
+            OutlinedButton(
+                onClick = onCancel,
+                modifier = Modifier.heightIn(min = 52.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
                 IconBack()
                 Text("Stop")
             }
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
                 Text(
                     "Fast Tag Assignment",
                     style = MaterialTheme.typography.titleLarge,
@@ -246,94 +324,118 @@ internal fun FastTagAssignmentScreen(
 
         Card(
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(28.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
         ) {
             Column(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
             ) {
                 Text(
-                    "CURRENT HIVE",
+                    "HIVE TO TAG",
                     style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
                     hiveReferenceName(hive.number),
-                    style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.ExtraBold
+                    style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
-                Text(
-                    hive.apiary,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
+                    androidx.compose.material3.Icon(
+                        imageVector = Icons.Rounded.Nfc,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Text(
+                        hive.apiary,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
             }
         }
 
-        Box(
-            modifier = Modifier.fillMaxWidth().weight(1f),
-            contentAlignment = Alignment.Center
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp),
+            colors = CardDefaults.cardColors(containerColor = statusContainer),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
         ) {
             Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 22.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(18.dp)
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                if (writeStage == "preparing" || writeStage == "waiting" || writeStage == "saving") {
+                if (isActive) {
                     HoneycombNfcIndicator(
-                        nfcEnabled = nfc.isEnabled(),
+                        nfcEnabled = nfcEnabled,
                         size = 112.dp
                     )
                 } else {
                     androidx.compose.material3.Icon(
-                        imageVector = if (writeStage == "done") Icons.Rounded.TaskAlt else Icons.Rounded.Nfc,
-                        contentDescription = null,
-                        tint = if (writeStage == "error" || writeStage == "check_error") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(62.dp)
-                    )
-                }
-                if (writeStage == "error") {
-                    Text(
-                        failureTitle,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.error,
-                        textAlign = TextAlign.Center
-                    )
-                } else if (writeStage == "check_error") {
-                    Text(
-                        "⚠ HIVE CHECK FAILED",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.error,
-                        textAlign = TextAlign.Center
-                    )
-                }
-                if (status.isNotBlank()) {
-                    Text(
-                        status,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        color = if (writeStage == "error" || writeStage == "check_error") {
-                            MaterialTheme.colorScheme.error
+                        imageVector = if (writeStage == "done") {
+                            Icons.Rounded.TaskAlt
                         } else {
-                            MaterialTheme.colorScheme.onSurface
-                        }
+                            Icons.Rounded.Nfc
+                        },
+                        contentDescription = null,
+                        tint = statusContent,
+                        modifier = Modifier.size(56.dp)
                     )
                 }
+
+                Text(
+                    statusHeading,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = statusContent,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    status,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = if (writeStage == "waiting" || isFailure) {
+                        FontWeight.SemiBold
+                    } else {
+                        FontWeight.Medium
+                    },
+                    textAlign = TextAlign.Center,
+                    color = statusContent
+                )
+
                 if (canRetry) {
-                    Button(onClick = {
-                        failureSticky = false
-                        retryCount++
-                    }) {
+                    Button(
+                        onClick = {
+                            failureSticky = false
+                            retryCount++
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 56.dp),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
                         Text(
                             when {
                                 writeStage == "check_error" -> "RETRY HIVE CHECK"
                                 failureTitle.contains("TAG ALREADY ASSIGNED") -> "SCAN ANOTHER TAG"
                                 else -> "RETRY TAG WRITE"
-                            }
+                            },
+                            fontWeight = FontWeight.ExtraBold
                         )
                     }
                 }
@@ -341,11 +443,13 @@ internal fun FastTagAssignmentScreen(
         }
 
         Text(
-            "Fast tag assignment can make mistakes.",
+            "Use a writable, unassigned tag. Keep it near the back of your phone until BeeKeep confirms the assignment.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 2.dp)
         )
     }
 }

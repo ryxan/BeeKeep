@@ -42,7 +42,7 @@ sealed interface NfcResult {
     data class Written(val info: NfcTagInfo) : NfcResult {
         val uid: String get() = info.uid
     }
-    data class Error(val message: String) : NfcResult
+    data class Error(val message: String, val uid: String? = null) : NfcResult
 }
 
 class NfcController {
@@ -59,6 +59,11 @@ class NfcController {
     @Volatile private var passiveReaderActive = false
     @Volatile private var passiveReadsEnabled = true
     @Volatile private var passiveReadListener: ((NfcResult.Read) -> Unit)? = null
+    // Entitlement is resolved by the active data scope in BeeKeepApp. Default deny
+    // until the personal account or selected workspace has been verified.
+    @Volatile private var entitlementScopeKey: String? = null
+    @Volatile private var entitlementAllowsNfc: Boolean = false
+    @Volatile private var entitlementAllowsTagManagement: Boolean = false
     @Volatile private var knownHiveIdByTagUid: Map<String, Long> = emptyMap()
     @Volatile private var knownAmbiguousTagUids: Set<String> = emptySet()
     @Volatile private var knownHiveTagsReady: Boolean = false
@@ -83,6 +88,42 @@ class NfcController {
     fun attach(activity: Activity) {
         attachedActivity = activity
         adapter = activity.getSystemService(NfcManager::class.java)?.defaultAdapter
+    }
+
+    /**
+     * Applies the verified permissions for the selected data scope.
+     * Viewers may scan existing tags but cannot write to a physical tag or
+     * change the assignment ledger.
+     */
+    fun setEntitlementAccess(
+        accessScopeKey: String,
+        canScan: Boolean,
+        canManageTags: Boolean
+    ) {
+        val scopeChanged = entitlementScopeKey != accessScopeKey
+        val wasAllowedToManageTags = entitlementAllowsTagManagement
+        entitlementScopeKey = accessScopeKey
+        entitlementAllowsNfc = canScan
+        entitlementAllowsTagManagement = canScan && canManageTags
+
+        // A scan/write started in one dataset must never finish after the user
+        // switches to another dataset, or after writable NFC access is revoked.
+        if (scopeChanged || !canScan || (wasAllowedToManageTags && !entitlementAllowsTagManagement)) {
+            scanGeneration.incrementAndGet()
+            active.set(false)
+            passiveReadGeneration.incrementAndGet()
+            passiveReadInFlight.set(false)
+            fastAssignmentFlowActive = false
+            clearFastAssignmentIgnoredUid()
+            attachedActivity?.let { activity ->
+                runCatching { adapter?.disableReaderMode(activity) }
+                passiveReaderActive = false
+            }
+        }
+
+        if (canScan) {
+            attachedActivity?.takeIf { activityResumed }?.let(::enablePassiveIfNeeded)
+        }
     }
 
     /** Receives passive reads after the local UID-to-hive index is ready. */
@@ -241,6 +282,10 @@ class NfcController {
      * because Android may dispatch an intent while ReaderMode is being re-armed.
      */
     fun beginFastAssignmentFlow(activity: Activity) {
+        if (!entitlementAllowsTagManagement) {
+            fastAssignmentFlowActive = false
+            return
+        }
         fastAssignmentFlowActive = true
         setPassiveReadingEnabled(activity, false)
     }
@@ -300,7 +345,7 @@ class NfcController {
         // Compose screen effects may request passive reading while a fast-write
         // transaction is in progress. The transaction must retain exclusive NFC
         // ownership until it explicitly finishes or is cancelled.
-        val effectiveEnabled = enabled && !fastAssignmentFlowActive
+        val effectiveEnabled = enabled && !fastAssignmentFlowActive && entitlementAllowsNfc
         if (passiveReadsEnabled == effectiveEnabled) {
             if (effectiveEnabled) enablePassiveIfNeeded(activity)
             return
@@ -342,16 +387,33 @@ class NfcController {
         }
     }
 
+    /**
+     * Check ownership using the same reconciled ledger/cache snapshot as NFC writes.
+     * Callers should not separately inspect Hive.tagUid, because old cached values
+     * can outlive a released assignment and otherwise produce false duplicate warnings.
+     */
+    fun isTagAssignedElsewhere(targetHiveId: Long, uid: String): Boolean {
+        val normalized = NfcUid.normalize(uid) ?: return false
+        if (normalized in knownAmbiguousTagUids) return true
+        val ownerHiveId = knownHiveIdByTagUid[normalized] ?: return false
+        return ownerHiveId != targetHiveId
+    }
+
     fun startRead(activity: Activity, onResult: (NfcResult) -> Unit) {
         start(activity, { tag -> read(tag) }, onResult)
     }
 
     /** Reads the tag, writing BeeKeep launch data immediately for blank/unassigned tags. */
     fun startReadAndPrepareForBeeKeep(activity: Activity, onResult: (NfcResult) -> Unit) {
-        start(activity, { tag ->
-            val result = read(tag)
-            if (result is NfcResult.Read) prepareTagForBeeKeep(tag, result) else result
-        }, onResult)
+        start(
+            activity = activity,
+            operation = { tag ->
+                val result = read(tag)
+                if (result is NfcResult.Read) prepareTagForBeeKeep(tag, result) else result
+            },
+            onResult = onResult,
+            requiresTagManagement = true
+        )
     }
 
     /**
@@ -386,7 +448,7 @@ class NfcController {
                     read(tag)
                 else -> write(tag, text)
             }
-        }, onResult)
+        }, onResult, requiresTagManagement = true)
     }
 
     fun startWrite(
@@ -405,24 +467,33 @@ class NfcController {
                 scannedUid == null ->
                     NfcResult.Error("This tag does not expose a valid NFC UID. Nothing was written.")
                 expectedUid != null && !NfcUid.matches(scannedUid, expectedUid) ->
-                    NfcResult.Error("This is tag $scannedUid, not the assigned tag $expectedUid. Hold the same tag to write BeeKeep launch data.")
+                    NfcResult.Error("This is tag $scannedUid, not the assigned tag $expectedUid. Hold the same tag to write BeeKeep launch data.", uid = scannedUid)
                 !allowConfirmedAssignment && scannedUid in knownAmbiguousTagUids ->
-                    NfcResult.Error("This NFC UID is linked to multiple hive records. Nothing was written. Repair or confirm the assignment first.")
+                    NfcResult.Error("This NFC UID is linked to multiple hive records. Nothing was written. Repair or confirm the assignment first.", uid = scannedUid)
                 !allowConfirmedAssignment && knownHiveIdByTagUid[scannedUid] != null && knownHiveIdByTagUid[scannedUid] != targetHiveId ->
-                    NfcResult.Error("This NFC tag is assigned to another hive. Nothing was written. Use NFC Tag Management to confirm reassignment.")
+                    NfcResult.Error("This NFC tag is assigned to another hive. Nothing was written. Use NFC Tag Management to confirm reassignment.", uid = scannedUid)
                 !allowConfirmedAssignment && isAssignedElsewhere(scannedUid) ->
-                    NfcResult.Error("This NFC tag is assigned to another hive. Nothing was written. Use NFC Tag Management to confirm any reassignment.")
+                    NfcResult.Error("This NFC tag is assigned to another hive. Nothing was written. Use NFC Tag Management to confirm any reassignment.", uid = scannedUid)
                 else -> write(tag, text)
             }
-        }, onResult, ignoredUid)
+        }, onResult, ignoredUid, requiresTagManagement = true)
     }
 
     private fun start(
         activity: Activity,
         operation: (Tag) -> NfcResult,
         onResult: (NfcResult) -> Unit,
-        ignoredUid: String? = null
+        ignoredUid: String? = null,
+        requiresTagManagement: Boolean = false
     ) {
+        if (!entitlementAllowsNfc) {
+            onResult(NfcResult.Error("NFC is not available for the currently selected BeeKeep data scope. Verify the personal plan or workspace owner's Commercial access."))
+            return
+        }
+        if (requiresTagManagement && !entitlementAllowsTagManagement) {
+            onResult(NfcResult.Error("Your workspace role allows NFC scanning and verification but not tag assignment or physical tag writes."))
+            return
+        }
         val nfc = adapter ?: activity.getSystemService(NfcManager::class.java)?.defaultAdapter
         if (nfc == null) { onResult(NfcResult.Error("This phone does not have NFC.")); return }
         if (!nfc.isEnabled) { onResult(NfcResult.Error("NFC is turned off. Turn it on in Settings and try again.")); return }
@@ -513,6 +584,11 @@ class NfcController {
             NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS
 
     private fun enablePassiveIfNeeded(activity: Activity) {
+        if (!entitlementAllowsNfc) {
+            runCatching { adapter?.disableReaderMode(activity) }
+            passiveReaderActive = false
+            return
+        }
         if (!passiveReadsEnabled || !activityResumed || active.get() || passiveReaderActive || !knownHiveTagsReady ||
             passiveReadListener == null || activity.isFinishing || activity.isDestroyed) return
         val nfc = adapter ?: activity.getSystemService(NfcManager::class.java)?.defaultAdapter ?: return
@@ -537,7 +613,13 @@ class NfcController {
                         shouldIgnoreFastAssignmentUid(discoveredUid)) return@enableReaderMode
                     val preparedResult = runCatching {
                         val readResult = read(tag)
-                        if (readResult is NfcResult.Read) prepareTagForBeeKeep(tag, readResult) else readResult
+                        if (readResult is NfcResult.Read && entitlementAllowsTagManagement) {
+                            prepareTagForBeeKeep(tag, readResult)
+                        } else {
+                            // Viewers can read existing assignments, but a passive
+                            // scan must never write launch data to an unassigned tag.
+                            readResult
+                        }
                     }.getOrNull()
                     val result = if (preparedResult is NfcResult.Read) {
                         preparedResult.copy(platformTag = tag)

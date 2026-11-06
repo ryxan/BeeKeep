@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -16,7 +17,9 @@ interface ApiaryDao {
     suspend fun get(id: Long): ApiaryEntity?
     @Query("SELECT * FROM apiaries WHERE name = :name COLLATE NOCASE LIMIT 1")
     suspend fun byName(name: String): ApiaryEntity?
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    // Use UPDATE-then-INSERT instead of REPLACE: replacing a parent row fires
+    // ON DELETE SET NULL for every hive currently linked to this apiary.
+    @Upsert
     suspend fun upsert(entity: ApiaryEntity)
     @Query("DELETE FROM apiaries WHERE id = :id")
     suspend fun hardDelete(id: Long)
@@ -32,6 +35,8 @@ interface HiveDao {
     fun observeAll(): Flow<List<HiveEntity>>
     @Query("SELECT * FROM hives WHERE deleted = 0 AND status != 'ACTIVE' ORDER BY dead_at DESC")
     fun observeDead(): Flow<List<HiveEntity>>
+    @Query("SELECT * FROM hives WHERE id = :id AND deleted = 0")
+    fun observeById(id: Long): Flow<HiveEntity?>
     @Query("SELECT * FROM hives WHERE id = :id AND deleted = 0")
     suspend fun get(id: Long): HiveEntity?
     @Query("SELECT * FROM hives WHERE apiary_id = :apiaryId OR (apiary_id IS NULL AND apiary = :oldName COLLATE NOCASE)")
@@ -50,7 +55,10 @@ interface HiveDao {
     suspend fun clearAll()
     @Query("UPDATE hives SET tag_uid = (SELECT tag_uid FROM nfc_tag_assignments WHERE hive_id = :hiveId AND unassigned_at IS NULL ORDER BY assigned_at DESC, id DESC LIMIT 1) WHERE id = :hiveId")
     suspend fun refreshTagCache(hiveId: Long)
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    // REPLACE deletes then reinserts the hive row, which fires ON DELETE CASCADE
+    // and can silently erase its inspections, feeding, treatments, harvests, events,
+    // and NFC assignment history during a cloud profile refresh.
+    @Upsert
     suspend fun upsert(entity: HiveEntity)
 }
 
@@ -111,11 +119,11 @@ interface NfcTagAssignmentDao {
 interface InspectionDao {
     @Query("SELECT * FROM inspections ORDER BY id")
     suspend fun allForBackup(): List<InspectionEntity>
-    @Query("SELECT * FROM inspections WHERE hive_id = :hiveId ORDER BY created_at DESC")
+    @Query("SELECT * FROM inspections WHERE hive_id = :hiveId ORDER BY created_at DESC, id DESC")
     fun observeForHive(hiveId: Long): Flow<List<InspectionEntity>>
-    @Query("SELECT * FROM inspections ORDER BY created_at DESC")
+    @Query("SELECT * FROM inspections ORDER BY created_at DESC, id DESC")
     fun observeAll(): Flow<List<InspectionEntity>>
-    @Query("SELECT * FROM inspections WHERE hive_id = :hiveId ORDER BY created_at DESC LIMIT 1")
+    @Query("SELECT * FROM inspections WHERE hive_id = :hiveId ORDER BY created_at DESC, id DESC LIMIT 1")
     suspend fun latest(hiveId: Long): InspectionEntity?
     @Query("SELECT * FROM inspections WHERE id = :id")
     suspend fun get(id: Long): InspectionEntity?
@@ -133,9 +141,9 @@ interface InspectionDao {
 interface FeedingDao {
     @Query("SELECT * FROM feeding_entries ORDER BY id")
     suspend fun allForBackup(): List<FeedingEntity>
-    @Query("SELECT * FROM feeding_entries WHERE hive_id = :hiveId ORDER BY created_at DESC")
+    @Query("SELECT * FROM feeding_entries WHERE hive_id = :hiveId ORDER BY occurred_at DESC, id DESC")
     fun observeForHive(hiveId: Long): Flow<List<FeedingEntity>>
-    @Query("SELECT * FROM feeding_entries ORDER BY created_at DESC")
+    @Query("SELECT * FROM feeding_entries ORDER BY occurred_at DESC, id DESC")
     fun observeAll(): Flow<List<FeedingEntity>>
     @Query("SELECT * FROM feeding_entries WHERE id = :id")
     suspend fun get(id: Long): FeedingEntity?
@@ -153,9 +161,9 @@ interface FeedingDao {
 interface TreatmentDao {
     @Query("SELECT * FROM treatment_entries ORDER BY id")
     suspend fun allForBackup(): List<TreatmentEntity>
-    @Query("SELECT * FROM treatment_entries WHERE hive_id = :hiveId ORDER BY created_at DESC")
+    @Query("SELECT * FROM treatment_entries WHERE hive_id = :hiveId ORDER BY occurred_at DESC, id DESC")
     fun observeForHive(hiveId: Long): Flow<List<TreatmentEntity>>
-    @Query("SELECT * FROM treatment_entries ORDER BY created_at DESC")
+    @Query("SELECT * FROM treatment_entries ORDER BY occurred_at DESC, id DESC")
     fun observeAll(): Flow<List<TreatmentEntity>>
     @Query("SELECT * FROM treatment_entries WHERE id = :id")
     suspend fun get(id: Long): TreatmentEntity?
@@ -173,9 +181,9 @@ interface TreatmentDao {
 interface HarvestDao {
     @Query("SELECT * FROM harvest_entries ORDER BY id")
     suspend fun allForBackup(): List<HarvestEntity>
-    @Query("SELECT * FROM harvest_entries WHERE hive_id = :hiveId ORDER BY created_at DESC")
+    @Query("SELECT * FROM harvest_entries WHERE hive_id = :hiveId ORDER BY occurred_at DESC, id DESC")
     fun observeForHive(hiveId: Long): Flow<List<HarvestEntity>>
-    @Query("SELECT * FROM harvest_entries ORDER BY created_at DESC")
+    @Query("SELECT * FROM harvest_entries ORDER BY occurred_at DESC, id DESC")
     fun observeAll(): Flow<List<HarvestEntity>>
     @Query("SELECT * FROM harvest_entries WHERE id = :id")
     suspend fun get(id: Long): HarvestEntity?
@@ -213,9 +221,29 @@ interface EventDao {
 interface OutboxDao {
     @Query("SELECT * FROM sync_outbox WHERE state = 'pending' ORDER BY created_at, id")
     suspend fun allPendingForReset(): List<SyncOutboxEntity>
+
+    /** Full local-only copy for a recovery snapshot; this does not acknowledge or mutate rows. */
+    @Query("SELECT * FROM sync_outbox ORDER BY created_at, id")
+    suspend fun allForAttachmentSnapshot(): List<SyncOutboxEntity>
     @Query("DELETE FROM sync_outbox")
     suspend fun clearAll()
-    @Query("SELECT * FROM sync_outbox WHERE state = 'pending' ORDER BY created_at, id LIMIT :limit")
+    @Query("""
+        SELECT * FROM sync_outbox
+        WHERE state = 'pending'
+        ORDER BY CASE entity_type
+            WHEN 'inspection_note_draft' THEN 0
+            WHEN 'inspection' THEN 1
+            WHEN 'feeding' THEN 1
+            WHEN 'treatment' THEN 1
+            WHEN 'harvest' THEN 1
+            WHEN 'event' THEN 1
+            WHEN 'apiary' THEN 2
+            WHEN 'nfc_assignment' THEN 3
+            WHEN 'hive' THEN 4
+            ELSE 5
+        END, created_at, id
+        LIMIT :limit
+    """)
     suspend fun pending(limit: Int = 50): List<SyncOutboxEntity>
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun enqueue(entity: SyncOutboxEntity)
@@ -223,13 +251,113 @@ interface OutboxDao {
     suspend fun deletePendingForEntity(entityType: String, entityId: Long)
     @Query("UPDATE sync_outbox SET state = :state, last_error = :error WHERE id = :id")
     suspend fun setState(id: Long, state: String, error: String? = null)
+    @Query("UPDATE sync_outbox SET state = 'done', last_error = NULL WHERE id IN (:ids)")
+    suspend fun markDone(ids: List<Long>)
+
+    @Query("UPDATE sync_outbox SET state = 'attachment_held', last_error = 'Preserved during account attachment; never replayed automatically.' WHERE state = 'pending'")
+    suspend fun holdPendingForAttachment()
     @Query("DELETE FROM sync_outbox WHERE state = 'done' AND created_at < :cutoff")
     suspend fun pruneDone(cutoff: Long)
 }
 
 
 @Dao
+interface WorkspaceActionOutboxDao {
+    /** Full local-only copy for a recovery snapshot; rows remain in the outbox. */
+    @Query("SELECT * FROM workspace_action_outbox ORDER BY id")
+    suspend fun allForAttachmentSnapshot(): List<WorkspaceActionOutboxEntity>
+
+    @Query("""
+        SELECT * FROM workspace_action_outbox
+        WHERE workspace_id = :workspaceId AND state = 'pending'
+        ORDER BY id
+        LIMIT :limit
+    """)
+    suspend fun pending(workspaceId: String, limit: Int = 50): List<WorkspaceActionOutboxEntity>
+
+    @Query("""
+        SELECT MAX(action_at) FROM workspace_action_outbox
+        WHERE workspace_id = :workspaceId
+          AND entity_type = :entityType
+          AND entity_id = :entityId
+    """)
+    suspend fun latestActionAt(workspaceId: String, entityType: String, entityId: Long): Long?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun enqueue(action: WorkspaceActionOutboxEntity)
+
+    @Query("UPDATE workspace_action_outbox SET state = 'done', last_error = NULL WHERE id IN (:ids)")
+    suspend fun markDone(ids: List<Long>)
+
+    @Query("UPDATE workspace_action_outbox SET state = 'pending', last_error = :error WHERE id IN (:ids)")
+    suspend fun markPendingWithError(ids: List<Long>, error: String)
+
+    @Query("SELECT COUNT(*) FROM workspace_action_outbox WHERE workspace_id = :workspaceId AND state = 'pending'")
+    suspend fun pendingCount(workspaceId: String): Int
+
+    @Query("DELETE FROM workspace_action_outbox WHERE state = 'done' AND created_at < :cutoff")
+    suspend fun pruneDone(cutoff: Long)
+
+    @Query("UPDATE workspace_action_outbox SET state = 'attachment_held', last_error = 'Preserved during account attachment; never replayed automatically.' WHERE state = 'pending'")
+    suspend fun holdPendingForAttachment()
+
+    @Query("DELETE FROM workspace_action_outbox")
+    suspend fun clearAll()
+}
+
+@Dao
+interface ActionBatchOutboxDao {
+    /** Full local-only copy for a recovery snapshot; rows remain in the outbox. */
+    @Query("SELECT * FROM action_batch_outbox ORDER BY created_at, batch_id")
+    suspend fun allForAttachmentSnapshot(): List<ActionBatchOutboxEntity>
+
+    @Query("SELECT * FROM action_batch_outbox WHERE state = 'pending' ORDER BY created_at, batch_id LIMIT :limit")
+    suspend fun pending(limit: Int = 20): List<ActionBatchOutboxEntity>
+
+    @Query("SELECT * FROM action_batch_outbox WHERE batch_id = :batchId")
+    suspend fun get(batchId: String): ActionBatchOutboxEntity?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun enqueue(batch: ActionBatchOutboxEntity)
+
+    @Query("UPDATE action_batch_outbox SET state = :state, last_error = :error WHERE batch_id = :batchId")
+    suspend fun setState(batchId: String, state: String, error: String? = null)
+
+    @Query("DELETE FROM action_batch_outbox WHERE batch_id = :batchId AND state = 'done'")
+    suspend fun deleteCompleted(batchId: String)
+
+    @Query("SELECT COUNT(*) FROM action_batch_outbox WHERE state = 'pending'")
+    fun observePendingCount(): Flow<Int>
+    @Query("UPDATE action_batch_outbox SET state = 'attachment_held', last_error = 'Preserved during account attachment; never replayed automatically.' WHERE state = 'pending'")
+    suspend fun holdPendingForAttachment()
+
+    @Query("DELETE FROM action_batch_outbox")
+    suspend fun clearAll()
+}
+
+@Dao
+interface WorkspaceActionSettingsDao {
+    @Query("SELECT * FROM workspace_action_settings ORDER BY scope_key")
+    suspend fun allForAttachmentSnapshot(): List<WorkspaceActionSettingsEntity>
+
+    @Query("SELECT * FROM workspace_action_settings WHERE scope_key = :scopeKey LIMIT 1")
+    suspend fun get(scopeKey: String): WorkspaceActionSettingsEntity?
+
+    @Query("SELECT * FROM workspace_action_settings WHERE scope_key = :scopeKey LIMIT 1")
+    fun observe(scopeKey: String): Flow<WorkspaceActionSettingsEntity?>
+
+    @Upsert
+    suspend fun upsert(settings: WorkspaceActionSettingsEntity)
+
+    @Query("UPDATE workspace_action_settings SET sync_state = :state, last_error = :error WHERE scope_key = :scopeKey")
+    suspend fun setSyncState(scopeKey: String, state: String, error: String? = null)
+}
+
+@Dao
 interface TaskDao {
+    @Query("SELECT * FROM tasks ORDER BY id")
+    suspend fun allForBackup(): List<TaskEntity>
+
     @Query("SELECT * FROM tasks ORDER BY due_at DESC")
     fun observeAll(): Flow<List<TaskEntity>>
 
@@ -243,4 +371,14 @@ interface TaskDao {
     suspend fun upsert(entity: TaskEntity)
     @Query("DELETE FROM tasks")
     suspend fun clearAll()
+}
+
+
+@Dao
+interface LocalDataAttachmentMarkerDao {
+    @Query("SELECT * FROM local_data_attachment_markers WHERE snapshot_sha256 = :snapshotSha256 LIMIT 1")
+    suspend fun get(snapshotSha256: String): LocalDataAttachmentMarkerEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(marker: LocalDataAttachmentMarkerEntity)
 }

@@ -2,8 +2,10 @@ package com.beekeep.app
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -15,6 +17,24 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material.icons.rounded.CalendarMonth
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.MedicalServices
+import androidx.compose.material.icons.rounded.Scale
+import androidx.compose.material.icons.rounded.WaterDrop
+import androidx.compose.material3.Divider
+import androidx.compose.material3.Surface
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.Locale
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -22,7 +42,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Yard
 import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
@@ -34,6 +56,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -44,6 +67,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.beekeep.app.data.ActivityEvent
+import com.beekeep.app.data.Feeding
 import com.beekeep.app.data.Harvest
 import com.beekeep.app.data.Hive
 import com.beekeep.app.data.Treatment
@@ -53,9 +77,21 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 
 @Composable
-internal fun HiveRow(hive: Hive, supporting: String? = null, compact: Boolean = false, onClick: () -> Unit) {
-    // The Apiaries hive list now highlights the colony's strength rather than mite percentage.
-    val strengthGrade = ColonyStrength.gradeFromStored(hive.strength)
+internal fun HiveRow(
+    number: String,
+    apiary: String,
+    queenStatus: String,
+    strength: Int,
+    beeCountFrames: Double?,
+    supporting: String? = null,
+    compact: Boolean = false,
+    locked: Boolean = false,
+    onClick: () -> Unit
+) {
+    // Keep the row dependent only on the values it actually displays. When Room
+    // emits a refreshed hive list, unchanged rows can then be skipped by Compose.
+    // The Apiaries hive list highlights colony strength rather than mite percentage.
+    val strengthGrade = ColonyStrength.gradeFromStored(strength)
     val strengthColor = when (strengthGrade) {
         1 -> Color(0xFFB91C1C) // Very Weak: red
         2 -> Color(0xFFEA580C) // Weak: orange
@@ -63,7 +99,7 @@ internal fun HiveRow(hive: Hive, supporting: String? = null, compact: Boolean = 
         4 -> Color(0xFF65A30D) // Strong: light green
         else -> Color(0xFF166534) // Very strong: dark green
     }
-    val attention = hive.queenStatus == "Queenless" || strengthGrade <= 2
+    val attention = queenStatus == "Queenless" || strengthGrade <= 2
     Card(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
@@ -75,39 +111,112 @@ internal fun HiveRow(hive: Hive, supporting: String? = null, compact: Boolean = 
         ),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = if (compact) 10.dp else 15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 3.dp)) {
-                Text(hiveDisplayName(hive.number), fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
-                Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text(
-                    hive.beeCountFrames?.let { frames ->
-                        "Queen ${hive.queenStatus} ~ ${formatBeeCountFrames(frames)} Frames of Bees"
-                    } ?: "Queen ${hive.queenStatus}",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall
-                )
-                supporting?.let { Text(it, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
-            }
-            Column(
-                Modifier.padding(horizontal = 4.dp, vertical = if (compact) 2.dp else 4.dp),
-                horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+        Box(Modifier.fillMaxWidth()) {
+            Row(
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 13.dp, vertical = if (compact) 10.dp else 15.dp)
+                    .padding(end = if (locked) 18.dp else 0.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    ColonyStrength.labelForGrade(strengthGrade),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = strengthColor,
-                    maxLines = 1
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 3.dp)) {
+                    Text(hiveDisplayName(number), fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
+                    Text(apiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        beeCountFrames?.let { frames ->
+                            "Queen $queenStatus ~ ${formatBeeCountFrames(frames)} Frames of Bees"
+                        } ?: "Queen $queenStatus",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    supporting?.let { Text(it, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium) }
+                }
+                Column(
+                    Modifier.padding(horizontal = 4.dp, vertical = if (compact) 2.dp else 4.dp),
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        ColonyStrength.labelForGrade(strengthGrade),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = strengthColor,
+                        maxLines = 1
+                    )
+                    Icon(Icons.Rounded.ChevronRight, "Open hive", tint = Color(0xFF78350F))
+                }
+            }
+            if (locked) {
+                Icon(
+                    Icons.Rounded.Lock,
+                    contentDescription = "Locked hive",
+                    tint = Color(0xFFB45309),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 7.dp, end = 7.dp).size(16.dp)
                 )
-                Icon(Icons.Rounded.ChevronRight, "Open hive", tint = Color(0xFF78350F))
+            }
+        }
+    }
+}
+
+
+@Composable
+internal fun LockedHiveScreen(
+    hiveName: String,
+    message: String,
+    canUpgrade: Boolean = true,
+    onBack: () -> Unit,
+    onUpgrade: () -> Unit
+) {
+    BackHandler { onBack() }
+    Box(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(
+                Modifier.fillMaxWidth().padding(22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Icon(
+                    Icons.Rounded.Lock,
+                    contentDescription = "Hive locked",
+                    tint = Color(0xFFB45309),
+                    modifier = Modifier.size(42.dp)
+                )
+                Text("Upgrade BeeKeep", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+                Text(
+                    message,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (canUpgrade) {
+                    Button(onClick = onUpgrade, modifier = Modifier.fillMaxWidth()) {
+                        Text("UPGRADE TO COMMERCIAL")
+                    }
+                } else {
+                    Text(
+                        "ASK THE WORKSPACE OWNER TO RENEW COMMERCIAL",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                TextButton(onClick = onBack) { Text("BACK TO HIVES") }
             }
         }
     }
 }
 
 @Composable
-internal fun ColonyHistoryScreen(deadHives: List<Hive>, padding: androidx.compose.foundation.layout.PaddingValues, onBack: () -> Unit, onOpenHive: (Long) -> Unit) {
+internal fun ColonyHistoryScreen(
+    deadHives: List<Hive>,
+    lockedHiveIds: Set<Long> = emptySet(),
+    padding: androidx.compose.foundation.layout.PaddingValues,
+    onBack: () -> Unit,
+    onOpenHive: (Long) -> Unit
+) {
     BackHandler { onBack() }
     Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -135,7 +244,17 @@ internal fun ColonyHistoryScreen(deadHives: List<Hive>, padding: androidx.compos
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
-                            Icon(Icons.Rounded.ChevronRight, "Open colony history", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                if (hive.id in lockedHiveIds) {
+                                    Icon(
+                                        Icons.Rounded.Lock,
+                                        contentDescription = "Locked hive",
+                                        tint = Color(0xFFB45309),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                                Icon(Icons.Rounded.ChevronRight, "Open colony history", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
                     }
                 }
@@ -191,109 +310,930 @@ internal fun QueenProfileDialog(
 
 @Composable internal fun EventCard(event:ActivityEvent){Card(shape=RoundedCornerShape(16.dp)){Row(Modifier.fillMaxWidth().padding(14.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)){Icon(Icons.Rounded.Yard,null);Column{Text(event.title,fontWeight=FontWeight.Bold);Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM,DateFormat.SHORT).format(Date(event.createdAt)),color=MaterialTheme.colorScheme.onSurfaceVariant);if(event.detail.isNotBlank())Text(event.detail)}}}}
 
+internal fun parsePositiveLogAmount(raw: String): Double? {
+    val parsed = raw.trim().replace(',', '.').toDoubleOrNull() ?: return null
+    return parsed.takeIf { it.isFinite() && it > 0.0 }
+}
+
+internal fun parseOptionalNonNegativeLogWeight(raw: String): Double? {
+    if (raw.isBlank()) return 0.0
+    val parsed = raw.trim().replace(',', '.').toDoubleOrNull() ?: return null
+    return parsed.takeIf { it.isFinite() && it >= 0.0 }
+}
+
+internal fun parseNonNegativeLogDays(raw: String): Int? =
+    raw.trim().toIntOrNull()?.takeIf { it >= 0 }
+
+internal fun hasMeaningfulHarvestRecord(
+    supersPulled: Int,
+    wetHoney: Double,
+    dryHoney: Double,
+    wax: Double,
+    propolis: Double
+): Boolean = supersPulled > 0 || listOf(wetHoney, dryHoney, wax, propolis).any { it > 0.0 }
+
+/** Convert compatible liquid/weight units without silently changing what a typed amount means. */
+internal fun convertLogAmountUnits(raw: String, fromUnit: String, toUnit: String): String {
+    if (raw.isBlank() || fromUnit == toUnit) return raw
+    val value = raw.trim().replace(',', '.').toDoubleOrNull() ?: return raw
+    if (!value.isFinite()) return raw
+    val converted = when (fromUnit to toUnit) {
+        "gal" to "L" -> value * 3.785411784
+        "L" to "gal" -> value / 3.785411784
+        "lb" to "kg" -> value * 0.45359237
+        "kg" to "lb" -> value / 0.45359237
+        else -> return ""
+    }
+    return String.format(Locale.US, "%.3f", converted).trimEnd('0').trimEnd('.')
+}
+
+private fun formatActionRecordDate(occurredAt: Long, createdAt: Long): String {
+    val timestamp = occurredAt.takeIf { it > 0L } ?: createdAt
+    return DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(timestamp))
+}
+
+private fun formatActionRecordQuantity(value: Double): String =
+    String.format(Locale.US, "%.2f", value).trimEnd('0').trimEnd('.')
+
 @Composable
-internal fun FeedDialog(onDismiss: () -> Unit, onSave: (String, String, Double, String, String) -> Unit) {
+private fun ApiaryWideRecordBadge(batchId: String?) {
+    if (!batchId.isNullOrBlank()) {
+        Surface(
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.secondaryContainer
+        ) {
+            Text(
+                "APIARY-WIDE",
+                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.ExtraBold
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecordHistoryMessage(message: String, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+    ) {
+        Text(
+            message,
+            modifier = Modifier.padding(18.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium
+        )
+    }
+}
+
+@Composable
+private fun FeedingRecordCard(record: Feeding) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(record.feedType, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        formatActionRecordDate(record.occurredAt, record.createdAt),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                ApiaryWideRecordBadge(record.batchId)
+            }
+            Text(
+                buildList {
+                    add("Amount: ${formatActionRecordQuantity(record.amount)} ${record.unit}")
+                    if (record.ratio.isNotBlank()) add("Ratio: ${record.ratio}")
+                }.joinToString(" · "),
+                style = MaterialTheme.typography.bodyMedium
+            )
+            if (record.notes.isNotBlank()) {
+                Text(record.notes, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TreatmentRecordCard(record: Treatment) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(record.product, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(record.treatmentType, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        formatActionRecordDate(record.occurredAt, record.createdAt),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                ApiaryWideRecordBadge(record.batchId)
+            }
+            val timing = buildList {
+                record.insertedAt?.let { add("Placed: ${formatActionRecordDate(it, it)}") }
+                record.removalAt?.let { add("Remove: ${formatActionRecordDate(it, it)}") }
+                record.withdrawalUntil?.let { add("Withdrawal ends: ${formatActionRecordDate(it, it)}") }
+            }
+            if (timing.isNotEmpty()) Text(timing.joinToString(" · "), style = MaterialTheme.typography.bodySmall)
+            if (record.notes.isNotBlank()) {
+                Text(record.notes, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun HarvestRecordCard(record: Harvest) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Harvest", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        formatActionRecordDate(record.occurredAt, record.createdAt),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                ApiaryWideRecordBadge(record.batchId)
+            }
+            Text(
+                "Supers: ${record.supersPulled} · Wet honey: ${formatActionRecordQuantity(record.wetHoneyWeight)} ${record.weightUnit} · " +
+                    "Dry honey: ${formatActionRecordQuantity(record.dryHoneyWeight)} ${record.weightUnit}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Text(
+                "Wax: ${formatActionRecordQuantity(record.waxWeight)} ${record.weightUnit} · " +
+                    "Propolis: ${formatActionRecordQuantity(record.propolisWeight)} ${record.weightUnit}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            if (record.notes.isNotBlank()) {
+                Text(record.notes, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeedingHistoryContent(
+    modifier: Modifier,
+    records: List<Feeding>,
+    loading: Boolean,
+    error: String?
+) {
+    when {
+        loading -> RecordHistoryMessage("Loading feeding records…", modifier)
+        error != null -> RecordHistoryMessage("Feeding records could not be loaded. Close and reopen this hive to try again. ($error)", modifier)
+        records.isEmpty() -> RecordHistoryMessage("No feeding records for this hive yet.", modifier)
+        else -> LazyColumn(
+            modifier = modifier,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(bottom = 8.dp)
+        ) {
+            item {
+                Text(
+                    "Showing records saved on this device. This history remains available offline.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            items(records, key = { it.id }) { FeedingRecordCard(it) }
+        }
+    }
+}
+
+@Composable
+private fun TreatmentHistoryContent(
+    modifier: Modifier,
+    records: List<Treatment>,
+    loading: Boolean,
+    error: String?
+) {
+    when {
+        loading -> RecordHistoryMessage("Loading treatment records…", modifier)
+        error != null -> RecordHistoryMessage("Treatment records could not be loaded. Close and reopen this hive to try again. ($error)", modifier)
+        records.isEmpty() -> RecordHistoryMessage("No treatment records for this hive yet.", modifier)
+        else -> LazyColumn(
+            modifier = modifier,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(bottom = 8.dp)
+        ) {
+            item {
+                Text(
+                    "Showing records saved on this device. This history remains available offline.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            items(records, key = { it.id }) { TreatmentRecordCard(it) }
+        }
+    }
+}
+
+@Composable
+private fun HarvestHistoryContent(
+    modifier: Modifier,
+    records: List<Harvest>,
+    loading: Boolean,
+    error: String?
+) {
+    when {
+        loading -> RecordHistoryMessage("Loading harvest records…", modifier)
+        error != null -> RecordHistoryMessage("Harvest records could not be loaded. Close and reopen this hive to try again. ($error)", modifier)
+        records.isEmpty() -> RecordHistoryMessage("No harvest records for this hive yet.", modifier)
+        else -> LazyColumn(
+            modifier = modifier,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(bottom = 8.dp)
+        ) {
+            item {
+                Text(
+                    "Showing records saved on this device. This history remains available offline.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            items(records, key = { it.id }) { HarvestRecordCard(it) }
+        }
+    }
+}
+
+@Composable
+internal fun FeedDialog(
+    onDismiss: () -> Unit,
+    hiveName: String? = null,
+    records: List<Feeding> = emptyList(),
+    recordsLoading: Boolean = false,
+    recordsError: String? = null,
+    showHistory: Boolean = true,
+    entryInfoMessage: String? = null,
+    onSave: (String, String, Double, String, String) -> Unit
+) {
+    var selectedTab by rememberSaveable { mutableStateOf("entry") }
     var type by rememberSaveable { mutableStateOf("Syrup") }
-    var ratio by rememberSaveable { mutableStateOf("1:1") }
+    var customType by rememberSaveable { mutableStateOf("") }
+    var ratioChoice by rememberSaveable { mutableStateOf("1:1") }
+    var customRatio by rememberSaveable { mutableStateOf("") }
     var amount by rememberSaveable { mutableStateOf("1") }
     var unit by rememberSaveable { mutableStateOf("gal") }
     var notes by rememberSaveable { mutableStateOf("") }
     var error by rememberSaveable { mutableStateOf("") }
-    SimpleLogDialog("Log Feeding", onDismiss, {
-        val value = amount.trim().toDoubleOrNull()
-        when {
-            type.isBlank() -> error = "Enter a feed type."
-            value == null || !value.isFinite() || value < 0 -> error = "Enter a valid non-negative amount."
-            unit.isBlank() -> error = "Enter a unit."
-            else -> onSave(type.trim(), ratio.trim(), value, unit.trim(), notes.trim())
+
+    val typeOptions = listOf("Syrup", "Fondant", "Pollen patty", "Dry sugar", "Water", "Other")
+    val unitOptions = when (type) {
+        "Fondant", "Pollen patty", "Dry sugar" -> listOf("lb", "kg")
+        "Other" -> listOf("L", "gal", "lb", "kg")
+        else -> listOf("L", "gal")
+    }
+
+    FieldLogDialog(
+        title = "Log feeding",
+        subtitle = hiveName?.let { "$it · Recorded when saved" } ?: "Record what you gave this colony",
+        icon = Icons.Rounded.WaterDrop,
+        validationMessage = error,
+        onDismiss = onDismiss,
+        onSave = {
+            val parsedAmount = parsePositiveLogAmount(amount)
+            val finalType = if (type == "Other") customType.trim() else type
+            val finalRatio = if (type == "Syrup") {
+                if (ratioChoice == "Custom") customRatio.trim() else ratioChoice
+            } else ""
+            when {
+                finalType.isBlank() -> error = "Choose a feed type or enter a custom type."
+                parsedAmount == null -> error = "Enter an amount greater than 0. Use a dot or comma for decimals."
+                unit !in unitOptions -> error = "Choose a valid unit."
+                type == "Syrup" && finalRatio.isBlank() -> error = "Choose or enter a syrup ratio."
+                else -> onSave(finalType, finalRatio, parsedAmount, unit, notes.trim())
+            }
+        },
+        selectedTab = selectedTab,
+        onTabSelected = { selectedTab = it },
+        historyContent = if (showHistory) {
+            { modifier -> FeedingHistoryContent(modifier, records, recordsLoading, recordsError) }
+        } else null
+    ) {
+        LogInfoPanel(
+            title = "Feeding entry",
+            body = entryInfoMessage ?: "The save time is recorded automatically. Amounts must be greater than zero."
+        )
+        LogValidationMessage(error)
+
+        LogFieldSection("What did you feed?") {
+            LogChoiceChips(typeOptions, type) { selected ->
+                val nextUnits = when (selected) {
+                    "Fondant", "Pollen patty", "Dry sugar" -> listOf("lb", "kg")
+                    "Other" -> listOf("L", "gal", "lb", "kg")
+                    else -> listOf("L", "gal")
+                }
+                val nextUnit = if (unit in nextUnits) unit
+                else if (selected in listOf("Fondant", "Pollen patty", "Dry sugar")) "lb" else "gal"
+                val previousUnit = unit
+                val previousAmount = amount
+                val nextAmount = if (nextUnit != previousUnit) {
+                    convertLogAmountUnits(previousAmount, previousUnit, nextUnit)
+                } else previousAmount
+                amount = nextAmount
+                unit = nextUnit
+                type = selected
+                error = if (previousAmount.isNotBlank() && previousUnit != nextUnit && nextAmount.isBlank()) {
+                    "The feed type changed between volume and weight. Re-enter the amount in the new unit."
+                } else ""
+                ratioChoice = if (selected == "Syrup") ratioChoice.takeIf { it in listOf("1:1", "2:1", "1:2", "Custom") } ?: "1:1" else ""
+            }
+            if (type == "Other") {
+                OutlinedTextField(
+                    value = customType,
+                    onValueChange = { customType = it; error = "" },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Feed type") },
+                    placeholder = { Text("Enter feed type") },
+                    singleLine = true
+                )
+            }
         }
-    }, {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(type, { type = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Feed type") }, singleLine = true)
-            OutlinedTextField(ratio, { ratio = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Ratio (optional)") }, singleLine = true)
-            OutlinedTextField(amount, { amount = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Amount") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(unit, { unit = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Unit") }, singleLine = true)
-            OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") })
-            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+
+        if (type == "Syrup") {
+            LogFieldSection("Syrup ratio") {
+                LogChoiceChips(listOf("1:1", "2:1", "1:2", "Custom"), ratioChoice) {
+                    ratioChoice = it
+                    error = ""
+                }
+                if (ratioChoice == "Custom") {
+                    OutlinedTextField(
+                        value = customRatio,
+                        onValueChange = { customRatio = it; error = "" },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Custom ratio") },
+                        placeholder = { Text("e.g. 3:2") },
+                        singleLine = true
+                    )
+                }
+            }
         }
-    })
+
+        LogFieldSection("How much?") {
+            OutlinedTextField(
+                value = amount,
+                onValueChange = { amount = it; error = "" },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Amount") },
+                placeholder = { Text("Enter amount") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                singleLine = true
+            )
+            Text("Unit", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+            LogChoiceChips(unitOptions, unit) { nextUnit ->
+                val previousAmount = amount
+                val nextAmount = convertLogAmountUnits(previousAmount, unit, nextUnit)
+                amount = nextAmount
+                error = if (previousAmount.isNotBlank() && unit != nextUnit && nextAmount.isBlank()) {
+                    "The unit changed between volume and weight. Re-enter the amount."
+                } else ""
+                unit = nextUnit
+            }
+        }
+
+        LogFieldSection("Notes (optional)") {
+            OutlinedTextField(
+                value = notes,
+                onValueChange = { notes = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Notes") },
+                placeholder = { Text("Feed source, hive response, or follow-up…") },
+                minLines = 2,
+                maxLines = 4
+            )
+        }
+
+    }
 }
 
 @Composable
-internal fun TreatmentDialog(onDismiss: () -> Unit, onSave: (String, String, Int, Int, String) -> Unit) {
+internal fun TreatmentDialog(
+    onDismiss: () -> Unit,
+    hiveName: String? = null,
+    records: List<Treatment> = emptyList(),
+    recordsLoading: Boolean = false,
+    recordsError: String? = null,
+    showHistory: Boolean = true,
+    entryInfoMessage: String? = null,
+    onSave: (String, String, Int, Int, String) -> Unit
+) {
+    var selectedTab by rememberSaveable { mutableStateOf("entry") }
     var type by rememberSaveable { mutableStateOf("Mite treatment") }
+    var customType by rememberSaveable { mutableStateOf("") }
     var product by rememberSaveable { mutableStateOf("") }
-    var duration by rememberSaveable { mutableStateOf("42") }
-    var withdrawal by rememberSaveable { mutableStateOf("0") }
+    // Timings are deliberately blank: removal and withdrawal requirements depend on the chosen product's label.
+    var removalDays by rememberSaveable { mutableStateOf("") }
+    var withdrawalDays by rememberSaveable { mutableStateOf("") }
     var notes by rememberSaveable { mutableStateOf("") }
     var error by rememberSaveable { mutableStateOf("") }
-    SimpleLogDialog("Log Treatment", onDismiss, {
-        val removal = duration.trim().toIntOrNull()
-        val withdraw = withdrawal.trim().toIntOrNull()
-        when {
-            type.isBlank() -> error = "Enter a treatment type."
-            product.isBlank() -> error = "Enter a product."
-            removal == null || removal < 0 -> error = "Removal days must be a non-negative whole number."
-            withdraw == null || withdraw < 0 -> error = "Withdrawal days must be a non-negative whole number."
-            else -> onSave(type.trim(), product.trim(), removal, withdraw, notes.trim())
+
+    val typeOptions = listOf("Mite treatment", "Disease treatment", "Medication", "Other")
+    val parsedRemovalDays = parseNonNegativeLogDays(removalDays)
+    val parsedWithdrawalDays = parseNonNegativeLogDays(withdrawalDays)
+    val plannedRemovalDate = parsedRemovalDays?.takeIf { it > 0 }?.let(::logDateAfterDays)
+    val plannedWithdrawalDate = if (parsedRemovalDays != null && parsedRemovalDays > 0 &&
+        parsedWithdrawalDays != null && parsedWithdrawalDays > 0
+    ) {
+        logDateAfterDays(parsedRemovalDays + parsedWithdrawalDays)
+    } else null
+
+    FieldLogDialog(
+        title = "Log treatment",
+        subtitle = hiveName?.let { "$it · Record product and follow-up timing" } ?: "Record product and follow-up timing",
+        icon = Icons.Rounded.MedicalServices,
+        validationMessage = error,
+        onDismiss = onDismiss,
+        onSave = {
+            val finalType = if (type == "Other") customType.trim() else type
+            when {
+                finalType.isBlank() -> error = "Choose a treatment type or enter a custom type."
+                product.trim().isBlank() -> error = "Enter the product or treatment name."
+                parsedRemovalDays == null -> error = "Enter removal days from the product label, or 0 if no removal reminder applies."
+                parsedWithdrawalDays == null -> error = "Enter the additional withdrawal days from the product label, or 0 if none applies."
+                parsedRemovalDays == 0 && parsedWithdrawalDays != null && parsedWithdrawalDays > 0 -> error = "An additional withdrawal period needs a removal date. Check the product label."
+                else -> onSave(finalType, product.trim(), parsedRemovalDays, parsedWithdrawalDays, notes.trim())
+            }
+        },
+        selectedTab = selectedTab,
+        onTabSelected = { selectedTab = it },
+        historyContent = if (showHistory) {
+            { modifier -> TreatmentHistoryContent(modifier, records, recordsLoading, recordsError) }
+        } else null
+    ) {
+        LogInfoPanel(
+            title = "Product-label timing",
+            body = entryInfoMessage ?: "Enter the timing specified for the product you are using. BeeKeep records these dates; it does not create treatment alerts or determine a safe treatment schedule.",
+            warning = true
+        )
+        LogValidationMessage(error)
+
+        LogFieldSection("Treatment type") {
+            LogChoiceChips(typeOptions, type) {
+                type = it
+                error = ""
+            }
+            if (type == "Other") {
+                OutlinedTextField(
+                    value = customType,
+                    onValueChange = { customType = it; error = "" },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Treatment type") },
+                    placeholder = { Text("Enter a type") },
+                    singleLine = true
+                )
+            }
+            OutlinedTextField(
+                value = product,
+                onValueChange = { product = it; error = "" },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Product / treatment name") },
+                placeholder = { Text("Name exactly as shown on the label") },
+                singleLine = true
+            )
         }
-    }, {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(type, { type = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Treatment type") }, singleLine = true)
-            OutlinedTextField(product, { product = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Product") }, singleLine = true)
-            OutlinedTextField(duration, { duration = it.filter(Char::isDigit); error = "" }, Modifier.fillMaxWidth(), label = { Text("Removal in days") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
-            OutlinedTextField(withdrawal, { withdrawal = it.filter(Char::isDigit); error = "" }, Modifier.fillMaxWidth(), label = { Text("Extra withdrawal days") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
-            OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") })
-            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+
+        LogFieldSection("Removal timing") {
+            OutlinedTextField(
+                value = removalDays,
+                onValueChange = { removalDays = it.filter(Char::isDigit).take(4); error = "" },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Remove after (days)") },
+                supportingText = { Text("Enter 0 if no removal reminder applies.") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
+            when {
+                parsedRemovalDays == null -> Text("Removal date will appear when you enter the number of days.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                parsedRemovalDays == 0 -> Text("No removal date will be recorded.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                else -> LogDatePreview("Planned removal", plannedRemovalDate.orEmpty())
+            }
         }
-    })
+
+        LogFieldSection("Withdrawal timing") {
+            OutlinedTextField(
+                value = withdrawalDays,
+                onValueChange = { withdrawalDays = it.filter(Char::isDigit).take(4); error = "" },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Additional days after removal") },
+                supportingText = { Text("Enter 0 if no extra withdrawal period applies.") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
+            when {
+                parsedWithdrawalDays == null -> Text("Enter the additional interval from the product label.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                parsedWithdrawalDays == 0 -> Text("No withdrawal end date will be recorded.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                plannedWithdrawalDate != null -> LogDatePreview("Withdrawal date", plannedWithdrawalDate)
+                parsedRemovalDays == null -> Text("Enter removal days first to calculate the withdrawal date.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                parsedRemovalDays == 0 -> Text("A withdrawal reminder requires a removal date.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        LogFieldSection("Notes (optional)") {
+            OutlinedTextField(
+                value = notes,
+                onValueChange = { notes = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Notes") },
+                placeholder = { Text("Placement, batch number, observed response…") },
+                minLines = 2,
+                maxLines = 4
+            )
+        }
+
+    }
 }
 
 @Composable
-internal fun HarvestDialog(onDismiss: () -> Unit, onSave: (Int, Double, Double, String, Double, Double, String) -> Unit) {
-    var supers by rememberSaveable { mutableStateOf("0") }
-    var wet by rememberSaveable { mutableStateOf("0") }
-    var dry by rememberSaveable { mutableStateOf("0") }
+internal fun HarvestDialog(
+    onDismiss: () -> Unit,
+    hiveName: String? = null,
+    records: List<Harvest> = emptyList(),
+    recordsLoading: Boolean = false,
+    recordsError: String? = null,
+    showHistory: Boolean = true,
+    entryInfoMessage: String? = null,
+    onSave: (Int, Double, Double, String, Double, Double, String) -> Unit
+) {
+    var selectedTab by rememberSaveable { mutableStateOf("entry") }
+    var supers by rememberSaveable { mutableIntStateOf(0) }
+    var wet by rememberSaveable { mutableStateOf("") }
+    var dry by rememberSaveable { mutableStateOf("") }
     var unit by rememberSaveable { mutableStateOf("lb") }
-    var wax by rememberSaveable { mutableStateOf("0") }
-    var prop by rememberSaveable { mutableStateOf("0") }
+    var wax by rememberSaveable { mutableStateOf("") }
+    var propolis by rememberSaveable { mutableStateOf("") }
     var notes by rememberSaveable { mutableStateOf("") }
     var error by rememberSaveable { mutableStateOf("") }
-    SimpleLogDialog("Log Harvest", onDismiss, {
-        val s = supers.trim().toIntOrNull()
-        val w = wet.trim().toDoubleOrNull()
-        val d = dry.trim().toDoubleOrNull()
-        val wx = wax.trim().toDoubleOrNull()
-        val pr = prop.trim().toDoubleOrNull()
-        when {
-            s == null || s < 0 -> error = "Supers pulled must be a non-negative whole number."
-            w == null || !w.isFinite() || w < 0 -> error = "Enter a valid wet honey weight."
-            d == null || !d.isFinite() || d < 0 -> error = "Enter a valid dry honey weight."
-            unit.isBlank() -> error = "Enter a weight unit."
-            wx == null || !wx.isFinite() || wx < 0 -> error = "Enter a valid wax weight."
-            pr == null || !pr.isFinite() || pr < 0 -> error = "Enter a valid propolis weight."
-            else -> onSave(s, w, d, unit.trim(), wx, pr, notes.trim())
+
+    val parsedWet = parseOptionalNonNegativeLogWeight(wet)
+    val parsedDry = parseOptionalNonNegativeLogWeight(dry)
+    val parsedWax = parseOptionalNonNegativeLogWeight(wax)
+    val parsedPropolis = parseOptionalNonNegativeLogWeight(propolis)
+
+    FieldLogDialog(
+        title = "Log harvest",
+        subtitle = hiveName?.let { "$it · Capture supers and recovered products" } ?: "Capture supers and recovered products",
+        icon = Icons.Rounded.Scale,
+        validationMessage = error,
+        onDismiss = onDismiss,
+        onSave = {
+            when {
+                parsedWet == null -> error = "Wet honey must be a valid non-negative weight."
+                parsedDry == null -> error = "Dry honey must be a valid non-negative weight."
+                parsedWax == null -> error = "Wax weight must be a valid non-negative weight."
+                parsedPropolis == null -> error = "Propolis weight must be a valid non-negative weight."
+                !hasMeaningfulHarvestRecord(supers, parsedWet, parsedDry, parsedWax, parsedPropolis) ->
+                    error = "Enter at least one harvest quantity or the number of supers pulled."
+                unit !in listOf("lb", "kg") -> error = "Choose a valid weight unit."
+                else -> onSave(supers, parsedWet, parsedDry, unit, parsedWax, parsedPropolis, notes.trim())
+            }
+        },
+        selectedTab = selectedTab,
+        onTabSelected = { selectedTab = it },
+        historyContent = if (showHistory) {
+            { modifier -> HarvestHistoryContent(modifier, records, recordsLoading, recordsError) }
+        } else null
+    ) {
+        LogInfoPanel(
+            title = "Harvest record",
+            body = entryInfoMessage ?: "Blank weight fields are saved as 0 in the current record format. Enter your measured amounts or a supers count before saving."
+        )
+        LogValidationMessage(error)
+
+        LogFieldSection("Supers pulled") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(supers.toString(), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
+                    Text(if (supers == 1) "super removed" else "supers removed", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                OutlinedButton(
+                    onClick = { supers = (supers - 1).coerceAtLeast(0); error = "" },
+                    enabled = supers > 0,
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp)
+                ) { Text("−", style = MaterialTheme.typography.titleLarge) }
+                Button(
+                    onClick = { supers = (supers + 1).coerceAtMost(999); error = "" },
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp)
+                ) { Text("+", style = MaterialTheme.typography.titleLarge) }
+            }
         }
-    }, {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(supers, { supers = it.filter(Char::isDigit); error = "" }, Modifier.fillMaxWidth(), label = { Text("Supers pulled") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
-            OutlinedTextField(wet, { wet = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Wet honey") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(dry, { dry = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Dry honey") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(unit, { unit = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Weight unit") }, singleLine = true)
-            OutlinedTextField(wax, { wax = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Wax") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(prop, { prop = it; error = "" }, Modifier.fillMaxWidth(), label = { Text("Propolis") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
-            OutlinedTextField(notes, { notes = it }, Modifier.fillMaxWidth(), label = { Text("Notes") })
-            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+
+        LogFieldSection("Weight unit") {
+            LogChoiceChips(listOf("lb", "kg"), unit) { nextUnit ->
+                wet = convertLogAmountUnits(wet, unit, nextUnit)
+                dry = convertLogAmountUnits(dry, unit, nextUnit)
+                wax = convertLogAmountUnits(wax, unit, nextUnit)
+                propolis = convertLogAmountUnits(propolis, unit, nextUnit)
+                unit = nextUnit
+                error = ""
+            }
         }
-    })
+
+        LogFieldSection("Honey") {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = wet,
+                    onValueChange = { wet = it; error = "" },
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Wet ($unit)") },
+                    placeholder = { Text("Blank = 0") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = dry,
+                    onValueChange = { dry = it; error = "" },
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Dry ($unit)") },
+                    placeholder = { Text("Blank = 0") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true
+                )
+            }
+        }
+
+        LogFieldSection("Other products (optional)") {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = wax,
+                    onValueChange = { wax = it; error = "" },
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Wax ($unit)") },
+                    placeholder = { Text("Blank = 0") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = propolis,
+                    onValueChange = { propolis = it; error = "" },
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Propolis ($unit)") },
+                    placeholder = { Text("Blank = 0") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true
+                )
+            }
+        }
+
+        LogFieldSection("Notes (optional)") {
+            OutlinedTextField(
+                value = notes,
+                onValueChange = { notes = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Notes") },
+                placeholder = { Text("Harvest conditions, moisture, batch details…") },
+                minLines = 2,
+                maxLines = 4
+            )
+        }
+
+    }
 }
 
-@Composable private fun SimpleLogDialog(title: String, onDismiss: () -> Unit, onConfirm: () -> Unit, content: @Composable () -> Unit) {
-    AlertDialog(
+@Composable
+private fun FieldLogDialog(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    validationMessage: String,
+    onDismiss: () -> Unit,
+    onSave: () -> Unit,
+    selectedTab: String = "entry",
+    onTabSelected: (String) -> Unit = {},
+    historyContent: (@Composable (Modifier) -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val configuration = LocalConfiguration.current
+    val maxDialogHeight = (configuration.screenHeightDp.dp * 0.88f).coerceAtMost(760.dp)
+    val maxFormHeight = (configuration.screenHeightDp.dp * 0.54f).coerceAtMost(470.dp)
+    val formScrollState = rememberScrollState()
+    LaunchedEffect(validationMessage) {
+        if (validationMessage.isNotBlank()) formScrollState.animateScrollTo(0)
+    }
+
+    Dialog(
         onDismissRequest = onDismiss,
-        title = { Text(title, fontWeight = FontWeight.ExtraBold) },
-        text = { content() },
-        confirmButton = { TextButton(onClick = onConfirm) { Text("SAVE", fontWeight = FontWeight.ExtraBold) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL") } }
-    )
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.94f)
+                .widthIn(max = 520.dp)
+                .heightIn(max = maxDialogHeight),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 8.dp
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(start = 20.dp, top = 18.dp, end = 10.dp, bottom = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        modifier = Modifier.size(48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(25.dp))
+                        }
+                    }
+                    Column(
+                        modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                        Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Rounded.Close, contentDescription = "Close")
+                    }
+                }
+                Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.75f))
+                if (historyContent != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        FilterChip(
+                            selected = selectedTab == "entry",
+                            onClick = { onTabSelected("entry") },
+                            label = { Text("New entry") }
+                        )
+                        FilterChip(
+                            selected = selectedTab == "records",
+                            onClick = { onTabSelected("records") },
+                            label = { Text("Records") }
+                        )
+                    }
+                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.75f))
+                }
+                if (historyContent != null && selectedTab == "records") {
+                    historyContent(
+                        Modifier.fillMaxWidth()
+                            .heightIn(min = 150.dp, max = maxFormHeight)
+                            .padding(horizontal = 20.dp, vertical = 12.dp)
+                    )
+                } else {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = maxFormHeight)
+                            .verticalScroll(formScrollState)
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        content = content
+                    )
+                }
+                Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.75f))
+                if (historyContent != null && selectedTab == "records") {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.fillMaxWidth().padding(16.dp).heightIn(min = 52.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp)
+                    ) {
+                        Text("CLOSE", fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.weight(1f).heightIn(min = 52.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp)
+                        ) {
+                            Text("CANCEL", fontWeight = FontWeight.Bold)
+                        }
+                        Button(
+                            onClick = onSave,
+                            modifier = Modifier.weight(1.25f).heightIn(min = 52.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp)
+                        ) {
+                            Text("SAVE LOG", fontWeight = FontWeight.ExtraBold)
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
+
+@Composable
+private fun LogFieldSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.ExtraBold)
+        content()
+    }
+}
+
+@Composable
+private fun LogChoiceChips(
+    options: List<String>,
+    selected: String,
+    onSelected: (String) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        options.forEach { option ->
+            FilterChip(
+                selected = selected == option,
+                onClick = { onSelected(option) },
+                label = { Text(option) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun LogInfoPanel(title: String, body: String, warning: Boolean = false) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = if (warning) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.65f)
+        else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+    ) {
+        Column(Modifier.padding(13.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.ExtraBold)
+            Text(
+                body,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (warning) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface
+            )
+        }
+    }
+}
+
+@Composable
+private fun LogValidationMessage(message: String) {
+    if (message.isNotBlank()) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.errorContainer
+        ) {
+            Text(
+                message,
+                modifier = Modifier.padding(12.dp),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@Composable
+private fun LogDatePreview(label: String, date: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Rounded.CalendarMonth, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                Text(date, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
+            }
+        }
+    }
+}
+
+private fun logDateAfterDays(days: Int): String =
+    LocalDate.now().plusDays(days.toLong()).format(
+        DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).withLocale(Locale.getDefault())
+    )

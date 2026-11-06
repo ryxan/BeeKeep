@@ -23,12 +23,18 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -46,13 +52,12 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.beekeep.app.data.Apiary
-import com.beekeep.app.data.Hive
 import com.beekeep.app.ui.theme.BeeKeepAccent
 
 @Composable
@@ -189,10 +194,11 @@ internal fun HoneycombNfcIndicator(nfcEnabled: Boolean, size: Dp = 220.dp) {
 
 @Composable
 internal fun HomeScreen(
-    hives: List<Hive>,
-    apiaries: List<Apiary>,
+    hiveCount: Int,
+    apiaryCount: Int,
     padding: androidx.compose.foundation.layout.PaddingValues,
     nfcEnabled: Boolean,
+    currentPlan: BeeKeepPlan = BeeKeepPlan.HOBBYIST,
     onOpenApiaries: () -> Unit
 ) {
     LazyColumn(
@@ -271,14 +277,40 @@ internal fun HomeScreen(
                         modifier = Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
-                        Text(
-                            text = "BeeKeep",
-                            style = MaterialTheme.typography.headlineLarge,
-                            color = BeeKeepAccent,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            softWrap = false
-                        )
+                        if (currentPlan != BeeKeepPlan.HOBBYIST) {
+                            val tierLabel = currentPlan.displayName
+                            Row(
+                                verticalAlignment = Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Text(
+                                    text = "BeeKeep",
+                                    style = MaterialTheme.typography.headlineLarge,
+                                    color = BeeKeepAccent,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                                Text(
+                                    text = tierLabel,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = BeeKeepAccent,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
+                            }
+                        } else {
+                            Text(
+                                text = "BeeKeep",
+                                style = MaterialTheme.typography.headlineLarge,
+                                color = BeeKeepAccent,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
                         Text(
                             text = "MADE BY BEEKEEPERS\nFOR BEEKEEPERS",
                             style = MaterialTheme.typography.labelMedium,
@@ -304,18 +336,181 @@ internal fun HomeScreen(
                 Modifier.fillMaxWidth().padding(top = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                MetricCard("Apiaries", apiaries.size.toString(), Modifier.weight(1f), onClick = onOpenApiaries)
-                MetricCard("Hives", hives.size.toString(), Modifier.weight(1f))
+                MetricCard("Apiaries", apiaryCount.toString(), Modifier.weight(1f), onClick = onOpenApiaries)
+                MetricCard("Hives", hiveCount.toString(), Modifier.weight(1f))
             }
         }
+        item { HomeHelpMenu() }
         item {
-            Row(
-                Modifier.fillMaxWidth().padding(top = 48.dp, bottom = 30.dp),
-                horizontalArrangement = Arrangement.Center
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(top = 24.dp, bottom = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 HoneycombNfcIndicator(nfcEnabled = nfcEnabled)
+                Text(
+                    text = "NFC tags are sold separately. Choose writable NFC tags compatible with your phone. They’re available from most online retailers.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFB91C1C),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+                )
             }
         }
+    }
+}
+
+private data class HelpTopic(val title: String, val steps: List<String>)
+
+@Composable
+private fun HomeHelpMenu() {
+    var expanded by remember { mutableStateOf(false) }
+    var selectedTopicIndex by remember { mutableIntStateOf(-1) }
+    var stepIndex by remember { mutableIntStateOf(0) }
+
+    val topics = remember {
+        listOf(
+            HelpTopic("Apiaries and hives", listOf(
+                "Open Apiaries and add each place where you keep bees. Give each apiary its own name.",
+                "Select an apiary to see its hives. Add hives there so each colony has its own page and records.",
+                "Open a hive to inspect it or review its activity history."
+            )),
+            HelpTopic("NFC tags and Fast Tag Mode", listOf(
+                "Turn on Fast tag assignment mode in Settings when you want to assign tags to multiple hives quickly.",
+                "Scan an unassigned tag, then choose an existing hive or create a new one. In fast mode, follow the prompts before scanning the next tag.",
+                "Scan an assigned tag to open its hive. Make sure NFC is enabled on your phone. You can change the voice options for scans in Settings."
+            )),
+            HelpTopic("Inspections and field notes", listOf(
+                "Open a hive and tap Inspect to record what you find during a visit.",
+                "Fill in the sections you use, such as mite wash, brood and stores, queen status, and health flags. Add field notes as needed.",
+                "Review your entries, then save the inspection. You can find past entries under Records or Recent Activity."
+            )),
+            HelpTopic("Feeding, treatments, harvests and records", listOf(
+                "From a hive page, use Feed, Treat, or Harvest to log work for that colony.",
+                "Open Records or Recent Activity to review previous inspections and other hive activity.",
+                "Keep each entry on the correct hive so its history stays together."
+            )),
+            HelpTopic("Map and apiary locations", listOf(
+                "Tap Map in the bottom navigation bar to view your saved apiary locations.",
+                "When adding or editing an apiary, use the location option to save its GPS position. Allow location access when Android asks.",
+                "Tap My Location on the map to find your current position. GPS accuracy depends on signal and surroundings."
+            )),
+            HelpTopic("Voice notes", listOf(
+                "Allow microphone access to dictate notes. You can type notes instead if you prefer.",
+                "In Settings, choose whether voice recording starts after an NFC hive scan. Opening Inspect manually will not start recording automatically.",
+                "Use the same settings to turn the ready beep on or off and choose whether BeeKeep speaks the hive number. Check transcribed notes for errors before saving."
+            )),
+            HelpTopic("Settings, backups and sync", listOf(
+                "Settings includes display options, NFC and voice behaviour, text size, and permission checks.",
+                "Use the backup controls to export your data or restore a backup. Read the confirmation before you continue.",
+                "If BeeKeep Cloud is configured, sign in and use Sync Now to sync your records. Keep an exported backup as an extra copy."
+            ))
+        )
+    }
+
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "Help?",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = BeeKeepAccent
+                )
+                Icon(
+                    imageVector = if (expanded) Icons.Rounded.KeyboardArrowDown else Icons.Rounded.ChevronRight,
+                    contentDescription = if (expanded) "Collapse help" else "Expand help",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+
+            if (expanded) {
+                topics.forEachIndexed { index, topic ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            selectedTopicIndex = index
+                            stepIndex = 0
+                        }.padding(vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(topic.title, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                when (index) {
+                                    0 -> "Organize your apiaries and colonies"
+                                    1 -> "Assign tags and scan hives"
+                                    2 -> "Record inspections and field notes"
+                                    3 -> "Log hive work and find past records"
+                                    4 -> "Save and view apiary GPS locations"
+                                    5 -> "Set up hands-free voice notes"
+                                    else -> "Manage preferences, backups and sync"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Icon(
+                            Icons.Rounded.ChevronRight,
+                            contentDescription = "Open ${topic.title} help",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    if (index != topics.lastIndex) {
+                        Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)))
+                    }
+                }
+            }
+        }
+    }
+
+    if (selectedTopicIndex in topics.indices) {
+        val topic = topics[selectedTopicIndex]
+        AlertDialog(
+            onDismissRequest = { selectedTopicIndex = -1 },
+            title = {
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(topic.title, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        "Step ${stepIndex + 1} of ${topic.steps.size}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            text = { Text(topic.steps[stepIndex], style = MaterialTheme.typography.bodyLarge) },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (stepIndex < topic.steps.lastIndex) stepIndex++ else selectedTopicIndex = -1
+                }) {
+                    Text(if (stepIndex == topic.steps.lastIndex) "DONE" else "NEXT")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    if (stepIndex > 0) stepIndex-- else selectedTopicIndex = -1
+                }) {
+                    Text(if (stepIndex > 0) "BACK" else "CLOSE")
+                }
+            }
+        )
     }
 }
 

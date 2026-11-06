@@ -48,6 +48,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -61,7 +62,9 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.LocationOn
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Map
 import androidx.compose.material.icons.rounded.Mic
@@ -102,6 +105,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
@@ -110,6 +114,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import com.beekeep.app.data.IdGenerator
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -145,11 +150,15 @@ import com.beekeep.app.data.Apiary
 import com.beekeep.app.data.Harvest
 import com.beekeep.app.data.Hive
 import com.beekeep.app.data.Inspection
+import com.beekeep.app.data.HarvestQuantityMode
+import com.beekeep.app.data.workspaceActionSettingsScopeKey
 import com.beekeep.app.data.LocalHiveRepository
 import com.beekeep.app.data.Treatment
 import com.beekeep.app.cloud.CloudResult
 import com.beekeep.app.cloud.CloudSyncScheduler
 import com.beekeep.app.cloud.SupabaseGateway
+import com.beekeep.app.cloud.BeeKeepAccountSetupState
+import com.beekeep.app.cloud.BeeKeepWorkspaceOwnerQuotaEntitlement
 import com.beekeep.app.location.LocationController
 import com.beekeep.app.nfc.NfcController
 import com.beekeep.app.nfc.BeeKeepNfcPayload
@@ -217,9 +226,19 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
         val cloud = SupabaseGateway(applicationContext, repository)
         cloudGateway = cloud
-        CloudSyncScheduler.schedule(applicationContext)
+        cloud.handleAuthDeepLink(intent)
         val vm = ViewModelProvider(this, BeeKeepViewModel.Factory(repository, applicationContext))[BeeKeepViewModel::class.java]
-        lifecycleScope.launch { cloud.syncNow() }
+        lifecycleScope.launch {
+            // Startup renders the account-bound local Room database first. Do not contend for
+            // the sync mutex until the gateway has published the initial local session state.
+            cloud.accountInitialized.first { it }
+            // Schedule background sync only after local-first session and workspace selection
+            // have been published, so a worker cannot hold the shared sync mutex ahead of startup.
+            CloudSyncScheduler.schedule(applicationContext)
+            if (cloud.account.value.signedIn) {
+                if (cloud.syncNow() is CloudResult.Success) cloud.startRealtime()
+            }
+        }
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         setContent {
             var darkMode by rememberSaveable { mutableStateOf(prefs.getBoolean("dark_mode", false)) }
@@ -240,6 +259,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     val incomingNfc by pendingNfcResult.collectAsStateWithLifecycle()
                     BeeKeepApp(
                         vm, nfc, this, locationController, cloud, darkMode, incomingNfc,
+                        repository = repository,
                         onSpeakHiveNumber = ::speakHiveNumber,
                         largeFieldText = largeFieldText,
                         onLargeFieldTextChange = { value ->
@@ -328,10 +348,13 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (::cloudGateway.isInitialized) cloudGateway.handleAuthDeepLink(intent)
         handleNfcIntent(intent)
     }
 
     private fun handleNfcIntent(intent: Intent?) {
+        // Entitlement resolution can still be in progress on a cold start. Queue the
+        // NDEF read here; BeeKeepApp handles it only after the account plan is verified.
         // While fast tagging is enabled, never interpret an Android NFC launch intent
         // as a request to navigate to Inspection. ReaderMode owns the physical tag;
         // this preference guard also survives a newly-created NfcController instance.
@@ -380,11 +403,14 @@ enum class Screen {
     APIARIES,
     APIARY_HIVES,
     MAP,
+    WORKSPACE,
     SCAN,
     MORE,
+    SUPPORT_ADMIN,
     SETTINGS,
     TAG_MANAGER,
-    COLONY_HISTORY
+    COLONY_HISTORY,
+    PURCHASES
 }
 
 enum class HiveLogType { FEED, TREAT, HARVEST }
@@ -404,6 +430,78 @@ fun BeeKeepApp(
     cloud: SupabaseGateway,
     darkMode: Boolean,
     incomingNfc: NfcResult.Read?,
+    repository: LocalHiveRepository,
+    onSpeakHiveNumber: (String) -> Unit,
+    largeFieldText: Boolean,
+    onLargeFieldTextChange: (Boolean) -> Unit,
+    compactHiveRows: Boolean,
+    onCompactHiveRowsChange: (Boolean) -> Unit,
+    onDarkModeChange: (Boolean) -> Unit
+) {
+    val account by cloud.account.collectAsStateWithLifecycle()
+    val accountInitialized by cloud.accountInitialized.collectAsStateWithLifecycle()
+    val passwordRecoveryRequired by cloud.passwordRecoveryRequired.collectAsStateWithLifecycle()
+    val accountSetupState by cloud.accountSetupState.collectAsStateWithLifecycle()
+    var startupWatchdogElapsed by rememberSaveable { mutableStateOf(false) }
+
+    androidx.compose.runtime.LaunchedEffect(accountInitialized) {
+        if (!accountInitialized) {
+            startupWatchdogElapsed = false
+            kotlinx.coroutines.delay(15_000L)
+            if (!cloud.accountInitialized.value) startupWatchdogElapsed = true
+        } else {
+            startupWatchdogElapsed = false
+        }
+    }
+
+    when {
+        !accountInitialized && startupWatchdogElapsed -> BeeKeepStartupRecoveryScreen(cloud)
+        !accountInitialized -> BeeKeepAuthLoadingScreen()
+        passwordRecoveryRequired -> BeeKeepAuthScreen(cloud)
+        !account.signedIn -> BeeKeepAuthScreen(cloud)
+        accountSetupState is BeeKeepAccountSetupState.UsernameRequired -> {
+            BeeKeepAccountSetupScreen(
+                cloud = cloud,
+                setup = accountSetupState as BeeKeepAccountSetupState.UsernameRequired
+            )
+        }
+        accountSetupState is BeeKeepAccountSetupState.Unavailable -> {
+            BeeKeepAccountSetupUnavailableScreen(
+                cloud = cloud,
+                message = (accountSetupState as BeeKeepAccountSetupState.Unavailable).message
+            )
+        }
+        accountSetupState is BeeKeepAccountSetupState.Ready ||
+            accountSetupState is BeeKeepAccountSetupState.Offline -> BeeKeepAuthenticatedApp(
+            vm = vm,
+            nfc = nfc,
+            activity = activity,
+            locationController = locationController,
+            cloud = cloud,
+            darkMode = darkMode,
+            incomingNfc = incomingNfc,
+            repository = repository,
+            onSpeakHiveNumber = onSpeakHiveNumber,
+            largeFieldText = largeFieldText,
+            onLargeFieldTextChange = onLargeFieldTextChange,
+            compactHiveRows = compactHiveRows,
+            onCompactHiveRowsChange = onCompactHiveRowsChange,
+            onDarkModeChange = onDarkModeChange
+        )
+        else -> BeeKeepAuthLoadingScreen()
+    }
+}
+
+@Composable
+private fun BeeKeepAuthenticatedApp(
+    vm: BeeKeepViewModel,
+    nfc: NfcController,
+    activity: ComponentActivity,
+    locationController: LocationController,
+    cloud: SupabaseGateway,
+    darkMode: Boolean,
+    incomingNfc: NfcResult.Read?,
+    repository: LocalHiveRepository,
     onSpeakHiveNumber: (String) -> Unit,
     largeFieldText: Boolean,
     onLargeFieldTextChange: (Boolean) -> Unit,
@@ -412,6 +510,10 @@ fun BeeKeepApp(
     onDarkModeChange: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
+    val cloudHiveLimitOverride by cloud.hiveLimitOverride.collectAsStateWithLifecycle()
+    val serverVerifiedPlan by cloud.verifiedPlan.collectAsStateWithLifecycle()
+    val cloudAccountInitialized by cloud.accountInitialized.collectAsStateWithLifecycle()
+    val commercialEntitlementResolved = BuildConfig.DEBUG || cloudAccountInitialized
     val autoVoicePrefs = remember(context) {
         context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
     }
@@ -473,14 +575,34 @@ fun BeeKeepApp(
         fastAssignmentStateHydrated = true
     }
     var screen by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var purchasePlanName by rememberSaveable {
+        mutableStateOf(BeeKeepEntitlements.currentPlan(context).name)
+    }
+    val localPurchasePlan = BeeKeepPlan.fromStoredValue(purchasePlanName)
+    // A server-granted Commercial entitlement must override the debug purchase simulator too.
+    // Otherwise a Hobbyist debug profile would still see upgrade prompts despite a valid grant.
+    val purchasePlan = BeeKeepEntitlements.planForAppFeatures(
+        isDebugBuild = BuildConfig.DEBUG,
+        localPlan = localPurchasePlan,
+        serverVerifiedPlan = serverVerifiedPlan
+    )
+    var lockedHivePromptVisible by rememberSaveable { mutableStateOf(false) }
+    var lockedHivePromptName by rememberSaveable { mutableStateOf<String?>(null) }
+    var lockedHivePromptHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var purchaseBackScreen by rememberSaveable { mutableStateOf(Screen.MORE) }
+    var purchaseSuccessScreen by rememberSaveable { mutableStateOf(Screen.HOME) }
     var selectedHiveOpen by rememberSaveable { mutableStateOf(false) }
     var selectedApiaryName by rememberSaveable { mutableStateOf<String?>(null) }
+    // Preserve scroll/search state when a hive detail screen temporarily replaces a list.
+    val screenSaveableStateHolder = rememberSaveableStateHolder()
     var mapOrigin by rememberSaveable { mutableStateOf(Screen.HOME) }
     var mapFocusApiaryId by rememberSaveable { mutableStateOf<Long?>(null) }
     var inspecting by rememberSaveable { mutableStateOf(false) }
     var addHive by rememberSaveable { mutableStateOf(false) }
+    var hiveLimitPromptVisible by rememberSaveable { mutableStateOf(false) }
     var logType by rememberSaveable { mutableStateOf<HiveLogType?>(null) }
     var addApiary by rememberSaveable { mutableStateOf(false) }
+    var apiaryLimitPromptVisible by rememberSaveable { mutableStateOf(false) }
     var addApiaryOptionsVisible by rememberSaveable { mutableStateOf(false) }
     var addingApiariesWithHives by rememberSaveable { mutableStateOf(false) }
     var editingApiary by remember { mutableStateOf<Apiary?>(null) }
@@ -496,14 +618,40 @@ fun BeeKeepApp(
     var pendingAutoTagWriteHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
     var pendingAutoTagWriteIgnoredUid by rememberSaveable { mutableStateOf<String?>(null) }
     var scanning by remember { mutableStateOf(false) }
-    var firstRunPromptVisible by rememberSaveable { mutableStateOf(false) }
-    var firstRunPromptChecked by rememberSaveable { mutableStateOf(false) }
     var pendingResetWarning by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingLocationHive by remember { mutableStateOf<Hive?>(null) }
     var pendingApiaryMove by remember { mutableStateOf<Pair<Hive, Apiary>?>(null) }
+    var apiaryBatchTargetPickerVisible by rememberSaveable { mutableStateOf(false) }
+    var apiaryBatchActionTarget by remember { mutableStateOf<ApiaryBatchActionTarget?>(null) }
+    var apiaryBatchActionType by remember { mutableStateOf<HiveLogType?>(null) }
+    var apiaryBatchConfirmationMessage by rememberSaveable { mutableStateOf("") }
+    var apiaryBatchSubmitting by remember { mutableStateOf(false) }
+    var pendingApiaryBatchCommit by remember { mutableStateOf<(() -> Unit)?>(null) }
     var locationCheckCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = androidx.compose.material3.SnackbarHostState()
+
+    fun clearApiaryBatchAction() {
+        apiaryBatchTargetPickerVisible = false
+        apiaryBatchActionTarget = null
+        apiaryBatchActionType = null
+        apiaryBatchConfirmationMessage = ""
+        apiaryBatchSubmitting = false
+        pendingApiaryBatchCommit = null
+    }
+
+    fun requestApiaryBatchConfirmation(message: String, save: () -> Unit) {
+        if (apiaryBatchSubmitting) return
+        apiaryBatchSubmitting = true
+        apiaryBatchConfirmationMessage = message
+        pendingApiaryBatchCommit = save
+    }
+
+    fun cancelApiaryBatchConfirmation() {
+        apiaryBatchConfirmationMessage = ""
+        pendingApiaryBatchCommit = null
+        apiaryBatchSubmitting = false
+    }
 
     fun showUnassignedTagPrompt(uid: String, origin: Screen, tag: android.nfc.Tag?) {
         // Lock NFC before updating Compose state, so queued intents and IO callbacks
@@ -520,14 +668,477 @@ fun BeeKeepApp(
 
     val hives by vm.hives.collectAsStateWithLifecycle()
     val deadHives by vm.deadHives.collectAsStateWithLifecycle()
+    val account by cloud.account.collectAsStateWithLifecycle()
+    val activeWorkspaceId by vm.activeWorkspaceId.collectAsStateWithLifecycle()
+    val activeWorkspaceReadOnly by vm.activeWorkspaceReadOnly.collectAsStateWithLifecycle()
+    val readOnlyWriteAttempt by vm.readOnlyWriteAttempt.collectAsStateWithLifecycle()
+    var teamQuotaSnapshot by remember {
+        mutableStateOf<Pair<String, BeeKeepWorkspaceOwnerQuotaEntitlement>?>(null)
+    }
+    var teamQuotaError by remember { mutableStateOf<String?>(null) }
+    var teamQuotaRefreshSignal by remember { mutableIntStateOf(0) }
+    val personalQuotaLimits = remember(purchasePlan, cloudHiveLimitOverride) {
+        BeeKeepQuotaLimits.forPlan(purchasePlan, cloudHiveLimitOverride)
+    }
+    val selectedTeamQuota = teamQuotaSnapshot?.takeIf { it.first == activeWorkspaceId }?.second
+    val isPersonalDataset = activeWorkspaceId.isNullOrBlank()
+    val quotaContextKey = if (isPersonalDataset) {
+        "personal:${purchasePlan.name}:${personalQuotaLimits.hiveLimit}:${personalQuotaLimits.apiaryLimit}"
+    } else {
+        "team:${activeWorkspaceId}:${selectedTeamQuota?.active}:${selectedTeamQuota?.effectiveHiveLimit}:" +
+            "${selectedTeamQuota?.effectiveApiaryLimit}:${selectedTeamQuota?.memberRole}:$activeWorkspaceReadOnly"
+    }
+    var appliedQuotaContextKey by remember { mutableStateOf<String?>(null) }
+    val quotaEnforcementReady = BeeKeepQuotaAccessPolicy.canWrite(
+        isPersonalDataset = isPersonalDataset,
+        quotaContextApplied = appliedQuotaContextKey == quotaContextKey,
+        ownerCommercialActive = selectedTeamQuota?.active,
+        memberRole = selectedTeamQuota?.memberRole,
+        workspaceReadOnly = activeWorkspaceReadOnly
+    )
+    val activeQuotaLimits = if (isPersonalDataset) {
+        personalQuotaLimits
+    } else {
+        selectedTeamQuota?.let {
+            BeeKeepQuotaLimits.forWorkspaceOwner(it.active, it.effectiveHiveLimit, it.effectiveApiaryLimit)
+        } ?: BeeKeepQuotaLimits.forPlan(BeeKeepPlan.HOBBYIST)
+    }
+    val effectiveHiveLimit = activeQuotaLimits.hiveLimit
+    val quotaSnapshotVerified = appliedQuotaContextKey == quotaContextKey &&
+        (if (isPersonalDataset) commercialEntitlementResolved else selectedTeamQuota != null)
+    val quotaOrderedHives = remember(hives, deadHives) {
+        (hives + deadHives)
+            .distinctBy { it.id }
+            .sortedWith(
+                compareBy<Hive> { it.isDead }
+                    .thenBy { it.number.toIntOrNull() ?: Int.MAX_VALUE }
+                    .thenBy { it.number.lowercase(Locale.ROOT) }
+                    .thenBy { it.apiary.lowercase(Locale.ROOT) }
+                    .thenBy { it.id }
+            )
+    }
+    val lockedHiveIds = remember(quotaOrderedHives, effectiveHiveLimit, quotaSnapshotVerified) {
+        if (!quotaSnapshotVerified) {
+            emptySet()
+        } else {
+            BeeKeepEntitlements.hiveIdsBeyondLimit(
+                quotaOrderedHives.map { it.id },
+                effectiveHiveLimit
+            )
+        }
+    }
+
+    // A selected team uses the owner's server-resolved limits, never the invitee's personal plan.
+    // Until that lookup succeeds, use a restrictive fallback and block quota-dependent writes.
+    androidx.compose.runtime.LaunchedEffect(
+        activeWorkspaceId,
+        account.signedIn,
+        account.userId,
+        teamQuotaRefreshSignal
+    ) {
+        val workspaceId = activeWorkspaceId?.trim()?.takeIf { it.isNotEmpty() }
+        if (workspaceId == null) {
+            teamQuotaSnapshot = null
+            teamQuotaError = null
+            return@LaunchedEffect
+        }
+
+        // Keep the last verified quota for this workspace while offline. A failed refresh is not
+        // evidence that the owner's plan changed or that the selected team should use another cap.
+        teamQuotaError = null
+        if (!account.signedIn) {
+            teamQuotaError = "Sign in to verify this workspace's subscription limits."
+            return@LaunchedEffect
+        }
+
+        while (true) {
+            val result = cloud.workspaceOwnerQuotaEntitlement(workspaceId)
+            if (result.isSuccess && result.value != null) {
+                teamQuotaSnapshot = workspaceId to result.value!!
+                teamQuotaError = null
+            } else {
+                teamQuotaError = result.error
+                    ?: "Couldn't verify the workspace owner's subscription limits. Check your connection and retry."
+            }
+            delay(60_000)
+        }
+    }
+    // Keep the selected Room dataset's write gate aligned with the live owner entitlement,
+    // even when the beekeeper is on another screen and WorkspaceScreen is not mounted.
+    androidx.compose.runtime.LaunchedEffect(
+        activeWorkspaceId,
+        selectedTeamQuota?.active,
+        selectedTeamQuota?.memberRole,
+        activeWorkspaceReadOnly
+    ) {
+        val workspaceId = activeWorkspaceId?.trim()?.takeIf { it.isNotEmpty() } ?: return@LaunchedEffect
+        val quota = selectedTeamQuota ?: return@LaunchedEffect
+        val expectedReadOnly = !quota.active || quota.memberRole !in setOf("owner", "admin", "member")
+        if (activeWorkspaceReadOnly != expectedReadOnly) {
+            val result = cloud.activateWorkspace(workspaceId)
+            if (!result.isSuccess) {
+                teamQuotaSnapshot = null
+                teamQuotaError = result.error
+                    ?: "Workspace access could not be refreshed. Check your connection and retry."
+            }
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(quotaContextKey) {
+        // Install the quota before marking this data context writable. This also covers
+        // personal<->team switching, where the same Room repository changes databases.
+        vm.updateQuotaLimits(activeQuotaLimits)
+        appliedQuotaContextKey = quotaContextKey
+    }
+
+    fun showQuotaVerificationMessage() {
+        val message = when {
+            activeWorkspaceId.isNullOrBlank() ->
+                "BeeKeep could not verify the active plan limits. Try again."
+            selectedTeamQuota == null ->
+                teamQuotaError ?: "Checking the workspace owner's subscription limits…"
+            !selectedTeamQuota.active ->
+                "This workspace is locked because the owner's Commercial subscription is inactive."
+            selectedTeamQuota.memberRole == "viewer" || activeWorkspaceReadOnly ->
+                "This workspace is view-only. Ask the owner to check your access."
+            else -> "Workspace access could not be verified. Check your connection and try again."
+        }
+        scope.launch { snackbarHostState.showSnackbar(message) }
+    }
+    var hasJoinedTeamWorkspace by rememberSaveable {
+        mutableStateOf(autoVoicePrefs.getString("selected_team_workspace_id", "").orEmpty().isNotBlank())
+    }
+    val isCommercialPlan = purchasePlan == BeeKeepPlan.COMMERCIAL
+    val nfcAccessScopeKey = if (isPersonalDataset) {
+        "personal:${account.userId.orEmpty()}"
+    } else {
+        "workspace:${activeWorkspaceId.orEmpty()}"
+    }
+    val nfcAccessResolved = if (isPersonalDataset) {
+        commercialEntitlementResolved
+    } else {
+        // Do not trust a quota snapshot from the previously selected team while
+        // the new workspace entitlement is still being loaded.
+        quotaSnapshotVerified
+    }
+    val resolvedNfcAccess = BeeKeepNfcAccessPolicy.resolve(
+        isPersonalDataset = isPersonalDataset,
+        personalCommercialActive = commercialEntitlementResolved && isCommercialPlan,
+        workspaceOwnerCommercialActive = selectedTeamQuota?.active,
+        workspaceMemberRole = selectedTeamQuota?.memberRole,
+        workspaceWritable = !activeWorkspaceReadOnly
+    )
+    val nfcCanScan = nfcAccessResolved && resolvedNfcAccess.canScan
+    val nfcCanManage = nfcAccessResolved && resolvedNfcAccess.canManageTags
+    var hasServerCommercialEntitlement by rememberSaveable { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(account.signedIn, purchasePlan) {
+        if (!account.signedIn) {
+            hasServerCommercialEntitlement = false
+        } else {
+            val entitlement = cloud.myActiveCommercialEntitlement()
+            // Preserve a previously verified entitlement during transient network failures.
+            if (entitlement.isSuccess) {
+                hasServerCommercialEntitlement = entitlement.value == true
+            }
+        }
+    }
+    val hasCommercialWorkspaceAccess = isCommercialPlan || hasServerCommercialEntitlement
+    var workspaceMembershipResolvedForUser by rememberSaveable { mutableStateOf(false) }
+
+    // Discover team access from the signed-in account on every device. A saved local workspace
+    // selection is only a convenience and must not decide whether a real member can open the page.
+    androidx.compose.runtime.LaunchedEffect(account.signedIn, account.email) {
+        if (!account.signedIn) {
+            workspaceMembershipResolvedForUser = false
+        } else {
+            workspaceMembershipResolvedForUser = false
+            val membership = cloud.listWorkspaces()
+            if (membership.isSuccess) {
+                val hasTeamMembership = membership.value.orEmpty().any { workspace -> !workspace.is_personal }
+                hasJoinedTeamWorkspace = hasTeamMembership
+                workspaceMembershipResolvedForUser = true
+                if (!hasTeamMembership) {
+                    autoVoicePrefs.edit { remove("selected_team_workspace_id") }
+                }
+            } else {
+                // Do not trap a valid member outside the Workspace page during a transient
+                // membership lookup failure; the page can surface the error and allow a retry.
+                hasJoinedTeamWorkspace = true
+                workspaceMembershipResolvedForUser = true
+            }
+        }
+    }
+
+    val showWorkspaceDestination = hasCommercialWorkspaceAccess ||
+        (account.signedIn && (hasJoinedTeamWorkspace || !workspaceMembershipResolvedForUser)) ||
+        !activeWorkspaceId.isNullOrBlank()
+    androidx.compose.runtime.LaunchedEffect(activeWorkspaceId) {
+        if (!activeWorkspaceId.isNullOrBlank()) hasJoinedTeamWorkspace = true
+    }
     val apiaries by vm.apiaries.collectAsStateWithLifecycle()
+    val harvestSettingsScopeKey = remember(activeWorkspaceId, account.userId) {
+        workspaceActionSettingsScopeKey(activeWorkspaceId, account.userId)
+    }
+    val savedHarvestActionSettings by repository
+        .observeWorkspaceActionSettings(harvestSettingsScopeKey)
+        .collectAsStateWithLifecycle(initialValue = null)
+    val currentHarvestQuantityMode = HarvestQuantityMode.fromStorage(
+        savedHarvestActionSettings?.harvestQuantityMode
+    )
+    androidx.compose.runtime.LaunchedEffect(activeWorkspaceId) {
+        clearApiaryBatchAction()
+    }
+    val apiaryHiveCounts by vm.apiaryHiveCounts.collectAsStateWithLifecycle()
+    var showViewOnlyDialog by rememberSaveable { mutableStateOf(false) }
+
+    androidx.compose.runtime.LaunchedEffect(readOnlyWriteAttempt) {
+        if (readOnlyWriteAttempt > 0L) showViewOnlyDialog = true
+    }
+    androidx.compose.runtime.LaunchedEffect(snackbarHostState.currentSnackbarData?.visuals?.message) {
+        val message = snackbarHostState.currentSnackbarData?.visuals?.message
+        if (message?.contains("view-only", ignoreCase = true) == true) {
+            showViewOnlyDialog = true
+            snackbarHostState.currentSnackbarData?.dismiss()
+        }
+    }
+    if (showViewOnlyDialog) {
+        AlertDialog(
+            onDismissRequest = { showViewOnlyDialog = false },
+            title = { Text("VIEW ONLY", fontWeight = androidx.compose.ui.text.font.FontWeight.ExtraBold) },
+            text = {
+                Text(
+                    "Your role in this team is view-only. You can view shared records, but you cannot save inspections or make changes. Ask a workspace owner to update your role if you need editing access."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showViewOnlyDialog = false }) { Text("OK") }
+            }
+        )
+    }
     val selected by vm.selected.collectAsStateWithLifecycle()
-    val inspections by vm.inspections.collectAsStateWithLifecycle()
-    val events by vm.events.collectAsStateWithLifecycle()
     val feedings by vm.feedings.collectAsStateWithLifecycle()
+    val feedingsLoading by vm.feedingsLoading.collectAsStateWithLifecycle()
+    val feedingsError by vm.feedingsError.collectAsStateWithLifecycle()
     val treatments by vm.treatments.collectAsStateWithLifecycle()
+    val treatmentsLoading by vm.treatmentsLoading.collectAsStateWithLifecycle()
+    val treatmentsError by vm.treatmentsError.collectAsStateWithLifecycle()
     val harvests by vm.harvests.collectAsStateWithLifecycle()
+    val harvestsLoading by vm.harvestsLoading.collectAsStateWithLifecycle()
+    val harvestsError by vm.harvestsError.collectAsStateWithLifecycle()
     val ready by vm.ready.collectAsStateWithLifecycle()
+
+    // Keep the Commercial test subscription's expiry live while BeeKeep stays open, not only on app resume.
+    androidx.compose.runtime.LaunchedEffect(purchasePlanName) {
+        if (purchasePlan.isPaidSubscription) {
+            val expiresAt = BeeKeepEntitlements.debugCommercialExpiresAt(context)
+            if (expiresAt != null) {
+                val remainingMillis = expiresAt - System.currentTimeMillis()
+                if (remainingMillis > 0L) kotlinx.coroutines.delay(remainingMillis)
+            }
+            // Re-check even when the expiry getter returns null, since it may have
+            // noticed and normalized an expiry at the exact time this effect started.
+            purchasePlanName = BeeKeepEntitlements.currentPlan(context).name
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(
+        screen,
+        nfcAccessResolved,
+        nfcCanScan,
+        isPersonalDataset
+    ) {
+        if (!nfcAccessResolved || nfcCanScan ||
+            (screen != Screen.TAG_MANAGER && screen != Screen.SCAN)
+        ) return@LaunchedEffect
+
+        nfc.stop(activity)
+        if (isPersonalDataset) {
+            purchaseBackScreen = Screen.MORE
+            purchaseSuccessScreen = Screen.MORE
+            screen = Screen.PURCHASES
+        } else {
+            screen = Screen.MORE
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    "NFC is locked in this workspace until its owner has active Commercial access."
+                )
+            }
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(
+        nfcAccessScopeKey,
+        nfcAccessResolved,
+        nfcCanScan,
+        nfcCanManage,
+        fastTagAssignmentMode,
+        fastAssignmentSessionActive,
+        fastAssignmentScreenActive
+    ) {
+        // Keep the NFC controller aligned with the entitlement for the selected
+        // personal/team database. It starts denied and is enabled only after a
+        // trusted personal or membership-scoped workspace check succeeds.
+        nfc.setEntitlementAccess(
+            accessScopeKey = nfcAccessScopeKey,
+            canScan = nfcAccessResolved && nfcCanScan,
+            canManageTags = nfcAccessResolved && nfcCanManage
+        )
+        if (!nfcAccessResolved) return@LaunchedEffect
+
+        if (!nfcCanScan || !nfcCanManage) {
+            nfc.stop(activity)
+            nfc.finishFastAssignmentFlow(activity, preserveLastUid = false)
+            fastTagAssignmentMode = false
+            fastAssignmentSessionActive = false
+            fastAssignmentScreenActive = false
+            fastAssignmentCurrentHiveId = null
+            fastAssignmentApiaryName = null
+            fastAssignmentIgnoredUid = null
+            fastAssignmentAssignedHiveIds = emptySet()
+            pendingAutoTagWriteHiveId = null
+            pendingAutoTagWriteIgnoredUid = null
+            pendingInspectionHiveId = null
+            pendingAutoStartVoiceHiveId = null
+            autoVoicePrefs.edit {
+                putBoolean("fast_tag_assignment_mode", false)
+                remove("fast_tag_session_active")
+                remove("fast_tag_session_screen_active")
+                remove("fast_tag_session_current_hive_id")
+                remove("fast_tag_session_apiary")
+                remove("fast_tag_session_ignored_uid")
+                remove("fast_tag_session_assigned_ids")
+            }
+        }
+
+        if (nfcCanScan) {
+            // Viewers may still scan and verify tags. Only writable roles retain
+            // Fast Tag Assignment and other tag-changing operations.
+            val allowPassiveReads = !fastTagAssignmentMode &&
+                !fastAssignmentSessionActive && !fastAssignmentScreenActive &&
+                screen != Screen.SCAN && screen != Screen.TAG_MANAGER
+            nfc.setPassiveReadingEnabled(activity, allowPassiveReads)
+        } else {
+            nfc.setPassiveReadingEnabled(activity, false)
+            unassignedTagUid = null
+            pendingTagUid = null
+            (activity as? MainActivity)?.pendingNfcResult?.value = null
+        }
+    }
+
+    fun requestHiveAccess(hive: Hive): Boolean {
+        val latestPlan = BeeKeepEntitlements.currentPlan(context)
+        if (isPersonalDataset && purchasePlanName != latestPlan.name) {
+            purchasePlanName = latestPlan.name
+        }
+        val latestHiveLimit = if (isPersonalDataset) {
+            BeeKeepEntitlements.hiveLimit(latestPlan, cloudHiveLimitOverride)
+        } else {
+            effectiveHiveLimit
+        }
+        val latestLockedHiveIds = if (quotaSnapshotVerified) {
+            BeeKeepEntitlements.hiveIdsBeyondLimit(
+                quotaOrderedHives.map { it.id },
+                latestHiveLimit
+            )
+        } else {
+            emptySet()
+        }
+        if (hive.id !in latestLockedHiveIds) return true
+        lockedHivePromptName = hiveDisplayName(hive.number)
+        lockedHivePromptHiveId = hive.id
+        lockedHivePromptVisible = true
+        return false
+    }
+
+    fun requestHiveAccessById(hiveId: Long): Boolean {
+        val hive = (hives + deadHives).firstOrNull { it.id == hiveId }
+        return hive?.let { requestHiveAccess(it) } ?: true
+    }
+
+    fun openLockedHiveUpgrade() {
+        lockedHivePromptVisible = false
+        lockedHivePromptName = null
+        lockedHivePromptHiveId = null
+        purchaseBackScreen = screen
+        purchaseSuccessScreen = screen
+        screen = Screen.PURCHASES
+    }
+
+    fun canUpgradeLockedHive(): Boolean =
+        isPersonalDataset || selectedTeamQuota?.memberRole == "owner"
+
+    fun lockedHiveAccessMessage(hiveName: String): String {
+        val limit = activeQuotaLimits.hiveLimit
+        return if (canUpgradeLockedHive()) {
+            "$hiveName is above the current ${activeQuotaLimits.plan.displayName} plan's ${limit}-hive limit. Your hive and its records are safe. Upgrade to Commercial to unlock and edit it."
+        } else {
+            "$hiveName is above the workspace owner's current ${activeQuotaLimits.plan.displayName} plan's ${limit}-hive limit. Your hive and its records are safe. Ask the workspace owner to renew Commercial to unlock and edit it."
+        }
+    }
+
+    fun stopFastAssignmentForLockedHive() {
+        nfc.stop(activity)
+        nfc.finishFastAssignmentFlow(activity, preserveLastUid = false)
+        fastAssignmentSessionActive = false
+        fastAssignmentScreenActive = false
+        fastAssignmentCurrentHiveId = null
+        fastAssignmentApiaryName = null
+        fastAssignmentIgnoredUid = null
+        fastAssignmentAssignedHiveIds = emptySet()
+        pendingAutoTagWriteHiveId = null
+        pendingAutoTagWriteIgnoredUid = null
+        pendingAutoStartVoiceHiveId = null
+        pendingInspectionHiveId = null
+        inspecting = false
+        selectedHiveOpen = false
+        vm.clearHive()
+    }
+
+    // If a plan renewal unlocks the hive behind an already-open alert, dismiss that
+    // stale prompt immediately. The currently displayed hive/list can continue in place.
+    androidx.compose.runtime.LaunchedEffect(lockedHiveIds, lockedHivePromptVisible, lockedHivePromptHiveId) {
+        val promptHiveId = lockedHivePromptHiveId
+        if (lockedHivePromptVisible && promptHiveId != null && promptHiveId !in lockedHiveIds) {
+            lockedHivePromptVisible = false
+            lockedHivePromptName = null
+            lockedHivePromptHiveId = null
+        }
+    }
+
+    // Stop any in-flight hardware operation as soon as the currently open hive
+    // becomes locked, while leaving the lock screen available to explain the expiry.
+    androidx.compose.runtime.LaunchedEffect(lockedHiveIds, selected?.id, fastAssignmentCurrentHiveId) {
+        val selectedHiveLocked = selected?.id?.let { it in lockedHiveIds } == true
+        val fastTargetLocked = fastAssignmentCurrentHiveId?.let { it in lockedHiveIds } == true
+        if (selectedHiveLocked || fastTargetLocked) {
+            nfc.stop(activity)
+            (activity as? MainActivity)?.pendingNfcResult?.value = null
+            pendingAutoTagWriteHiveId = null
+            pendingAutoTagWriteIgnoredUid = null
+            pendingAutoStartVoiceHiveId = null
+            pendingInspectionHiveId = null
+            inspecting = false
+        }
+    }
+
+    // Show a themed prompt when the active plan's hive cap is reached.
+    androidx.compose.runtime.LaunchedEffect(
+        addHive,
+        hives.size,
+        deadHives.size,
+        lockedHiveIds,
+        purchasePlan,
+        effectiveHiveLimit,
+        quotaEnforcementReady
+    ) {
+        val availablePlanHiveCount = BeeKeepEntitlements.countHivesSubjectToFreeLimit(
+            (hives + deadHives).map { it.id },
+            lockedHiveIds
+        )
+        if (quotaEnforcementReady && addHive && availablePlanHiveCount >= effectiveHiveLimit) {
+            hiveLimitPromptVisible = true
+        }
+    }
 
     fun skipFastAssignmentHive(skippedHiveId: Long, reason: String) {
         // Ignore stale or duplicate skip callbacks after another hive becomes current.
@@ -585,21 +1196,15 @@ fun BeeKeepApp(
                 ?: skippedHive?.apiary
                 ?: autoVoicePrefs.getString("fast_tag_session_apiary", null)
                 ?: ""
-            val apiaryHives = latestHives.filter {
-                it.apiary.equals(apiaryName, ignoreCase = true) && !it.isDead
-            }
-            val currentIndex = apiaryHives.indexOfFirst { it.id == skippedHiveId }
-            val candidates = if (currentIndex >= 0) {
-                apiaryHives.drop(currentIndex + 1) + apiaryHives.take(currentIndex)
-            } else {
-                apiaryHives
-            }
-            val nextHive = candidates.firstOrNull { candidate ->
-                candidate.id != skippedHiveId &&
-                    candidate.id !in fastAssignmentAssignedHiveIds &&
-                    candidate.id !in alreadyAssignedHiveIds &&
-                    candidate.tagUid.isNullOrBlank()
-            }
+            val nextHive = FastTagTargetSelection.nextUntaggedHive(
+                hives = latestHives,
+                apiaryId = skippedHive?.apiaryId,
+                apiaryName = apiaryName,
+                startHiveId = skippedHiveId,
+                includeStart = false,
+                excludedHiveIds = fastAssignmentAssignedHiveIds + alreadyAssignedHiveIds + skippedHiveId,
+                lockedHiveIds = lockedHiveIds
+            )
             val skippedLabel = skippedHive?.let { hiveReferenceName(it.number) }
                 ?: ("Hive " + skippedHiveId)
 
@@ -685,21 +1290,28 @@ fun BeeKeepApp(
                 .filter { !it.first.isNullOrBlank() }
                 .map { it.second }
                 .toSet()
-            val apiaryHives = latestHives.filter {
-                it.apiary.equals(apiaryName, ignoreCase = true) && !it.isDead
-            }
-            val currentIndex = apiaryHives.indexOfFirst { it.id == currentHive.id }
-            val nextCandidates = if (currentIndex >= 0) {
-                apiaryHives.drop(currentIndex + 1) + apiaryHives.take(currentIndex)
-            } else {
-                apiaryHives
-            }
-            val nextUntaggedHive = nextCandidates.firstOrNull { hive ->
-                hive.id != currentHive.id &&
-                    hive.id !in assignedInThisRun &&
-                    hive.id !in alreadyAssignedHiveIds &&
-                    hive.tagUid.isNullOrBlank()
-            }
+            val currentLockedHiveIds = BeeKeepEntitlements.hiveIdsBeyondLimit(
+                (latestHives + deadHives)
+                    .distinctBy { it.id }
+                    .sortedWith(
+                        compareBy<Hive> { it.isDead }
+                            .thenBy { it.number.toIntOrNull() ?: Int.MAX_VALUE }
+                            .thenBy { it.number.lowercase(Locale.ROOT) }
+                            .thenBy { it.apiary.lowercase(Locale.ROOT) }
+                            .thenBy { it.id }
+                    )
+                    .map { it.id },
+                effectiveHiveLimit
+            )
+            val nextUntaggedHive = FastTagTargetSelection.nextUntaggedHive(
+                hives = latestHives,
+                apiaryId = currentHive.apiaryId,
+                apiaryName = apiaryName,
+                startHiveId = currentHive.id,
+                includeStart = false,
+                excludedHiveIds = assignedInThisRun + alreadyAssignedHiveIds + currentHive.id,
+                lockedHiveIds = currentLockedHiveIds
+            )
 
             // A Stop action must win over a slow snapshot lookup; never revive a cancelled run.
             if (!fastAssignmentSessionActive && !fastAssignmentScreenActive) return@launch
@@ -727,45 +1339,63 @@ fun BeeKeepApp(
     }
 
     fun startFastTagAssignmentFromHive(requestedHive: Hive) {
+        if (!requestHiveAccess(requestedHive)) return
         (activity as? MainActivity)?.stopHiveAnnouncements()
-        val apiaryHives = hives.filter {
-            it.apiary.equals(requestedHive.apiary, ignoreCase = true) && !it.isDead
-        }
-        val currentIndex = apiaryHives.indexOfFirst { it.id == requestedHive.id }
-        val candidateOrder = if (currentIndex >= 0) {
-            apiaryHives.drop(currentIndex) + apiaryHives.take(currentIndex)
-        } else {
-            apiaryHives
-        }
-        val firstUntaggedHive = candidateOrder.firstOrNull { it.tagUid.isNullOrBlank() }
-        if (firstUntaggedHive == null) {
-            scope.launch {
-                snackbarHostState.showSnackbar(
-                    "Fast Tag Assignment: no untagged hives remain in ${requestedHive.apiary}."
-                )
-            }
-            return
-        }
 
-        // With Fast Tag Assignment enabled, selecting a hive starts the dedicated
-        // tagging flow directly. Never open the standard Hive Detail page first.
-        (activity as? MainActivity)?.pendingNfcResult?.value = null
-        nfc.beginFastAssignmentFlow(activity)
-        fastAssignmentSessionActive = true
-        fastAssignmentApiaryName = requestedHive.apiary
-        fastAssignmentAssignedHiveIds = emptySet()
-        fastAssignmentCurrentHiveId = firstUntaggedHive.id
-        fastAssignmentIgnoredUid = null
-        fastAssignmentScreenActive = true
-        pendingAutoTagWriteHiveId = null
-        pendingAutoTagWriteIgnoredUid = null
-        pendingInspectionHiveId = null
-        pendingAutoStartVoiceHiveId = null
-        inspecting = false
-        selectedHiveOpen = false
-        logType = null
-        screen = Screen.HOME
-        vm.clearHive()
+        scope.launch {
+            // Use Room's current hive rows and assignment ledger. A stale Hive.tagUid cache
+            // must not make already-tagged targets appear eligible for a fresh NFC write.
+            val latestHives = runCatching { vm.getHivesSnapshot() }.getOrNull()
+            val latestAssignments = runCatching { vm.getAllKnownNfcTagAssignments() }.getOrNull()
+            if (latestHives == null || latestAssignments == null) {
+                snackbarHostState.showSnackbar("Fast Tag Assignment stopped. BeeKeep couldn't verify the current hive/tag records. No tag was written.")
+                return@launch
+            }
+            val selectedHive = latestHives.firstOrNull { it.id == requestedHive.id }
+            if (selectedHive == null) {
+                snackbarHostState.showSnackbar("Fast Tag Assignment stopped because the selected hive no longer exists in this workspace.")
+                return@launch
+            }
+            val alreadyAssignedHiveIds = latestAssignments
+                .filter { !it.first.isNullOrBlank() }
+                .map { it.second }
+                .toSet()
+            val firstUntaggedHive = FastTagTargetSelection.nextUntaggedHive(
+                hives = latestHives,
+                apiaryId = selectedHive.apiaryId,
+                apiaryName = selectedHive.apiary,
+                startHiveId = selectedHive.id,
+                includeStart = true,
+                excludedHiveIds = alreadyAssignedHiveIds,
+                lockedHiveIds = lockedHiveIds
+            )
+            if (firstUntaggedHive == null) {
+                snackbarHostState.showSnackbar(
+                    "Fast Tag Assignment: no untagged hives remain in ${selectedHive.apiary}."
+                )
+                return@launch
+            }
+
+            // Selecting a hive starts a session scoped to that hive's apiary identity.
+            // The writer only assigns tags to existing, explicitly selected hive IDs.
+            (activity as? MainActivity)?.pendingNfcResult?.value = null
+            nfc.beginFastAssignmentFlow(activity)
+            fastAssignmentSessionActive = true
+            fastAssignmentApiaryName = selectedHive.apiary
+            fastAssignmentAssignedHiveIds = emptySet()
+            fastAssignmentCurrentHiveId = firstUntaggedHive.id
+            fastAssignmentIgnoredUid = null
+            fastAssignmentScreenActive = true
+            pendingAutoTagWriteHiveId = null
+            pendingAutoTagWriteIgnoredUid = null
+            pendingInspectionHiveId = null
+            pendingAutoStartVoiceHiveId = null
+            inspecting = false
+            selectedHiveOpen = false
+            logType = null
+            screen = Screen.HOME
+            vm.clearHive()
+        }
     }
 
     // Keep the in-progress handoff recoverable if Android recreates MainActivity
@@ -816,6 +1446,12 @@ fun BeeKeepApp(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 nfcEnabledForIndicator = nfc.isAvailable() && nfc.isEnabled()
+                purchasePlanName = BeeKeepEntitlements.currentPlan(context).name
+                // Refresh subscriptions that may have been renewed outside the open screen.
+                scope.launch {
+                    cloud.refreshAccount()
+                    teamQuotaRefreshSignal += 1
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -826,23 +1462,11 @@ fun BeeKeepApp(
         }
     }
 
-    // Offer first-run setup only after every record stream has hydrated. Existing
-    // workspaces are marked as initialized silently so upgrades are never interrupted.
-    androidx.compose.runtime.LaunchedEffect(ready, hives, deadHives, apiaries) {
-        if (!ready || firstRunPromptChecked) return@LaunchedEffect
-        firstRunPromptChecked = true
-        val setupAlreadyCompleted = autoVoicePrefs.getBoolean("initial_setup_completed", false)
-        if (!setupAlreadyCompleted && hives.isEmpty() && deadHives.isEmpty() && apiaries.isEmpty()) {
-            firstRunPromptVisible = true
-        } else if (!setupAlreadyCompleted) {
-            autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
-        }
-    }
-
-    // Show any cloud-reset warning after the user dismisses the fresh-start prompt.
-    androidx.compose.runtime.LaunchedEffect(firstRunPromptVisible, pendingResetWarning, screen) {
+    // Show cloud-reset warnings as soon as the user returns to Home. This no longer
+    // depends on the removed first-launch setup prompt.
+    androidx.compose.runtime.LaunchedEffect(pendingResetWarning, screen) {
         val warning = pendingResetWarning ?: return@LaunchedEffect
-        if (!firstRunPromptVisible && screen == Screen.HOME) {
+        if (screen == Screen.HOME) {
             snackbarHostState.showSnackbar(warning)
             pendingResetWarning = null
         }
@@ -914,6 +1538,11 @@ fun BeeKeepApp(
     }
 
     fun checkHiveLocation(hive: Hive) {
+        if (!requestHiveAccess(hive)) {
+            pendingLocationHive = null
+            locationCheckCallback = null
+            return
+        }
         val currentApiary = apiaries.firstOrNull { it.name.equals(hive.apiary, ignoreCase = true) }
         if (apiaries.none { it.latitude != null && it.longitude != null }) {
             scope.launch { snackbarHostState.showSnackbar("Save GPS coordinates for your apiaries to enable hive location checks.") }
@@ -1009,16 +1638,27 @@ fun BeeKeepApp(
                     val resolvedHiveId = NfcTagResolution.resolveHiveId(assignedHive?.id)
                     val resolvedHive = assignedHive?.takeIf { it.id == resolvedHiveId }
                     if (resolvedHive != null) {
-                        checkHiveLocation(resolvedHive)
-                        if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
-                        vm.openHive(resolvedHive.id)
-                        selectedHiveOpen = true
-                        screen = Screen.HOME
-                        pendingAutoStartVoiceHiveId = resolvedHive.id
-                        pendingInspectionHiveId = resolvedHive.id
-                        snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready")
-                    } else {
+                        if (!requestHiveAccess(resolvedHive)) {
+                            screen = Screen.HOME
+                            pendingAutoStartVoiceHiveId = null
+                            pendingInspectionHiveId = null
+                            inspecting = false
+                        } else {
+                            checkHiveLocation(resolvedHive)
+                            if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
+                            vm.openHive(resolvedHive.id)
+                            selectedHiveOpen = true
+                            screen = Screen.HOME
+                            pendingAutoStartVoiceHiveId = resolvedHive.id
+                            pendingInspectionHiveId = resolvedHive.id
+                            snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready")
+                        }
+                    } else if (nfcCanManage) {
                         showUnassignedTagPrompt(normalizedUid, Screen.HOME, result.platformTag)
+                    } else {
+                        snackbarHostState.showSnackbar(
+                            "This tag is not assigned in the selected workspace. Ask an Owner, Admin or Member to assign it."
+                        )
                     }
                 }
             }
@@ -1028,10 +1668,37 @@ fun BeeKeepApp(
     }
 
     fun startManualNfcScan() {
+        if (!nfcAccessResolved) {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    if (isPersonalDataset) "Checking your BeeKeep plan…" else "Checking the workspace owner's Commercial access…"
+                )
+            }
+            return
+        }
+        if (!nfcCanScan) {
+            if (isPersonalDataset) {
+                purchaseBackScreen = screen
+                purchaseSuccessScreen = screen
+                screen = Screen.PURCHASES
+            } else {
+                scope.launch {
+                    snackbarHostState.showSnackbar(
+                        "NFC is locked in this workspace until its owner has active Commercial access."
+                    )
+                }
+            }
+            return
+        }
         // A deliberate tap on Scan is an explicit retry, even if this UID was just dismissed.
         nfc.clearUnassignedPromptSuppressionForExplicitScan()
-        nfc.startReadAndPrepareForBeeKeep(activity) { result ->
-            handleManualNfcScanResult(result)
+        val onResult: (NfcResult) -> Unit = ::handleManualNfcScanResult
+        if (nfcCanManage) {
+            nfc.startReadAndPrepareForBeeKeep(activity, onResult)
+        } else {
+            // Viewers can read existing assignments, but a scan must never write
+            // launch data to an unassigned physical tag.
+            nfc.startRead(activity, onResult)
         }
         scanning = nfc.isScanning()
     }
@@ -1044,9 +1711,17 @@ fun BeeKeepApp(
         fastTagAssignmentMode,
         fastAssignmentSessionActive,
         fastAssignmentScreenActive,
-        fastAssignmentStateHydrated
+        fastAssignmentStateHydrated,
+        nfcCanScan,
+        nfcAccessResolved,
+        nfcCanManage
     ) {
         val result = incomingNfc ?: return@LaunchedEffect
+        if (!nfcAccessResolved) return@LaunchedEffect
+        if (!nfcCanScan) {
+            (activity as? MainActivity)?.pendingNfcResult?.value = null
+            return@LaunchedEffect
+        }
         if (!ready || !fastAssignmentStateHydrated) return@LaunchedEffect
         // The toggle itself—not only the current write transaction—owns NFC routing.
         // Ignore normal scan navigation until Fast Tag Assignment is switched off.
@@ -1108,27 +1783,40 @@ fun BeeKeepApp(
         val resolvedHiveId = NfcTagResolution.resolveHiveId(assignedHive?.id)
         val resolvedHive = assignedHive?.takeIf { it.id == resolvedHiveId }
         if (resolvedHive != null) {
-            checkHiveLocation(resolvedHive)
-            if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
-            val alreadyOpen = selectedHiveOpen && selected?.id == resolvedHive.id
-            val alreadyInspectingThisHive = inspecting && selected?.id == resolvedHive.id
-            if (!alreadyInspectingThisHive) pendingAutoStartVoiceHiveId = resolvedHive.id
-            if (!alreadyOpen) {
-                vm.openHive(resolvedHive.id)
-                selectedHiveOpen = true
-            }
-            screen = Screen.HOME
-            if (selected?.id == resolvedHive.id) {
-                inspecting = true
+            if (!requestHiveAccess(resolvedHive)) {
+                screen = Screen.HOME
+                pendingAutoStartVoiceHiveId = null
+                pendingInspectionHiveId = null
+                inspecting = false
             } else {
-                pendingInspectionHiveId = resolvedHive.id
+                checkHiveLocation(resolvedHive)
+                if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(resolvedHive.number)
+                val alreadyOpen = selectedHiveOpen && selected?.id == resolvedHive.id
+                val alreadyInspectingThisHive = inspecting && selected?.id == resolvedHive.id
+                if (!alreadyInspectingThisHive) pendingAutoStartVoiceHiveId = resolvedHive.id
+                if (!alreadyOpen) {
+                    vm.openHive(resolvedHive.id)
+                    selectedHiveOpen = true
+                }
+                screen = Screen.HOME
+                if (selected?.id == resolvedHive.id) {
+                    inspecting = true
+                } else {
+                    pendingInspectionHiveId = resolvedHive.id
+                }
+                if (!alreadyOpen) scope.launch { snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready") }
             }
-            if (!alreadyOpen) scope.launch { snackbarHostState.showSnackbar("${hiveReferenceName(resolvedHive.number)} recognized • inspection ready") }
-        } else {
+        } else if (nfcCanManage) {
             // Even when a hive is open, an unassigned physical tag must go through
             // an explicit assignment choice. Never infer ownership from current screen.
             showUnassignedTagPrompt(normalizedUid, Screen.HOME, result.platformTag)
             screen = Screen.SCAN
+        } else {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    "This tag is not assigned in the selected workspace. Ask an Owner, Admin or Member to assign it."
+                )
+            }
         }
         (activity as? MainActivity)?.pendingNfcResult?.value = null
     }
@@ -1244,13 +1932,15 @@ fun BeeKeepApp(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    vm.moveHiveToApiary(hive.id, targetApiary.name) { success, error ->
-                        pendingApiaryMove = null
-                        scope.launch {
-                            snackbarHostState.showSnackbar(
-                                if (success) "${hiveReferenceName(hive.number)} moved to ${targetApiary.name}"
-                                else error ?: "Could not move the hive."
-                            )
+                    pendingApiaryMove = null
+                    if (requestHiveAccess(hive)) {
+                        vm.moveHiveToApiary(hive.id, targetApiary.name) { success, error ->
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    if (success) "${hiveReferenceName(hive.number)} moved to ${targetApiary.name}"
+                                    else error ?: "Could not move the hive."
+                                )
+                            }
                         }
                     }
                 }) { Text("MOVE HIVE", fontWeight = FontWeight.ExtraBold) }
@@ -1259,6 +1949,102 @@ fun BeeKeepApp(
                 TextButton(onClick = { pendingApiaryMove = null }) { Text("KEEP CURRENT APIARY") }
             }
         )
+    }
+
+    if (lockedHivePromptVisible) {
+        AlertDialog(
+            onDismissRequest = {
+                lockedHivePromptVisible = false
+                lockedHivePromptName = null
+                lockedHivePromptHiveId = null
+            },
+            shape = RoundedCornerShape(26.dp),
+            containerColor = Color(0xFFFFFBEB),
+            titleContentColor = Color(0xFF78350F),
+            textContentColor = Color(0xFF654321),
+            title = { Text("Upgrade BeeKeep", fontWeight = FontWeight.ExtraBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${lockedHivePromptName ?: "This hive"} is above the current ${activeQuotaLimits.plan.displayName} plan's ${activeQuotaLimits.hiveLimit}-hive limit.")
+                    if (isPersonalDataset || selectedTeamQuota?.memberRole == "owner") {
+                        Text("Your hive and its existing records are safe. Upgrade to Commercial to unlock and edit it.")
+                    } else {
+                        Text("Your hive and its existing records are safe. Ask the workspace owner to renew Commercial to unlock and edit it.")
+                    }
+                }
+            },
+            confirmButton = {
+                if (isPersonalDataset || selectedTeamQuota?.memberRole == "owner") {
+                    Button(onClick = { openLockedHiveUpgrade() }, shape = RoundedCornerShape(14.dp)) {
+                        Text("UPGRADE TO COMMERCIAL", fontWeight = FontWeight.ExtraBold)
+                    }
+                } else {
+                    TextButton(onClick = {
+                        lockedHivePromptVisible = false
+                        lockedHivePromptName = null
+                        lockedHivePromptHiveId = null
+                    }) { Text("OK") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    lockedHivePromptVisible = false
+                    lockedHivePromptName = null
+                    lockedHivePromptHiveId = null
+                }) {
+                    Text("NOT NOW", color = Color(0xFF78350F))
+                }
+            }
+        )
+    }
+
+    if (screen == Screen.PURCHASES) {
+        PurchaseScreen(
+            padding = PaddingValues(0.dp),
+            currentPlan = purchasePlan,
+            onBack = { screen = purchaseBackScreen },
+            onChoosePlan = { plan ->
+                if (BuildConfig.DEBUG) {
+                    scope.launch {
+                        val previousPlan = BeeKeepEntitlements.currentPlan(context)
+                        val serverSync = cloud.syncDebugPlanToStaging(plan)
+                        if (!serverSync.isSuccess) {
+                            snackbarHostState.showSnackbar(
+                                "Staging entitlement was NOT updated: ${serverSync.error ?: "unknown error"}. " +
+                                    "The device plan was left unchanged so it stays in sync with Workspace access."
+                            )
+                            return@launch
+                        }
+
+                        BeeKeepEntitlements.setDebugPlan(context, plan)
+                        purchasePlanName = plan.name
+
+                        // The staging entitlement is authoritative now. Refresh both the account
+                        // plan and selected team's owner access, then refetch that team's quota.
+                        // The new locked-hive set is derived from this state, so the current screen
+                        // unlocks immediately without requiring the beekeeper to close/reopen it.
+                        cloud.refreshAccount()
+                        teamQuotaRefreshSignal += 1
+
+                        if (plan != BeeKeepPlan.HOBBYIST) {
+                            screen = purchaseSuccessScreen
+                        }
+
+                        val localMessage = when {
+                            plan == BeeKeepPlan.HOBBYIST && previousPlan.isPaidSubscription ->
+                                "Debug plan reset to Hobbyist. All existing records are preserved."
+                            plan == BeeKeepPlan.HOBBYIST ->
+                                "Debug test plan set to Hobbyist."
+                            previousPlan == BeeKeepPlan.HOBBYIST ->
+                                "BeeKeep Commercial activated. Existing records were preserved."
+                            else -> "Debug test plan activated: BeeKeep ${plan.displayName}."
+                        }
+                        snackbarHostState.showSnackbar("${localMessage} Staging cloud entitlement updated.")
+                    }
+                }
+            }
+        )
+        return
     }
 
     if (!ready) {
@@ -1275,13 +2061,40 @@ fun BeeKeepApp(
         AddHiveScreen(
             apiaries = apiaries,
             initialApiary = selectedApiaryName,
+            currentPlan = activeQuotaLimits.plan,
+            hiveLimit = activeQuotaLimits.hiveLimit,
             defaultQueenStatus = autoVoicePrefs.getString("default_queen_status", "Laying")?.takeIf { it in setOf("Laying", "Queenless", "Virgin") } ?: "Laying",
             defaultStrength = autoVoicePrefs.getInt("default_starting_strength", 3).coerceIn(1, 5),
-            onBack = { addHive = false; pendingTagUid = null }
+            hiveLimitPromptVisible = hiveLimitPromptVisible,
+            onDismissHiveLimitPrompt = { hiveLimitPromptVisible = false },
+            onOpenUpgrade = {
+                hiveLimitPromptVisible = false
+                addHive = false
+                pendingTagUid = null
+                purchaseBackScreen = screen
+                purchaseSuccessScreen = Screen.HOME
+                screen = Screen.PURCHASES
+            },
+            onBack = {
+                addHive = false
+                pendingTagUid = null
+                hiveLimitPromptVisible = false
+            }
         ) { number, apiary, queen, strength ->
-            vm.createHive(number, apiary, queen, strength, tagUid = pendingTagUid) { success, error ->
-                scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${number.trim()} created") }
-                if (success) { addHive = false; pendingTagUid = null }
+            if (!quotaEnforcementReady) {
+                showQuotaVerificationMessage()
+            } else vm.createHive(number, apiary, queen, strength, tagUid = pendingTagUid) { success, error ->
+                if (!success && error?.contains("Hive limit reached", ignoreCase = true) == true) {
+                    // A cap rejection must open the themed prompt, not disappear into a snackbar.
+                    hiveLimitPromptVisible = true
+                } else {
+                    scope.launch { snackbarHostState.showSnackbar(error ?: "Hive ${number.trim()} created") }
+                }
+                if (success) {
+                    addHive = false
+                    pendingTagUid = null
+                    hiveLimitPromptVisible = false
+                }
             }
         }
         return
@@ -1298,6 +2111,14 @@ fun BeeKeepApp(
                         snackbarHostState.showSnackbar(error ?: "Apiary and its hives deleted")
                     }
                     if (success) {
+                        // Remove unfinished drafts for every visible hive deleted with this apiary.
+                        val deletedHiveIds = (hives + deadHives)
+                            .asSequence()
+                            .filter { it.apiary.equals(apiaryToEdit.name, ignoreCase = true) }
+                            .map { it.id }
+                            .distinct()
+                            .toList()
+                        clearInspectionDraftsForHives(activity, deletedHiveIds)
                         if (selectedApiaryName?.equals(apiaryToEdit.name, ignoreCase = true) == true) {
                             selectedApiaryName = null
                             if (screen == Screen.APIARY_HIVES) screen = Screen.APIARIES
@@ -1317,16 +2138,59 @@ fun BeeKeepApp(
         return
     }
     if (addApiary) {
-        AddApiaryScreen(locationController, null, { addApiary = false }) { _, name, notes, lat, lon, forage, water ->
-            vm.saveApiary(name, notes, lat, lon, forage, water) { success, error ->
-                scope.launch { snackbarHostState.showSnackbar(error ?: "Apiary saved") }
-                if (success) addApiary = false
+        AddApiaryScreen(
+            locationController = locationController,
+            existingApiary = null,
+            onBack = {
+                addApiary = false
+                apiaryLimitPromptVisible = false
+            },
+            apiaryLimitPromptVisible = apiaryLimitPromptVisible,
+            currentPlan = activeQuotaLimits.plan,
+            onDismissApiaryLimitPrompt = { apiaryLimitPromptVisible = false },
+            onOpenUpgrade = {
+                apiaryLimitPromptVisible = false
+                addApiary = false
+                purchaseBackScreen = screen
+                purchaseSuccessScreen = Screen.HOME
+                screen = Screen.PURCHASES
+            },
+            onSave = { _, name, notes, lat, lon, forage, water ->
+                if (!quotaEnforcementReady) {
+                    showQuotaVerificationMessage()
+                } else vm.saveApiary(name, notes, lat, lon, forage, water) { success, error ->
+                    if (!success && error?.contains("Apiary limit reached", ignoreCase = true) == true) {
+                        apiaryLimitPromptVisible = true
+                    } else {
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "Apiary saved") }
+                    }
+                    if (success) {
+                        addApiary = false
+                        apiaryLimitPromptVisible = false
+                    }
+                }
             }
-        }
+        )
         return
     }
     if (fastAssignmentScreenActive) {
         val targetHive = hives.firstOrNull { it.id == fastAssignmentCurrentHiveId }
+        if (targetHive != null && targetHive.id in lockedHiveIds) {
+            LockedHiveScreen(
+                hiveName = hiveDisplayName(targetHive.number),
+                message = lockedHiveAccessMessage(hiveDisplayName(targetHive.number)),
+                canUpgrade = canUpgradeLockedHive(),
+                onBack = {
+                    stopFastAssignmentForLockedHive()
+                    screen = Screen.HOME
+                },
+                onUpgrade = {
+                    stopFastAssignmentForLockedHive()
+                    openLockedHiveUpgrade()
+                }
+            )
+            return
+        }
         if (targetHive == null) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("Preparing the next hive…", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1338,11 +2202,21 @@ fun BeeKeepApp(
                 nfc = nfc,
                 ignoredUid = fastAssignmentIgnoredUid,
                 isTagAssignedElsewhere = { targetHiveId, uid ->
-                    (hives + deadHives).any { it.id != targetHiveId && NfcUid.matches(it.tagUid, uid) }
+                    nfc.isTagAssignedElsewhere(targetHiveId, uid)
                 },
                 checkHiveSkipReason = { hiveId ->
                     val latestHive = vm.getHivesSnapshot().firstOrNull { it.id == hiveId }
-                    val assignedHiveIds = vm.getAllKnownNfcTagAssignments()
+                    // Refresh the writer's ownership cache from Room immediately before
+                    // each write attempt. Do not let an older in-memory hive/tag snapshot
+                    // classify a released UID as already assigned.
+                    val knownAssignments = vm.getAllKnownNfcTagAssignments()
+                    val currentIndex = NfcUidIndex.fromAssignments(knownAssignments)
+                    nfc.updateKnownHiveTags(
+                        hiveIdByTagUid = currentIndex.uniqueHiveIdByUid,
+                        ready = ready,
+                        ambiguousTagUids = currentIndex.ambiguousUids
+                    )
+                    val assignedHiveIds = knownAssignments
                         .filter { !it.first.isNullOrBlank() }
                         .map { it.second }
                         .toSet()
@@ -1356,7 +2230,43 @@ fun BeeKeepApp(
                 },
                 onHiveSkipped = { hiveId, reason -> skipFastAssignmentHive(hiveId, reason) },
                 onAssignTag = { hiveId, uid, onResult ->
-                    vm.assignTagToHive(hiveId, uid, onResult = onResult)
+                    vm.assignTagToHive(hiveId, uid) { saved, error ->
+                        if (!saved) {
+                            // A failed database assignment must never trigger the success ding.
+                            onResult(false, error)
+                        } else {
+                            // Verify the saved UID has one current owner in Room before the
+                            // screen is allowed to announce success or play confirmation feedback.
+                            scope.launch {
+                                val normalizedUid = NfcUid.normalize(uid)
+                                val assignments = runCatching {
+                                    vm.getAllKnownNfcTagAssignments()
+                                }.getOrNull()
+                                if (normalizedUid == null || assignments == null) {
+                                    onResult(
+                                        false,
+                                        "BeeKeep could not verify that the tag assignment was saved. Check the hive’s tag status before trying again."
+                                    )
+                                } else {
+                                    val index = NfcUidIndex.fromAssignments(assignments)
+                                    nfc.updateKnownHiveTags(
+                                        hiveIdByTagUid = index.uniqueHiveIdByUid,
+                                        ready = ready,
+                                        ambiguousTagUids = index.ambiguousUids
+                                    )
+                                    val verifiedOwner = index.uniqueHiveIdByUid[normalizedUid]
+                                    if (normalizedUid in index.ambiguousUids || verifiedOwner != hiveId) {
+                                        onResult(
+                                            false,
+                                            "BeeKeep could not confirm that this tag is assigned to ${hiveReferenceName(hives.firstOrNull { it.id == hiveId }?.number ?: hiveId.toString())}. Check the hive’s tag status before scanning again."
+                                        )
+                                    } else {
+                                        onResult(true, null)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
                 onAssignmentSaved = { assignedUid ->
                     advanceToNextUntaggedHiveForFastAssignment(targetHive, assignedUid)
@@ -1389,24 +2299,50 @@ fun BeeKeepApp(
     // while the Fast Tag Assignment preference is enabled.
     if (inspecting && !fastTagAssignmentMode && fastAssignmentStateHydrated) {
         val hiveForInspection = selected ?: run { inspecting = false; return }
+        if (hiveForInspection.id in lockedHiveIds) {
+            LockedHiveScreen(
+                hiveName = hiveDisplayName(hiveForInspection.number),
+                message = lockedHiveAccessMessage(hiveDisplayName(hiveForInspection.number)),
+                canUpgrade = canUpgradeLockedHive(),
+                onBack = {
+                    inspecting = false
+                    selectedHiveOpen = false
+                    pendingAutoStartVoiceHiveId = null
+                    pendingInspectionHiveId = null
+                    vm.clearHive()
+                },
+                onUpgrade = { openLockedHiveUpgrade() }
+            )
+            return
+        }
         InspectionScreen(
             activity, locationController, hiveForInspection,
-            priorInspections = inspections,
-            beeCountHistory = events.filter { it.type == "bee_count_change" && it.hiveId == hiveForInspection.id && it.detail.startsWith("Frames of bees changed from ") },
+            viewModel = vm,
+            workspaceId = activeWorkspaceId,
             defaultMiteSampleSize = autoVoicePrefs.getInt("default_mite_sample_size", 300).coerceIn(1, 10000),
             defaultStartingStrength = autoVoicePrefs.getInt("default_starting_strength", 3).coerceIn(1, 5),
             rememberLastInspectionValues = autoVoicePrefs.getBoolean("remember_last_inspection_values", true),
             voiceReadyBeepEnabled = autoVoicePrefs.getBoolean("voice_ready_beep", true),
             autoStartVoice = pendingAutoStartVoiceHiveId == hiveForInspection.id,
             autoVoiceEnabled = autoVoiceEnabled,
+            isReadOnlyWorkspace = activeWorkspaceReadOnly,
+            onViewOnlyAttempt = {
+                if (requestHiveAccess(hiveForInspection)) showViewOnlyDialog = true
+            },
             onVoiceAutoStartConsumed = {
                 if (pendingAutoStartVoiceHiveId == hiveForInspection.id) pendingAutoStartVoiceHiveId = null
             },
             onSaveHiveLocation = { hiveId, latitude, longitude, onResult ->
-                vm.updateHiveLocation(hiveId, latitude, longitude, onResult)
+                if (requestHiveAccessById(hiveId)) {
+                    vm.updateHiveLocation(hiveId, latitude, longitude, onResult)
+                } else {
+                    onResult("This hive is locked because its paid subscription has ended. Renew a paid plan to edit it.")
+                }
             },
             onRecordBeeCountChange = { hiveId, previousFrames, newFrames ->
-                vm.recordBeeCountChange(hiveId, previousFrames, newFrames)
+                if (requestHiveAccessById(hiveId)) {
+                    vm.recordBeeCountChange(hiveId, previousFrames, newFrames)
+                }
             },
             onBack = { pendingAutoStartVoiceHiveId = null; inspecting = false },
             onHome = {
@@ -1419,16 +2355,21 @@ fun BeeKeepApp(
                 vm.clearHive()
             },
             onSave = { inspection ->
-                val saved = vm.saveInspection(inspection)
-                if (saved) {
-                    // Keep the full note log (including an intentional empty value) available for the next Inspect session.
-                    activity.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
-                        .edit { putString("hive_${inspection.hiveId}", inspection.notes) }
-                    scope.launch { snackbarHostState.showSnackbar("Inspection saved") }
+                if (requestHiveAccess(hiveForInspection)) {
+                    val saved = vm.saveInspection(inspection)
+                    if (saved) {
+                        scope.launch { snackbarHostState.showSnackbar("Inspection saved") }
+                    } else {
+                        if (activeWorkspaceReadOnly) {
+                            showViewOnlyDialog = true
+                        } else {
+                            scope.launch { snackbarHostState.showSnackbar("Could not save inspection. Your field screen is still open; try again.") }
+                        }
+                    }
+                    saved
                 } else {
-                    scope.launch { snackbarHostState.showSnackbar("Could not save inspection. Your field screen is still open; try again.") }
+                    false
                 }
-                saved
             },
             onSaved = {
                 if (vm.selected.value?.id == hiveForInspection.id) {
@@ -1442,23 +2383,71 @@ fun BeeKeepApp(
     val currentLogType = logType
     val currentSelected = selected
     if (currentLogType != null && currentSelected != null) {
+        if (currentSelected.id in lockedHiveIds) {
+            LockedHiveScreen(
+                hiveName = hiveDisplayName(currentSelected.number),
+                message = lockedHiveAccessMessage(hiveDisplayName(currentSelected.number)),
+                canUpgrade = canUpgradeLockedHive(),
+                onBack = {
+                    logType = null
+                    selectedHiveOpen = false
+                    inspecting = false
+                    vm.clearHive()
+                },
+                onUpgrade = {
+                    logType = null
+                    openLockedHiveUpgrade()
+                }
+            )
+            return
+        }
         when (currentLogType) {
-            HiveLogType.FEED -> FeedDialog({ logType = null }) { type, ratio, amount, unit, notes ->
-                vm.saveFeeding(type, ratio, amount, unit, notes) { success, error ->
-                    if (success) logType = null
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "Feeding logged") }
+            HiveLogType.FEED -> FeedDialog(
+                onDismiss = { logType = null },
+                hiveName = hiveDisplayName(currentSelected.number),
+                records = feedings,
+                recordsLoading = feedingsLoading,
+                recordsError = feedingsError
+            ) { type, ratio, amount, unit, notes ->
+                if (requestHiveAccess(currentSelected)) {
+                    vm.saveFeeding(type, ratio, amount, unit, notes) { success, error ->
+                        if (success) logType = null
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "Feeding logged") }
+                    }
+                } else {
+                    logType = null
                 }
             }
-            HiveLogType.TREAT -> TreatmentDialog({ logType = null }) { type, product, days, withdrawal, notes ->
-                vm.saveTreatment(type, product, days, withdrawal, notes) { success, error ->
-                    if (success) logType = null
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "Treatment logged") }
+            HiveLogType.TREAT -> TreatmentDialog(
+                onDismiss = { logType = null },
+                hiveName = hiveDisplayName(currentSelected.number),
+                records = treatments,
+                recordsLoading = treatmentsLoading,
+                recordsError = treatmentsError
+            ) { type, product, days, withdrawal, notes ->
+                if (requestHiveAccess(currentSelected)) {
+                    vm.saveTreatment(type, product, days, withdrawal, notes) { success, error ->
+                        if (success) logType = null
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "Treatment logged") }
+                    }
+                } else {
+                    logType = null
                 }
             }
-            HiveLogType.HARVEST -> HarvestDialog({ logType = null }) { supers, wet, dry, unit, wax, propolis, notes ->
-                vm.saveHarvest(supers, wet, dry, unit, wax, propolis, notes) { success, error ->
-                    if (success) logType = null
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "Harvest logged") }
+            HiveLogType.HARVEST -> HarvestDialog(
+                onDismiss = { logType = null },
+                hiveName = hiveDisplayName(currentSelected.number),
+                records = harvests,
+                recordsLoading = harvestsLoading,
+                recordsError = harvestsError
+            ) { supers, wet, dry, unit, wax, propolis, notes ->
+                if (requestHiveAccess(currentSelected)) {
+                    vm.saveHarvest(supers, wet, dry, unit, wax, propolis, notes) { success, error ->
+                        if (success) logType = null
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "Harvest logged") }
+                    }
+                } else {
+                    logType = null
                 }
             }
         }
@@ -1471,15 +2460,25 @@ fun BeeKeepApp(
     if (selectedHiveOpen) {
         val hiveForDetail = selected
         if (hiveForDetail == null) {
-            Box(
-                Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    "Loading hive…",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            HiveDetailLoadingScreen()
+            return
+        }
+        if (hiveForDetail.id in lockedHiveIds) {
+            LockedHiveScreen(
+                hiveName = hiveDisplayName(hiveForDetail.number),
+                message = lockedHiveAccessMessage(hiveDisplayName(hiveForDetail.number)),
+                canUpgrade = canUpgradeLockedHive(),
+                onBack = {
+                    selectedHiveOpen = false
+                    pendingAutoStartVoiceHiveId = null
+                    pendingInspectionHiveId = null
+                    pendingAutoTagWriteHiveId = null
+                    pendingAutoTagWriteIgnoredUid = null
+                    inspecting = false
+                    vm.clearHive()
+                },
+                onUpgrade = { openLockedHiveUpgrade() }
+            )
             return
         }
         val hivesInThisApiary = hives.filter {
@@ -1493,7 +2492,25 @@ fun BeeKeepApp(
             ?.let { hivesInThisApiary.getOrNull(it + 1) }
         HiveDetailScreen(
             hive = hiveForDetail,
+            viewModel = vm,
             fastTagAssignmentMode = fastTagAssignmentActive,
+            nfcEntitled = nfcCanScan,
+            nfcCanManage = nfcCanManage,
+            onUpgradeNfc = {
+                if (!nfcAccessResolved) {
+                    scope.launch { snackbarHostState.showSnackbar("Checking NFC access for the selected data scope…") }
+                } else if (isPersonalDataset) {
+                    purchaseBackScreen = Screen.HOME
+                    purchaseSuccessScreen = Screen.HOME
+                    screen = Screen.PURCHASES
+                } else {
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            "The workspace owner must renew Commercial to unlock NFC for this workspace."
+                        )
+                    }
+                }
+            },
             autoStartTagWriting = pendingAutoTagWriteHiveId == hiveForDetail.id,
             autoStartTagWritingIgnoreUid = if (pendingAutoTagWriteHiveId == hiveForDetail.id) pendingAutoTagWriteIgnoredUid else null,
             onAutoTagWritingStarted = {
@@ -1527,16 +2544,13 @@ fun BeeKeepApp(
             nextHiveNumber = nextHiveInApiary?.number,
             onNextHive = {
                 nextHiveInApiary?.let { nextHive ->
-                    lastHiveTagSuccessHiveId = null
-                    lastHiveTagSuccessUid = null
-                    vm.openHive(nextHive.id)
+                    if (requestHiveAccess(nextHive)) {
+                        lastHiveTagSuccessHiveId = null
+                        lastHiveTagSuccessUid = null
+                        vm.openHive(nextHive.id)
+                    }
                 }
             },
-            inspections = inspections,
-            events = events,
-            feedings = feedings,
-            treatments = treatments,
-            harvests = harvests,
             nfc = nfc,
             activity = activity,
             onBack = {
@@ -1599,18 +2613,58 @@ fun BeeKeepApp(
                     inspecting = true
                 }
             },
-            onFeed = { logType = HiveLogType.FEED },
-            onTreat = { logType = HiveLogType.TREAT },
-            onHarvest = { logType = HiveLogType.HARVEST },
-            onTag = { uid, onResult -> vm.assignTag(uid, onResult) },
-            isTagAssignedElsewhere = { targetHiveId, uid ->
-                (hives + deadHives).any { it.id != targetHiveId && NfcUid.matches(it.tagUid, uid) }
+            onFeed = { if (requestHiveAccess(hiveForDetail)) logType = HiveLogType.FEED },
+            onTreat = { if (requestHiveAccess(hiveForDetail)) logType = HiveLogType.TREAT },
+            onHarvest = { if (requestHiveAccess(hiveForDetail)) logType = HiveLogType.HARVEST },
+            onTag = { uid, onResult ->
+                when {
+                    !nfcCanManage -> onResult(
+                        false,
+                        if (activeWorkspaceId.isNullOrBlank()) {
+                            "NFC tag assignment requires BeeKeep Commercial."
+                        } else {
+                            "Your workspace role does not allow NFC tag changes, or the workspace owner's Commercial access could not be verified."
+                        }
+                    )
+                    requestHiveAccess(hiveForDetail) -> vm.assignTag(uid, onResult)
+                    else -> onResult(false, "This hive is locked because its paid subscription has ended. Renew a paid plan to manage it.")
+                }
             },
-            onClearTag = { hiveId, onResult -> vm.clearTagForHive(hiveId, onResult) },
+            isTagAssignedElsewhere = { targetHiveId, uid ->
+                nfc.isTagAssignedElsewhere(targetHiveId, uid)
+            },
+            onClearTag = { hiveId, onResult ->
+                when {
+                    !nfcCanManage -> onResult(
+                        false,
+                        if (activeWorkspaceId.isNullOrBlank()) {
+                            "NFC tag management requires BeeKeep Commercial."
+                        } else {
+                            "Your workspace role does not allow NFC tag changes, or the workspace owner's Commercial access could not be verified."
+                        }
+                    )
+                    requestHiveAccessById(hiveId) -> vm.clearTagForHive(hiveId, onResult)
+                    else -> onResult(false, "This hive is locked because its paid subscription has ended. Renew a paid plan to manage its NFC tag.")
+                }
+            },
             confirmBeforeTagRemoval = autoVoicePrefs.getBoolean("confirm_tag_removal", true),
             tagAssignmentSuccessUid = if (lastHiveTagSuccessHiveId == hiveForDetail.id) lastHiveTagSuccessUid else null,
             onVerifyTag = {
-                nfc.startRead(activity) { result ->
+                if (!nfcAccessResolved) {
+                    scope.launch { snackbarHostState.showSnackbar("Checking NFC access for the selected data scope…") }
+                } else if (!nfcCanScan) {
+                    if (isPersonalDataset) {
+                        purchaseBackScreen = Screen.HOME
+                        purchaseSuccessScreen = Screen.HOME
+                        screen = Screen.PURCHASES
+                    } else {
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                "The workspace owner must renew Commercial to unlock NFC in this workspace."
+                            )
+                        }
+                    }
+                } else nfc.startRead(activity) { result ->
                     when (result) {
                         is NfcResult.Read -> {
                             val matchesUid = NfcUid.matches(result.uid, hiveForDetail.tagUid)
@@ -1634,19 +2688,29 @@ fun BeeKeepApp(
                 }
             },
             onMarkDead = {
-                vm.markHiveDead(hiveForDetail.id) { _, error ->
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} marked dead. History preserved.") }
+                if (requestHiveAccess(hiveForDetail)) {
+                    vm.markHiveDead(hiveForDetail.id) { _, error ->
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} marked dead. History preserved.") }
+                    }
                 }
             },
             onRestore = {
-                vm.restoreHive(hiveForDetail.id) { _, error ->
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} restored to active.") }
+                if (requestHiveAccess(hiveForDetail)) {
+                    vm.restoreHive(hiveForDetail.id) { _, error ->
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} restored to active.") }
+                    }
                 }
             },
             onDelete = {
-                vm.deleteHivePermanently(hiveForDetail.id) { success, error ->
-                    if (success) { selectedHiveOpen = false; vm.clearHive() }
-                    scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} permanently deleted.") }
+                if (requestHiveAccess(hiveForDetail)) {
+                    vm.deleteHivePermanently(hiveForDetail.id) { success, error ->
+                        if (success) {
+                            clearInspectionDraftsForHive(activity, hiveForDetail.id)
+                            selectedHiveOpen = false
+                            vm.clearHive()
+                        }
+                        scope.launch { snackbarHostState.showSnackbar(error ?: "${hiveReferenceName(hiveForDetail.number)} permanently deleted.") }
+                    }
                 }
             }
         )
@@ -1667,20 +2731,31 @@ fun BeeKeepApp(
         PreMadeHiveSetupScreen(
             vm = vm,
             existingApiaryNames = if (isAddingToExistingWorkspace) apiaries.map { it.name } else emptyList(),
-            existingHiveCount = if (isAddingToExistingWorkspace) hives.size + deadHives.size else 0,
+            existingHiveCount = if (isAddingToExistingWorkspace) {
+                BeeKeepEntitlements.countHivesSubjectToFreeLimit(
+                    (hives + deadHives).map { it.id },
+                    lockedHiveIds
+                )
+            } else 0,
             addToExistingWorkspace = isAddingToExistingWorkspace,
+            hiveLimit = activeQuotaLimits.hiveLimit,
+            apiaryLimit = activeQuotaLimits.apiaryLimit,
+            currentPlan = activeQuotaLimits.plan,
+            quotaEnforcementReady = quotaEnforcementReady,
             onBack = {
                 if (isAddingToExistingWorkspace) {
                     addingApiariesWithHives = false
                     screen = Screen.APIARIES
                 } else {
                     screen = Screen.HOME
-                    firstRunPromptVisible = !autoVoicePrefs.getBoolean("initial_setup_completed", false)
                 }
             },
+            onUpgrade = {
+                purchaseBackScreen = Screen.PREMADE_SETUP
+                purchaseSuccessScreen = Screen.PREMADE_SETUP
+                screen = Screen.PURCHASES
+            },
             onComplete = { createdApiaries, createdHives ->
-                autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
-                firstRunPromptVisible = false
                 addingApiariesWithHives = false
                 screen = if (isAddingToExistingWorkspace) Screen.APIARIES else Screen.HOME
                 scope.launch {
@@ -1698,31 +2773,259 @@ fun BeeKeepApp(
     if (screen == Screen.APIARY_HIVES) {
         val apiaryName = selectedApiaryName
         if (apiaryName == null) {
+            clearApiaryBatchAction()
             screen = Screen.APIARIES
             return
         }
-        ApiaryHivesScreen(
-            apiaryName = apiaryName,
-            hives = hives.filter { it.apiary.equals(apiaryName, ignoreCase = true) },
-            compactHiveRows = compactHiveRows,
-            padding = androidx.compose.foundation.layout.PaddingValues(),
-            onBack = { selectedApiaryName = null; screen = Screen.APIARIES },
-            onAddHive = { addHive = true },
-            onOpenHive = { hiveId ->
-                val targetHive = hives.firstOrNull { it.id == hiveId }
-                if (fastTagAssignmentMode && targetHive != null) {
-                    startFastTagAssignmentFromHive(targetHive)
-                } else {
-                    vm.openHive(hiveId)
-                    selectedHiveOpen = true
+        val apiaryHives = hives.filter { it.apiary.equals(apiaryName, ignoreCase = true) }
+        Box(Modifier.fillMaxSize()) {
+            screenSaveableStateHolder.SaveableStateProvider("apiary-hives:$apiaryName") {
+                ApiaryHivesScreen(
+                    apiaryName = apiaryName,
+                    hives = apiaryHives,
+                    compactHiveRows = compactHiveRows,
+                    lockedHiveIds = lockedHiveIds,
+                    padding = androidx.compose.foundation.layout.PaddingValues(),
+                    onBack = {
+                        clearApiaryBatchAction()
+                        selectedApiaryName = null
+                        screen = Screen.APIARIES
+                    },
+                    onAddHive = { addHive = true },
+                    onOpenHive = { hiveId ->
+                        if (requestHiveAccessById(hiveId)) {
+                            val targetHive = hives.firstOrNull { it.id == hiveId }
+                            if (fastTagAssignmentMode && targetHive != null) {
+                                startFastTagAssignmentFromHive(targetHive)
+                            } else {
+                                vm.openHive(hiveId)
+                                selectedHiveOpen = true
+                            }
+                        }
+                    },
+                    onApplyToApiary = {
+                        when {
+                            activeWorkspaceReadOnly -> showViewOnlyDialog = true
+                            !quotaEnforcementReady -> showQuotaVerificationMessage()
+                            else -> apiaryBatchTargetPickerVisible = true
+                        }
+                    }
+                )
+            }
+
+            androidx.compose.material3.SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+
+            if (apiaryBatchTargetPickerVisible) {
+                ApiaryBatchActionTargetDialog(
+                    apiaryName = apiaryName,
+                    hives = apiaryHives,
+                    lockedHiveIds = lockedHiveIds,
+                    onDismiss = { apiaryBatchTargetPickerVisible = false },
+                    onContinue = { actionType, selectedHiveIds ->
+                        val apiary = apiaries.firstOrNull {
+                            it.name.equals(apiaryName, ignoreCase = true)
+                        }
+                        if (apiary == null) {
+                            apiaryBatchTargetPickerVisible = false
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    "This apiary could not be found. Refresh and try again."
+                                )
+                            }
+                        } else if (activeWorkspaceReadOnly) {
+                            apiaryBatchTargetPickerVisible = false
+                            showViewOnlyDialog = true
+                        } else if (!quotaEnforcementReady) {
+                            apiaryBatchTargetPickerVisible = false
+                            showQuotaVerificationMessage()
+                        } else if (selectedHiveIds.any { !requestHiveAccessById(it) }) {
+                            apiaryBatchTargetPickerVisible = false
+                        } else {
+                            apiaryBatchActionTarget = ApiaryBatchActionTarget(
+                                apiaryId = apiary.id,
+                                apiaryName = apiary.name,
+                                hiveIds = selectedHiveIds
+                            )
+                            apiaryBatchActionType = actionType
+                            apiaryBatchTargetPickerVisible = false
+                        }
+                    }
+                )
+            }
+
+            val batchTarget = apiaryBatchActionTarget
+            if (batchTarget != null) {
+                val targetSummary = "${batchTarget.apiaryName} • ${batchTarget.hiveIds.size} hives"
+                when (apiaryBatchActionType) {
+                    HiveLogType.FEED -> FeedDialog(
+                        onDismiss = { clearApiaryBatchAction() },
+                        hiveName = targetSummary,
+                        showHistory = false,
+                        entryInfoMessage = "The amount entered will be recorded separately for every selected hive."
+                    ) { feedType, ratio, amount, unit, notes ->
+                        if (!apiaryBatchSubmitting) {
+                            requestApiaryBatchConfirmation(
+                                "Apply this feeding to ${batchTarget.hiveIds.size} selected hives in ${batchTarget.apiaryName}? Each hive will receive the full amount entered."
+                            ) {
+                                if (activeWorkspaceReadOnly) {
+                                    cancelApiaryBatchConfirmation()
+                                    showViewOnlyDialog = true
+                                } else if (!quotaEnforcementReady) {
+                                    cancelApiaryBatchConfirmation()
+                                    showQuotaVerificationMessage()
+                                } else if (batchTarget.hiveIds.any { !requestHiveAccessById(it) }) {
+                                    cancelApiaryBatchConfirmation()
+                                } else {
+vm.saveFeedingToApiary(
+                                    batchTarget.apiaryId,
+                                    batchTarget.apiaryName,
+                                    batchTarget.hiveIds,
+                                    feedType,
+                                    ratio,
+                                    amount,
+                                    unit,
+                                    notes
+                                ) { success, message ->
+                                    apiaryBatchSubmitting = false
+                                    if (success) clearApiaryBatchAction()
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(message ?: "Feeding saved.")
+                                    }
+                                }
+                                }
+                            }
+                        }
+                    }
+
+                    HiveLogType.TREAT -> TreatmentDialog(
+                        onDismiss = { clearApiaryBatchAction() },
+                        hiveName = targetSummary,
+                        showHistory = false,
+                        entryInfoMessage = "Use removal and withdrawal timing from the product label. BeeKeep records the dates; it does not determine a safe treatment schedule or create treatment alerts. The same treatment and label-based timing will be recorded on every selected hive."
+                    ) { treatmentType, product, days, withdrawalDays, notes ->
+                        if (!apiaryBatchSubmitting) {
+                            requestApiaryBatchConfirmation(
+                                "Apply this treatment to ${batchTarget.hiveIds.size} selected hives in ${batchTarget.apiaryName}? A separate treatment record will be created for each hive."
+                            ) {
+                                if (activeWorkspaceReadOnly) {
+                                    cancelApiaryBatchConfirmation()
+                                    showViewOnlyDialog = true
+                                } else if (!quotaEnforcementReady) {
+                                    cancelApiaryBatchConfirmation()
+                                    showQuotaVerificationMessage()
+                                } else if (batchTarget.hiveIds.any { !requestHiveAccessById(it) }) {
+                                    cancelApiaryBatchConfirmation()
+                                } else {
+vm.saveTreatmentToApiary(
+                                    batchTarget.apiaryId,
+                                    batchTarget.apiaryName,
+                                    batchTarget.hiveIds,
+                                    treatmentType,
+                                    product,
+                                    days,
+                                    withdrawalDays,
+                                    notes
+                                ) { success, message ->
+                                    apiaryBatchSubmitting = false
+                                    if (success) clearApiaryBatchAction()
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(message ?: "Treatment saved.")
+                                    }
+                                }
+                                }
+                            }
+                        }
+                    }
+
+                    HiveLogType.HARVEST -> {
+                        val quantityDescription = when (currentHarvestQuantityMode) {
+                            HarvestQuantityMode.PER_HIVE ->
+                                "The full quantities entered will be recorded on each selected hive."
+                            HarvestQuantityMode.APIARY_TOTAL ->
+                                "These are apiary totals for the selected hives. BeeKeep splits supers and each weight as evenly as possible; any remainder goes to earlier hives in hive-number order."
+                        }
+                        HarvestDialog(
+                            onDismiss = { clearApiaryBatchAction() },
+                            hiveName = targetSummary,
+                            showHistory = false,
+                            entryInfoMessage = quantityDescription
+                        ) { supers, wet, dry, unit, wax, propolis, notes ->
+                            if (!apiaryBatchSubmitting) {
+                                val confirmText = when (currentHarvestQuantityMode) {
+                                    HarvestQuantityMode.PER_HIVE ->
+                                        "Apply this harvest to ${batchTarget.hiveIds.size} selected hives in ${batchTarget.apiaryName}? Each hive will receive the full quantities entered."
+                                    HarvestQuantityMode.APIARY_TOTAL ->
+                                        "Apply these apiary-total quantities across ${batchTarget.hiveIds.size} selected hives? Supers are split as whole numbers; weight remainders go to earlier hives in hive-number order."
+                                }
+                                requestApiaryBatchConfirmation(confirmText) {
+                                    if (activeWorkspaceReadOnly) {
+                                    cancelApiaryBatchConfirmation()
+                                    showViewOnlyDialog = true
+                                } else if (!quotaEnforcementReady) {
+                                    cancelApiaryBatchConfirmation()
+                                    showQuotaVerificationMessage()
+                                } else if (batchTarget.hiveIds.any { !requestHiveAccessById(it) }) {
+                                    cancelApiaryBatchConfirmation()
+                                } else {
+vm.saveHarvestToApiary(
+                                        batchTarget.apiaryId,
+                                        batchTarget.apiaryName,
+                                        batchTarget.hiveIds,
+                                        supers,
+                                        wet,
+                                        dry,
+                                        unit,
+                                        wax,
+                                        propolis,
+                                        notes,
+                                        currentHarvestQuantityMode
+                                    ) { success, message ->
+                                        apiaryBatchSubmitting = false
+                                        if (success) clearApiaryBatchAction()
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar(message ?: "Harvest saved.")
+                                        }
+                                    }
+                                }
+                                }
+                            }
+                        }
+                    }
+
+                    null -> Unit
                 }
             }
-        )
+
+            if (apiaryBatchSubmitting && pendingApiaryBatchCommit != null) {
+                AlertDialog(
+                    onDismissRequest = { cancelApiaryBatchConfirmation() },
+                    title = { Text("Apply to selected hives?", fontWeight = FontWeight.ExtraBold) },
+                    text = { Text(apiaryBatchConfirmationMessage) },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                val commit = pendingApiaryBatchCommit
+                                pendingApiaryBatchCommit = null
+                                apiaryBatchConfirmationMessage = ""
+                                commit?.invoke()
+                            }
+                        ) { Text("APPLY", fontWeight = FontWeight.ExtraBold) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { cancelApiaryBatchConfirmation() }) { Text("CANCEL") }
+                    }
+                )
+            }
+        }
         return
     }
     Scaffold(
         snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
         bottomBar = {
+            Column {
             NavigationBar(
                 modifier = Modifier.clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)),
                 containerColor = if (darkMode) NavBarDark else NavBarLight,
@@ -1736,39 +3039,51 @@ fun BeeKeepApp(
                     mapFocusApiaryId = null
                     screen = Screen.MAP
                 }
+                if (showWorkspaceDestination) {
+                    NavItem("Workspace", Icons.Rounded.Groups, screen == Screen.WORKSPACE) {
+                        screen = Screen.WORKSPACE
+                    }
+                }
                 NavItem("Settings", Icons.Rounded.Settings, screen == Screen.MORE || screen == Screen.SETTINGS) { screen = Screen.SETTINGS }
+            }
             }
         }
     ) { padding ->
         when (screen) {
             Screen.HOME -> HomeScreen(
-                hives = hives,
-                apiaries = apiaries,
+                hiveCount = hives.size,
+                apiaryCount = apiaries.size,
                 padding = padding,
                 nfcEnabled = nfcEnabledForIndicator,
+                currentPlan = purchasePlan,
                 onOpenApiaries = {
                     selectedApiaryName = null
                     screen = Screen.APIARIES
                 }
             )
-            Screen.HIVES -> AllHivesScreen(
+            Screen.HIVES -> screenSaveableStateHolder.SaveableStateProvider("all-hives") {
+                AllHivesScreen(
                 hives = hives,
                 compactHiveRows = compactHiveRows,
+                lockedHiveIds = lockedHiveIds,
                 padding = padding,
                 onBack = { screen = Screen.HOME },
                 onAddHive = { selectedApiaryName = null; addHive = true },
                 onOpenHive = { hiveId ->
-                    val targetHive = hives.firstOrNull { it.id == hiveId }
-                    if (fastTagAssignmentMode && targetHive != null) {
-                        startFastTagAssignmentFromHive(targetHive)
-                    } else {
-                        vm.openHive(hiveId)
-                        selectedHiveOpen = true
+                    if (requestHiveAccessById(hiveId)) {
+                        val targetHive = hives.firstOrNull { it.id == hiveId }
+                        if (fastTagAssignmentMode && targetHive != null) {
+                            startFastTagAssignmentFromHive(targetHive)
+                        } else {
+                            vm.openHive(hiveId)
+                            selectedHiveOpen = true
+                        }
                     }
                 }
-            )
+                )
+            }
             Screen.APIARIES -> ApiariesScreen(
-                apiaries, hives, padding,
+                apiaries, apiaryHiveCounts, padding,
                 onAddApiary = { addApiaryOptionsVisible = true },
                 onEditApiary = { editingApiary = it },
                 onOpenMap = { apiary ->
@@ -1785,18 +3100,81 @@ fun BeeKeepApp(
                 locationController = locationController,
                 onBack = { screen = mapOrigin; mapFocusApiaryId = null }
             )
+            Screen.WORKSPACE -> WorkspaceScreen(
+                padding = padding,
+                activity = activity,
+                cloud = cloud,
+                currentPlan = purchasePlan,
+                hasCommercialAccess = hasCommercialWorkspaceAccess,
+                activeWorkspaceId = activeWorkspaceId,
+                hiveCount = hives.size,
+                apiaryCount = apiaries.size,
+                onUpgrade = {
+                    purchaseBackScreen = Screen.WORKSPACE
+                    purchaseSuccessScreen = Screen.WORKSPACE
+                    screen = Screen.PURCHASES
+                },
+                onWorkspaceMembershipChanged = { joined ->
+                    hasJoinedTeamWorkspace = joined
+                    if (!joined && activeWorkspaceId.isNullOrBlank()) {
+                        autoVoicePrefs.edit { remove("selected_team_workspace_id") }
+                        if (!hasCommercialWorkspaceAccess && screen == Screen.WORKSPACE) {
+                            screen = Screen.MORE
+                        }
+                    }
+                }
+            )
             Screen.MORE -> MoreScreen(
                 padding = padding,
                 onBack = { screen = Screen.SETTINGS },
-                onTagManager = { tagManagerReturnScreen = Screen.MORE; screen = Screen.TAG_MANAGER },
+                onWorkspaceJoined = { joinedMessage ->
+                    hasJoinedTeamWorkspace = true
+                    screen = Screen.WORKSPACE
+                    scope.launch { snackbarHostState.showSnackbar(joinedMessage) }
+                },
+                onTagManager = {
+                    if (!nfcAccessResolved) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                if (isPersonalDataset) "Checking your BeeKeep plan…" else "Checking the workspace owner's Commercial access…"
+                            )
+                        }
+                    } else if (nfcCanScan) {
+                        tagManagerReturnScreen = Screen.MORE
+                        screen = Screen.TAG_MANAGER
+                    } else if (isPersonalDataset) {
+                        purchaseBackScreen = Screen.MORE
+                        purchaseSuccessScreen = Screen.MORE
+                        screen = Screen.PURCHASES
+                    } else {
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                "NFC is locked in this workspace until its owner has active Commercial access."
+                            )
+                        }
+                    }
+                },
                 onColonyHistory = { screen = Screen.COLONY_HISTORY },
+                onUpgrade = {
+                    purchaseBackScreen = Screen.MORE
+                    purchaseSuccessScreen = Screen.HOME
+                    screen = Screen.PURCHASES
+                },
+                currentPlan = purchasePlan,
                 deadCount = deadHives.size,
+                onOpenSupportAdmin = { screen = Screen.SUPPORT_ADMIN },
                 activity = activity,
                 cloud = cloud
+            )
+            Screen.SUPPORT_ADMIN -> AdminHiveLimitScreen(
+                padding = padding,
+                cloud = cloud,
+                onBack = { screen = Screen.MORE }
             )
             Screen.SETTINGS -> SettingsScreen(
                 padding = padding,
                 activity = activity,
+                repository = repository,
                 preferences = autoVoicePrefs,
                 darkMode = darkMode,
                 onDarkModeChange = onDarkModeChange,
@@ -1806,10 +3184,40 @@ fun BeeKeepApp(
                     autoVoicePrefs.edit { putBoolean("auto_voice_on_nfc", enabled) }
                 },
                 fastTagAssignmentMode = fastTagAssignmentMode,
+                nfcEntitled = nfcCanScan,
+                nfcCanManage = nfcCanManage,
+                hiveLimit = activeQuotaLimits.hiveLimit,
+                apiaryLimit = activeQuotaLimits.apiaryLimit,
+                planName = activeQuotaLimits.plan.displayName,
+                quotaEnforcementReady = quotaEnforcementReady,
                 onFastTagAssignmentModeChange = { enabled ->
+                    if (enabled && !nfcAccessResolved) {
+                        scope.launch { snackbarHostState.showSnackbar("Checking NFC access for the selected data scope…") }
+                    } else if (enabled && !nfcCanScan) {
+                        if (isPersonalDataset) {
+                            purchaseBackScreen = Screen.SETTINGS
+                            purchaseSuccessScreen = Screen.SETTINGS
+                            screen = Screen.PURCHASES
+                        } else {
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    "NFC is locked until the workspace owner has active Commercial access."
+                                )
+                            }
+                        }
+                    } else if (enabled && !nfcCanManage) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                "Fast Tag Assignment requires an Owner, Admin or Member workspace role."
+                            )
+                        }
+                    } else {
                     fastTagAssignmentMode = enabled
                     autoVoicePrefs.edit { putBoolean("fast_tag_assignment_mode", enabled) }
-                    if (enabled) (activity as? MainActivity)?.stopHiveAnnouncements()
+                    if (enabled) {
+                        (activity as? MainActivity)?.stopHiveAnnouncements()
+                        nfc.setPassiveReadingEnabled(activity, false)
+                    }
                     if (!enabled) {
                         fastAssignmentSessionActive = false
                         fastAssignmentScreenActive = false
@@ -1824,6 +3232,7 @@ fun BeeKeepApp(
                         (activity as? MainActivity)?.pendingNfcResult?.value = null
                         nfc.finishFastAssignmentFlow(activity, preserveLastUid = false)
                     }
+                    }
                 },
                 largeFieldText = largeFieldText,
                 onLargeFieldTextChange = onLargeFieldTextChange,
@@ -1832,6 +3241,15 @@ fun BeeKeepApp(
                 cloud = cloud,
                 onBack = { screen = Screen.HOME },
                 onOpenMore = { screen = Screen.MORE },
+                onOpenPlans = {
+                    if (!commercialEntitlementResolved) {
+                        scope.launch { snackbarHostState.showSnackbar("Checking your BeeKeep plan…") }
+                    } else {
+                        purchaseBackScreen = Screen.SETTINGS
+                        purchaseSuccessScreen = Screen.SETTINGS
+                        screen = Screen.PURCHASES
+                    }
+                },
                 onResetApiaries = { warning ->
                     vm.clearHive()
                     nfc.stop(activity)
@@ -1849,8 +3267,6 @@ fun BeeKeepApp(
                     pendingInspectionHiveId = null
                     pendingAutoStartVoiceHiveId = null
                     pendingResetWarning = warning
-                    firstRunPromptChecked = true
-                    firstRunPromptVisible = true
                     screen = Screen.HOME
                 }
             )
@@ -1858,23 +3274,55 @@ fun BeeKeepApp(
                 padding = padding,
                 hives = hives,
                 deadHives = deadHives,
+                lockedHiveIds = lockedHiveIds,
+                canManageTags = nfcCanManage,
                 nfc = nfc,
                 activity = activity,
                 pendingUid = pendingTagUid,
                 confirmBeforeTagRemoval = autoVoicePrefs.getBoolean("confirm_tag_removal", true),
                 onPendingUidConsumed = { pendingTagUid = null },
                 onBack = { screen = tagManagerReturnScreen },
-                onOpenHive = { vm.openHive(it); selectedHiveOpen = true; screen = Screen.HOME },
-                onScanOpenHive = { hiveId ->
-                    if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(hives.firstOrNull { it.id == hiveId }?.number.orEmpty())
-                    vm.openHive(hiveId)
-                    selectedHiveOpen = true
-                    screen = Screen.HOME
-                    pendingAutoStartVoiceHiveId = hiveId
-                    pendingInspectionHiveId = hiveId
+                onOpenHive = { hiveId ->
+                    if (requestHiveAccessById(hiveId)) {
+                        vm.openHive(hiveId)
+                        selectedHiveOpen = true
+                        screen = Screen.HOME
+                    }
                 },
-                onAssignTag = { hiveId, uid, reassign, onResult -> vm.assignTagToHive(hiveId, uid, reassign, onResult) },
-                onClearTag = { hiveId, onResult -> vm.clearTagForHive(hiveId, onResult) },
+                onScanOpenHive = { hiveId ->
+                    val targetHive = (hives + deadHives).firstOrNull { it.id == hiveId }
+                    if (targetHive != null && !requestHiveAccess(targetHive)) {
+                        screen = Screen.HOME
+                        pendingAutoStartVoiceHiveId = null
+                        pendingInspectionHiveId = null
+                        inspecting = false
+                    } else {
+                        if (autoVoicePrefs.getBoolean("speak_hive_number_on_scan", true)) onSpeakHiveNumber(targetHive?.number.orEmpty())
+                        vm.openHive(hiveId)
+                        selectedHiveOpen = true
+                        screen = Screen.HOME
+                        pendingAutoStartVoiceHiveId = hiveId
+                        pendingInspectionHiveId = hiveId
+                    }
+                },
+                onAssignTag = { hiveId, uid, reassign, onResult ->
+                    if (!nfcCanManage) {
+                        onResult(false, "Your workspace role does not allow NFC tag changes.")
+                    } else if (requestHiveAccessById(hiveId)) {
+                        vm.assignTagToHive(hiveId, uid, reassign, onResult)
+                    } else {
+                        onResult(false, "This hive is locked because its paid subscription has ended. Renew a paid plan to manage its NFC tag.")
+                    }
+                },
+                onClearTag = { hiveId, onResult ->
+                    if (!nfcCanManage) {
+                        onResult(false, "Your workspace role does not allow NFC tag changes.")
+                    } else if (requestHiveAccessById(hiveId)) {
+                        vm.clearTagForHive(hiveId, onResult)
+                    } else {
+                        onResult(false, "This hive is locked because its paid subscription has ended. Renew a paid plan to manage its NFC tag.")
+                    }
+                },
                 onUnassignedTag = { uid ->
                     unassignedTagOrigin = Screen.TAG_MANAGER
                     unassignedTagUid = uid
@@ -1883,18 +3331,24 @@ fun BeeKeepApp(
                 onIsTagAmbiguous = { uid -> vm.isNfcTagAmbiguous(uid) },
                 onFindHiveForTag = { uid -> vm.findHiveByTag(uid) }
             )
+            Screen.PURCHASES -> Unit
             Screen.COLONY_HISTORY -> ColonyHistoryScreen(
                 deadHives = deadHives,
+                lockedHiveIds = lockedHiveIds,
                 padding = padding,
                 onBack = { screen = Screen.MORE },
-                onOpenHive = { vm.openHive(it); selectedHiveOpen = true }
+                onOpenHive = { hiveId ->
+                    if (requestHiveAccessById(hiveId)) {
+                        vm.openHive(hiveId)
+                        selectedHiveOpen = true
+                    }
+                }
             )
             Screen.SCAN, Screen.APIARY_HIVES, Screen.PREMADE_SETUP -> Unit
         }
     }
 
     if (addApiaryOptionsVisible && screen == Screen.APIARIES) {
-        val apiaryLimitReached = apiaries.size >= 50
         AlertDialog(
             onDismissRequest = { addApiaryOptionsVisible = false },
             title = { Text("Add an Apiary", fontWeight = FontWeight.ExtraBold) },
@@ -1908,7 +3362,6 @@ fun BeeKeepApp(
                             screen = Screen.PREMADE_SETUP
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !apiaryLimitReached,
                         shape = RoundedCornerShape(14.dp)
                     ) { Text("Add Apiary with Pre-made Hives") }
                     OutlinedButton(
@@ -1917,16 +3370,8 @@ fun BeeKeepApp(
                             addApiary = true
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !apiaryLimitReached,
                         shape = RoundedCornerShape(14.dp)
                     ) { Text("Create Empty Apiary") }
-                    if (apiaryLimitReached) {
-                        Text(
-                            "BeeKeep supports up to 50 apiaries. Remove an apiary before adding another.",
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
                 }
             },
             confirmButton = {},
@@ -1936,38 +3381,6 @@ fun BeeKeepApp(
         )
     }
 
-    if (firstRunPromptVisible && screen == Screen.HOME) {
-        AlertDialog(
-            onDismissRequest = {},
-            properties = DialogProperties(
-                dismissOnBackPress = false,
-                dismissOnClickOutside = false
-            ),
-            title = { Text("Welcome to BeeKeep", fontWeight = FontWeight.ExtraBold) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("How would you like to get started?")
-                    Button(
-                        onClick = {
-                            firstRunPromptVisible = false
-                            screen = Screen.PREMADE_SETUP
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(14.dp)
-                    ) { Text("Load Pre-made Hives") }
-                    OutlinedButton(
-                        onClick = {
-                            autoVoicePrefs.edit { putBoolean("initial_setup_completed", true) }
-                            firstRunPromptVisible = false
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(14.dp)
-                    ) { Text("Start from Scratch") }
-                }
-            },
-            confirmButton = {}
-        )
-    }
 }
 
 @Composable
@@ -1976,7 +3389,17 @@ private fun androidx.compose.foundation.layout.RowScope.NavItem(label: String, i
         selected = selected,
         onClick = onClick,
         icon = { Icon(icon, label) },
-        label = { Text(label, maxLines = 1) },
+        label = {
+            Text(
+                label,
+                maxLines = 1,
+                softWrap = false,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontSize = if (label == "Workspace") 9.sp else 10.sp,
+                    letterSpacing = if (label == "Workspace") (-0.35).sp else 0.sp
+                )
+            )
+        },
         colors = NavigationBarItemDefaults.colors(
             selectedIconColor = Trail.Bark,
             selectedTextColor = OnNavBar,
@@ -1987,25 +3410,48 @@ private fun androidx.compose.foundation.layout.RowScope.NavItem(label: String, i
     )
 }
 
+private data class HiveListSearchKey(
+    val id: Long,
+    val number: String,
+    val apiary: String
+)
+
 @Composable
 private fun AllHivesScreen(
     hives: List<Hive>,
     compactHiveRows: Boolean,
+    lockedHiveIds: Set<Long>,
     padding: PaddingValues,
     onBack: () -> Unit,
     onAddHive: () -> Unit,
     onOpenHive: (Long) -> Unit
 ) {
     BackHandler { onBack() }
+    val listState = rememberLazyListState()
     var query by rememberSaveable { mutableStateOf("") }
-    val filtered = hives
-        .filter { hive ->
+    // Only these fields affect search or ordering. A change to queen status,
+    // strength, or bee count can refresh its row without rerunning list filtering/sort.
+    val searchKeys = remember(hives) {
+        hives.map { HiveListSearchKey(it.id, it.number, it.apiary) }
+    }
+    val orderedSearchKeys = remember(searchKeys) {
+        searchKeys.sortedWith(
+            compareBy<HiveListSearchKey>(
+                { it.apiary.lowercase(Locale.ROOT) },
+                { it.number.toIntOrNull() ?: Int.MAX_VALUE },
+                { it.number }
+            )
+        )
+    }
+    val filteredHiveIds = remember(orderedSearchKeys, query) {
+        orderedSearchKeys.filter { entry ->
             query.isBlank() ||
-                hive.number.contains(query, ignoreCase = true) ||
-                hiveDisplayName(hive.number).contains(query, ignoreCase = true) ||
-                hive.apiary.contains(query, ignoreCase = true)
-        }
-        .sortedWith(compareBy<Hive>({ it.apiary.lowercase(Locale.ROOT) }, { it.number.toIntOrNull() ?: Int.MAX_VALUE }, { it.number }))
+                entry.number.contains(query, ignoreCase = true) ||
+                hiveDisplayName(entry.number).contains(query, ignoreCase = true) ||
+                entry.apiary.contains(query, ignoreCase = true)
+        }.map { it.id }
+    }
+    val hivesById = remember(hives) { hives.associateBy { it.id } }
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         InspectionHoneycombBackground(Modifier.matchParentSize())
@@ -2047,7 +3493,7 @@ private fun AllHivesScreen(
                 )
             )
             Spacer(Modifier.height(10.dp))
-            if (filtered.isEmpty()) {
+            if (filteredHiveIds.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     EmptyState(
                         if (hives.isEmpty()) "No hives yet" else "No matching hives",
@@ -2058,11 +3504,23 @@ private fun AllHivesScreen(
                 }
             } else {
                 LazyColumn(
+                    state = listState,
                     contentPadding = PaddingValues(bottom = 20.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    items(filtered, key = { it.id }) { hive ->
-                        HiveRow(hive, compact = compactHiveRows) { onOpenHive(hive.id) }
+                    items(filteredHiveIds, key = { it }) { hiveId ->
+                        val hive = hivesById[hiveId]
+                        if (hive != null) {
+                            HiveRow(
+                                number = hive.number,
+                                apiary = hive.apiary,
+                                queenStatus = hive.queenStatus,
+                                strength = hive.strength,
+                                beeCountFrames = hive.beeCountFrames,
+                                compact = compactHiveRows,
+                                locked = hive.id in lockedHiveIds
+                            ) { onOpenHive(hive.id) }
+                        }
                     }
                 }
             }
@@ -2075,14 +3533,24 @@ private fun ApiaryHivesScreen(
     apiaryName: String,
     hives: List<Hive>,
     compactHiveRows: Boolean,
+    lockedHiveIds: Set<Long>,
     padding: androidx.compose.foundation.layout.PaddingValues,
     onBack: () -> Unit,
     onAddHive: () -> Unit,
-    onOpenHive: (Long) -> Unit
+    onOpenHive: (Long) -> Unit,
+    onApplyToApiary: () -> Unit
 ) {
     BackHandler { onBack() }
+    val listState = rememberLazyListState()
     var query by rememberSaveable(apiaryName) { mutableStateOf("") }
-    val filtered = hives.filter { it.number.contains(query, ignoreCase = true) }
+    // Keep filtering keyed to the fields that determine membership in this list.
+    val searchKeys = remember(hives) {
+        hives.map { HiveListSearchKey(it.id, it.number, it.apiary) }
+    }
+    val filteredHiveIds = remember(searchKeys, query) {
+        searchKeys.filter { it.number.contains(query, ignoreCase = true) }.map { it.id }
+    }
+    val hivesById = remember(hives) { hives.associateBy { it.id } }
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         InspectionHoneycombBackground(Modifier.matchParentSize())
@@ -2093,6 +3561,10 @@ private fun ApiaryHivesScreen(
                 Text(apiaryName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
                 Text("${hives.size} ${if (hives.size == 1) "hive" else "hives"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            OutlinedButton(
+                onClick = onApplyToApiary,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+            ) { Text("Apply") }
             IconButton(onClick = onAddHive, modifier = Modifier.size(52.dp)) { Icon(Icons.Rounded.Add, "Add hive") }
         }
         OutlinedTextField(
@@ -2114,7 +3586,7 @@ private fun ApiaryHivesScreen(
             )
         )
         Spacer(Modifier.height(10.dp))
-        if (filtered.isEmpty()) {
+        if (filteredHiveIds.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 EmptyState(
                     if (hives.isEmpty()) "No hives in this apiary" else "No matching hives",
@@ -2124,9 +3596,20 @@ private fun ApiaryHivesScreen(
                 )
             }
         } else {
-            LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(filtered, key = { it.id }) { hive ->
-                    HiveRow(hive, compact = compactHiveRows) { onOpenHive(hive.id) }
+            LazyColumn(state = listState, contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(filteredHiveIds, key = { it }) { hiveId ->
+                    val hive = hivesById[hiveId]
+                    if (hive != null) {
+                        HiveRow(
+                            number = hive.number,
+                            apiary = hive.apiary,
+                            queenStatus = hive.queenStatus,
+                            strength = hive.strength,
+                            beeCountFrames = hive.beeCountFrames,
+                            compact = compactHiveRows,
+                            locked = hive.id in lockedHiveIds
+                        ) { onOpenHive(hive.id) }
+                    }
                 }
             }
         }
@@ -2203,6 +3686,8 @@ private fun TagManagementScreen(
     padding: PaddingValues,
     hives: List<Hive>,
     deadHives: List<Hive>,
+    lockedHiveIds: Set<Long>,
+    canManageTags: Boolean = true,
     nfc: NfcController,
     activity: ComponentActivity,
     pendingUid: String?,
@@ -2229,6 +3714,45 @@ private fun TagManagementScreen(
     var launchWriteStatusHandler by remember { mutableStateOf<((String) -> Unit)?>(null) }
     BackHandler { onBack() }
     val assigned = hives.count { !it.tagUid.isNullOrBlank() }
+
+    fun startTagScan(onResult: (NfcResult) -> Unit) {
+        if (canManageTags) {
+            nfc.startReadAndPrepareForBeeKeep(activity, onResult)
+        } else {
+            // Viewers must never trigger automatic writes to unassigned physical tags.
+            nfc.startRead(activity, onResult)
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(lockedHiveIds, canManageTags) {
+        if (!canManageTags) {
+            nfc.stop(activity)
+            assigningHiveId = null
+            pendingRemoveHiveId = null
+            reassignPrompt = null
+            launchWriteHiveId = null
+            launchWriteUid = null
+            launchWriteStatusHandler = null
+            status = "View-only access: you can scan and verify tags, but cannot change assignments."
+            return@LaunchedEffect
+        }
+        val activeLockedOperation = sequenceOf(
+            assigningHiveId,
+            pendingRemoveHiveId,
+            reassignPrompt?.first,
+            launchWriteHiveId
+        ).filterNotNull().firstOrNull { it in lockedHiveIds }
+        if (activeLockedOperation != null) {
+            nfc.stop(activity)
+            assigningHiveId = null
+            pendingRemoveHiveId = null
+            reassignPrompt = null
+            launchWriteHiveId = null
+            launchWriteUid = null
+            launchWriteStatusHandler = null
+            status = "This hive is locked because its paid subscription has ended. Renew a paid plan to manage its NFC tag."
+        }
+    }
 
     fun writeLaunchDataAfterAssignment(
         hiveId: Long,
@@ -2436,7 +3960,14 @@ private fun TagManagementScreen(
             Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("Tag ready to assign", fontWeight = FontWeight.ExtraBold)
-                    Text("Tag $pendingUid is not linked to a colony. Tap ASSIGN on the hive it belongs to.", color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    Text(
+                        if (canManageTags) {
+                            "Tag $pendingUid is not linked to a colony. Tap ASSIGN on the hive it belongs to."
+                        } else {
+                            "Tag $pendingUid is not linked to a colony. An Owner, Admin or Member must assign it."
+                        },
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
                     TextButton(onClick = onPendingUidConsumed) { Text("CANCEL PENDING ASSIGNMENT") }
                 }
             }
@@ -2445,7 +3976,7 @@ private fun TagManagementScreen(
         Button(
             onClick = {
                 assigningHiveId = null
-                nfc.startReadAndPrepareForBeeKeep(activity) { result ->
+                startTagScan { result ->
                     when (result) {
                         is NfcResult.Read -> scope.launch {
                             val normalizedUid = NfcUid.normalize(result.uid)
@@ -2472,7 +4003,11 @@ private fun TagManagementScreen(
                                     } else {
                                         "Unassigned tag • $normalizedUid. Choose the hive it belongs to."
                                     }
-                                    onUnassignedTag(normalizedUid)
+                                    if (canManageTags) {
+                                        onUnassignedTag(normalizedUid)
+                                    } else {
+                                        status = "This tag is not assigned in the selected workspace. Ask an Owner, Admin or Member to assign it."
+                                    }
                                 }
                             }
                         }
@@ -2502,26 +4037,39 @@ private fun TagManagementScreen(
                             Text(hiveDisplayName(hive.number), fontWeight = FontWeight.Bold)
                             Text(hive.apiary, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                         }
+                        if (hive.id in lockedHiveIds) {
+                            Icon(
+                                Icons.Rounded.Lock,
+                                contentDescription = "Locked hive",
+                                tint = Color(0xFFB45309),
+                                modifier = Modifier.size(17.dp).padding(end = 2.dp)
+                            )
+                        }
                         Text(if (hive.tagUid.isNullOrBlank()) "UNASSIGNED" else "TAGGED", fontWeight = FontWeight.Bold, color = if (hive.tagUid.isNullOrBlank()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                     }
                     Text(hive.tagUid ?: "No NFC tag assigned", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                        OutlinedButton(onClick = { onOpenHive(hive.id) }, modifier = Modifier.weight(1f)) { Text("OPEN") }
                         OutlinedButton(
-                            onClick = {
-                                assigningHiveId = hive.id
-                                assignAndWriteOnScan(
-                                    hiveId = hive.id,
-                                    expectedUid = pendingUid,
-                                    consumePending = pendingUid != null
-                                ) { message ->
-                                    verifyText = message
-                                    assigningHiveId = null
-                                }
-                            },
-                            enabled = nfc.isAvailable() && nfc.isEnabled(),
+                            onClick = { onOpenHive(hive.id) },
                             modifier = Modifier.weight(1f)
-                        ) { Text(if (hive.tagUid.isNullOrBlank()) "ASSIGN" else "REPLACE") }
+                        ) { Text("OPEN") }
+                        if (canManageTags) {
+                            OutlinedButton(
+                                onClick = {
+                                    assigningHiveId = hive.id
+                                    assignAndWriteOnScan(
+                                        hiveId = hive.id,
+                                        expectedUid = pendingUid,
+                                        consumePending = pendingUid != null
+                                    ) { message ->
+                                        verifyText = message
+                                        assigningHiveId = null
+                                    }
+                                },
+                                enabled = nfc.isAvailable() && nfc.isEnabled() && hive.id !in lockedHiveIds,
+                                modifier = Modifier.weight(1f)
+                            ) { Text(if (hive.tagUid.isNullOrBlank()) "ASSIGN" else "REPLACE") }
+                        }
                     }
                     if (hive.tagUid != null) {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -2544,23 +4092,33 @@ private fun TagManagementScreen(
                                         is NfcResult.Written -> Unit
                                     }
                                 }
-                            }, modifier = Modifier.weight(1f)) { Text("VERIFY") }
-                            TextButton(
-                                onClick = {
-                                    if (confirmBeforeTagRemoval) {
-                                        pendingRemoveHiveId = hive.id
-                                    } else {
-                                        verifyText = "Removing NFC tag…"
-                                        onClearTag(hive.id) { success, error ->
-                                            verifyText = if (success) "Tag removed • available for reuse" else (error ?: "Could not remove tag.")
+                            }, enabled = hive.id !in lockedHiveIds, modifier = Modifier.weight(1f)) { Text("VERIFY") }
+                            if (canManageTags) {
+                                TextButton(
+                                    onClick = {
+                                        if (confirmBeforeTagRemoval) {
+                                            pendingRemoveHiveId = hive.id
+                                        } else {
+                                            verifyText = "Removing NFC tag…"
+                                            onClearTag(hive.id) { success, error ->
+                                                verifyText = if (success) "Tag removed • available for reuse" else (error ?: "Could not remove tag.")
+                                            }
                                         }
-                                    }
-                                },
-                                modifier = Modifier.weight(1f)
-                            ) { Text("REMOVE") }
+                                    },
+                                    enabled = hive.id !in lockedHiveIds,
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("REMOVE") }
+                            }
                         }
                     }
                     verifyText.takeIf { it.isNotBlank() }?.let { Text(it, color = if (it.startsWith("⚠")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant) }
+                    if (!canManageTags) {
+                        Text(
+                            "View-only: existing tags can be scanned and verified, but tag assignments cannot be changed.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                     if (assigningHiveId == hive.id) Text("Hold the physical tag to the back of the phone…", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 }
             }
@@ -2572,8 +4130,12 @@ private fun TagManagementScreen(
 private fun MoreScreen(
     padding: PaddingValues,
     onBack: () -> Unit,
+    onWorkspaceJoined: (String) -> Unit,
     onTagManager: () -> Unit,
     onColonyHistory: () -> Unit,
+    onUpgrade: () -> Unit,
+    onOpenSupportAdmin: () -> Unit,
+    currentPlan: BeeKeepPlan,
     deadCount: Int,
     activity: ComponentActivity,
     cloud: SupabaseGateway
@@ -2584,7 +4146,55 @@ private fun MoreScreen(
     val account by cloud.account.collectAsStateWithLifecycle()
     var email by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf("") }
+    var savedUsername by rememberSaveable { mutableStateOf("") }
     var authMessage by rememberSaveable { mutableStateOf("") }
+    var showSupportEmailFallback by rememberSaveable { mutableStateOf(false) }
+    var supportAdmin by rememberSaveable { mutableStateOf(false) }
+
+    fun openSupportEmail() {
+        val emailBody = """
+            Hello BeeKeep Support,
+
+            Please describe your question or issue below:
+            - What happened?
+            - What did you expect to happen?
+            - Steps to reproduce (if applicable):
+
+            Please do not include passwords or other sensitive account information.
+
+            ---
+            App version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})
+            Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}
+            Android version: ${android.os.Build.VERSION.RELEASE}
+        """.trimIndent()
+        val emailIntent = Intent(Intent.ACTION_SENDTO).apply {
+            data = android.net.Uri.parse("mailto:beekeepinc@gmail.com")
+            putExtra(Intent.EXTRA_SUBJECT, "BeeKeep Support Request")
+            putExtra(Intent.EXTRA_TEXT, emailBody)
+        }
+        try {
+            context.startActivity(emailIntent)
+        } catch (_: android.content.ActivityNotFoundException) {
+            showSupportEmailFallback = true
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(account.signedIn, account.email) {
+        if (account.signedIn) {
+            val result = cloud.getUsername()
+            if (result.isSuccess) {
+                username = result.value.orEmpty()
+                savedUsername = username
+            }
+            // This is only a navigation affordance. The server re-authorizes every operation.
+            supportAdmin = cloud.checkSupportAdmin().value == true
+        } else {
+            username = ""
+            savedUsername = ""
+            supportAdmin = false
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(padding).padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -2596,6 +4206,51 @@ private fun MoreScreen(
                 Text("Additional tools and account controls", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
         }
+
+        if (supportAdmin) {
+            Card(
+                onClick = onOpenSupportAdmin,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFD97706))
+            ) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text("Support admin tools", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
+                        Text("Grant Commercial access and manage custom hive allowances", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Icon(Icons.Rounded.Lock, "Open support admin tools", tint = Color(0xFFB45309), modifier = Modifier.size(28.dp))
+                }
+            }
+        }
+
+        Card(
+            onClick = onUpgrade,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (currentPlan == BeeKeepPlan.HOBBYIST) Color(0xFFFFF7E6) else MaterialTheme.colorScheme.surface
+            ),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFD97706))
+        ) {
+            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        if (currentPlan == BeeKeepPlan.HOBBYIST) "Upgrade BeeKeep" else "BeeKeep ${currentPlan.displayName} active",
+                        fontWeight = FontWeight.ExtraBold,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color(0xFF92400E)
+                    )
+                }
+                Icon(Icons.Rounded.ChevronRight, contentDescription = "Open BeeKeep plans", tint = Color(0xFFB45309), modifier = Modifier.size(28.dp))
+            }
+        }
+
+        WorkspaceJoinEntry(
+            cloud = cloud,
+            activity = activity,
+            onWorkspaceJoined = onWorkspaceJoined
+        )
 
         Card(onClick = onTagManager, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2621,7 +4276,7 @@ private fun MoreScreen(
             Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                     Column(Modifier.weight(1f)) {
-                        Text("BeeKeep Cloud", fontWeight = FontWeight.Bold)
+                        Text("BeeKeep Account", fontWeight = FontWeight.Bold)
                         Text(
                             when {
                                 !account.configured -> "Add Supabase credentials to enable cloud sync"
@@ -2635,15 +4290,35 @@ private fun MoreScreen(
                 }
 
                 if (account.configured && !account.signedIn) {
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = { value ->
+                            username = value.filter { ch ->
+                                ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' || ch == '_'
+                            }.take(20)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Username (new accounts)") },
+                        placeholder = { Text("e.g. NorthApiary") },
+                        supportingText = {
+                            Text("3–20 letters, numbers or underscores. Leave blank when signing in.")
+                        },
+                        singleLine = true
+                    )
                     OutlinedTextField(email, { email = it }, Modifier.fillMaxWidth(), label = { Text("Email") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email))
                     OutlinedTextField(password, { password = it }, Modifier.fillMaxWidth(), label = { Text("Password") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
+                            enabled = email.contains("@") && password.isNotEmpty(),
                             onClick = {
                                 scope.launch {
                                     authMessage = ""
                                     when (val result = cloud.signIn(email, password)) {
-                                        CloudResult.Success -> { authMessage = "Signed in. Syncing…"; CloudSyncScheduler.runNow(context) }
+                                        CloudResult.Success -> {
+                                            authMessage = "Signed in. Syncing…"
+                                            cloud.startRealtime()
+                                            CloudSyncScheduler.runNow(context)
+                                        }
                                         CloudResult.NotConfigured -> authMessage = "Cloud is not configured."
                                         CloudResult.NotSignedIn -> authMessage = "Please sign in."
                                         is CloudResult.Failure -> authMessage = result.message
@@ -2653,14 +4328,27 @@ private fun MoreScreen(
                             modifier = Modifier.weight(1f)
                         ) { Text("SIGN IN") }
                         OutlinedButton(
+                            enabled = email.contains("@") && password.isNotEmpty() &&
+                                username.matches(Regex("^[A-Za-z0-9_]{3,20}$")),
                             onClick = {
                                 scope.launch {
                                     authMessage = ""
-                                    when (val result = cloud.signUp(email, password)) {
-                                        CloudResult.Success -> { authMessage = "Account created. Check your email if verification is required."; CloudSyncScheduler.runNow(context) }
-                                        CloudResult.NotConfigured -> authMessage = "Cloud is not configured."
-                                        CloudResult.NotSignedIn -> authMessage = "Account created but not signed in yet."
-                                        is CloudResult.Failure -> authMessage = result.message
+                                    val availability = cloud.isUsernameAvailable(username.trim())
+                                    if (!availability.isSuccess) {
+                                        authMessage = availability.error ?: "Couldn't check username availability. Please try again."
+                                    } else if (availability.value != true) {
+                                        authMessage = "That username is already taken. Please choose another."
+                                    } else {
+                                        when (val result = cloud.signUp(email, password, username.trim())) {
+                                            CloudResult.Success -> {
+                                                authMessage = "Account created. Check your email if verification is required."
+                                                cloud.startRealtime()
+                                                CloudSyncScheduler.runNow(context)
+                                            }
+                                            CloudResult.NotConfigured -> authMessage = "Cloud is not configured."
+                                            CloudResult.NotSignedIn -> authMessage = "Account created but not signed in yet."
+                                            is CloudResult.Failure -> authMessage = result.message
+                                        }
                                     }
                                 }
                             },
@@ -2668,43 +4356,80 @@ private fun MoreScreen(
                         ) { Text("CREATE") }
                     }
                 } else if (account.signedIn) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                scope.launch {
-                                    when (val result = cloud.syncNow()) {
-                                        CloudResult.Success -> authMessage = "Synced just now."
-                                        CloudResult.NotSignedIn -> authMessage = "Sign in required."
-                                        CloudResult.NotConfigured -> authMessage = "Cloud is not configured."
-                                        is CloudResult.Failure -> authMessage = result.message
-                                    }
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = { value ->
+                            username = value.filter { ch ->
+                                ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' || ch == '_'
+                            }.take(20)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Team username") },
+                        placeholder = { Text("e.g. NorthApiary") },
+                        supportingText = {
+                            Text("Your teammates see this name in the team member list.")
+                        },
+                        singleLine = true
+                    )
+                    Button(
+                        enabled = username.matches(Regex("^[A-Za-z0-9_]{3,20}$")) &&
+                            username != savedUsername && !account.syncing,
+                        onClick = {
+                            scope.launch {
+                                val result = cloud.setUsername(username.trim())
+                                if (result.isSuccess && result.value != null) {
+                                    username = result.value
+                                    savedUsername = result.value
+                                    authMessage = "Username saved. Your team roster will show it."
+                                } else {
+                                    authMessage = result.error ?: "Couldn't save your username."
                                 }
-                            },
-                            modifier = Modifier.weight(1f),
-                            enabled = !account.syncing
-                        ) { Text("SYNC NOW") }
-                        OutlinedButton(
-                            onClick = {
-                                scope.launch {
-                                    authMessage = ""
-                                    authMessage = when (val result = cloud.signOut()) {
-                                        CloudResult.Success -> "Signed out. Your phone data is still available offline."
-                                        CloudResult.NotConfigured -> "Cloud is not configured."
-                                        CloudResult.NotSignedIn -> "You are already signed out."
-                                        is CloudResult.Failure -> result.message
-                                    }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("SAVE USERNAME") }
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                authMessage = ""
+                                authMessage = when (val result = cloud.signOut()) {
+                                    CloudResult.Success -> "Signed out. Your phone data is still available offline."
+                                    CloudResult.NotConfigured -> "Cloud is not configured."
+                                    CloudResult.NotSignedIn -> "You are already signed out."
+                                    is CloudResult.Failure -> result.message
                                 }
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) { Text("SIGN OUT") }
-                    }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("SIGN OUT") }
                 }
 
                 if (authMessage.isNotBlank()) Text(authMessage, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                account.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                if (account.lastSyncAt != null) {
-                    Text("Last sync: ${account.lastSyncAt?.let { DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it)) } ?: "Never"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        Card(shape = RoundedCornerShape(24.dp)) {
+            Column(
+                Modifier.fillMaxWidth().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(9.dp)
+            ) {
+                Text("Contact support", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Need help with hive limits, syncing, NFC tags, or anything else in BeeKeep? Send an email directly to the BeeKeep team.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text("beekeepinc@gmail.com", fontWeight = FontWeight.SemiBold)
+                Button(
+                    onClick = { openSupportEmail() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("EMAIL SUPPORT")
                 }
+                Text(
+                    "Your email opens as a draft with app and device details. Review it before sending.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
 
@@ -2714,5 +4439,39 @@ private fun MoreScreen(
                 Text("Room offline database • NFC • GPS • Voice • WorkManager • cloud sync outbox", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
+    }
+
+    if (showSupportEmailFallback) {
+        AlertDialog(
+            onDismissRequest = { showSupportEmailFallback = false },
+            title = { Text("Email app not available") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("No email app was found on this device. Copy the address below and use it in your preferred email service.")
+                    Text("beekeepinc@gmail.com", fontWeight = FontWeight.Bold)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as? android.content.ClipboardManager
+                        if (clipboard != null) {
+                            clipboard.setPrimaryClip(
+                                android.content.ClipData.newPlainText(
+                                    "BeeKeep support email",
+                                    "beekeepinc@gmail.com"
+                                )
+                            )
+                            android.widget.Toast.makeText(context, "Support email copied", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                        showSupportEmailFallback = false
+                    }
+                ) { Text("COPY EMAIL") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSupportEmailFallback = false }) { Text("CLOSE") }
+            }
+        )
     }
 }

@@ -66,6 +66,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -85,7 +86,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.beekeep.app.cloud.CloudResult
 import com.beekeep.app.cloud.SupabaseGateway
 import com.beekeep.app.data.DataBackupPreview
+import com.beekeep.app.data.HarvestQuantityMode
 import com.beekeep.app.data.LocalHiveRepository
+import com.beekeep.app.data.canEditHarvestQuantitySetting
+import com.beekeep.app.data.workspaceActionSettingsScopeKey
+import com.beekeep.app.data.canRestoreBackupToWorkspace
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -99,12 +104,19 @@ import java.util.Locale
 internal fun SettingsScreen(
     padding: PaddingValues,
     activity: ComponentActivity,
+    repository: LocalHiveRepository,
     preferences: android.content.SharedPreferences,
     darkMode: Boolean,
     onDarkModeChange: (Boolean) -> Unit,
     autoVoiceEnabled: Boolean,
     onAutoVoiceEnabledChange: (Boolean) -> Unit,
     fastTagAssignmentMode: Boolean,
+    nfcEntitled: Boolean,
+    nfcCanManage: Boolean,
+    hiveLimit: Int,
+    apiaryLimit: Int,
+    planName: String,
+    quotaEnforcementReady: Boolean,
     onFastTagAssignmentModeChange: (Boolean) -> Unit,
     largeFieldText: Boolean,
     onLargeFieldTextChange: (Boolean) -> Unit,
@@ -113,13 +125,93 @@ internal fun SettingsScreen(
     cloud: SupabaseGateway,
     onBack: () -> Unit,
     onOpenMore: () -> Unit,
+    onOpenPlans: () -> Unit,
     onResetApiaries: (String?) -> Unit
 ) {
     val context = LocalContext.current
     BackHandler { onBack() }
     val scope = rememberCoroutineScope()
     val account by cloud.account.collectAsState()
-    val repository = remember(context) { LocalHiveRepository(context) }
+    // Use MainActivity's live repository: it follows the selected personal/team database.
+    val activeWorkspaceId by repository.activeWorkspaceId.collectAsState()
+    val activeWorkspaceReadOnly by repository.activeWorkspaceReadOnly.collectAsState()
+    var restoreWorkspaceOwnerVerified by remember { mutableStateOf(activeWorkspaceId.isNullOrBlank()) }
+    var restoreWorkspaceRoleCheckComplete by remember { mutableStateOf(activeWorkspaceId.isNullOrBlank()) }
+    var actionSettingsWorkspaceRole by remember { mutableStateOf<String?>(null) }
+    var actionSettingsRoleVerified by remember { mutableStateOf(activeWorkspaceId.isNullOrBlank()) }
+    var actionSettingsOwnerCommercialVerified by remember { mutableStateOf(activeWorkspaceId.isNullOrBlank()) }
+    var actionSettingsOwnerCommercialCheckComplete by remember { mutableStateOf(activeWorkspaceId.isNullOrBlank()) }
+
+    LaunchedEffect(activeWorkspaceId, account.signedIn, account.userId) {
+        if (activeWorkspaceId.isNullOrBlank()) {
+            restoreWorkspaceOwnerVerified = true
+            restoreWorkspaceRoleCheckComplete = true
+            actionSettingsWorkspaceRole = null
+            actionSettingsRoleVerified = true
+            actionSettingsOwnerCommercialVerified = true
+            actionSettingsOwnerCommercialCheckComplete = true
+        } else {
+            restoreWorkspaceOwnerVerified = false
+            restoreWorkspaceRoleCheckComplete = false
+            actionSettingsWorkspaceRole = null
+            actionSettingsRoleVerified = false
+            actionSettingsOwnerCommercialVerified = false
+            actionSettingsOwnerCommercialCheckComplete = false
+            if (account.signedIn) {
+                val workspaces = cloud.listWorkspaces()
+                val selectedWorkspace = workspaces.value.orEmpty().firstOrNull {
+                    it.id == activeWorkspaceId && !it.is_personal
+                }
+                restoreWorkspaceOwnerVerified = workspaces.isSuccess &&
+                    selectedWorkspace?.let {
+                        canRestoreBackupToWorkspace(isPersonalWorkspace = false, memberRole = it.member_role)
+                    } == true
+                actionSettingsWorkspaceRole = selectedWorkspace?.member_role
+                actionSettingsRoleVerified = workspaces.isSuccess && selectedWorkspace != null
+
+                if (selectedWorkspace?.member_role in setOf("owner", "admin")) {
+                    val entitlement = cloud.workspaceOwnerCommercialEntitlement(activeWorkspaceId.orEmpty())
+                    actionSettingsOwnerCommercialVerified = entitlement.isSuccess && entitlement.value == true
+                    actionSettingsOwnerCommercialCheckComplete = entitlement.isSuccess
+                }
+            }
+            restoreWorkspaceRoleCheckComplete = true
+        }
+    }
+    val canRestoreBackup = quotaEnforcementReady &&
+        !activeWorkspaceReadOnly &&
+        restoreWorkspaceRoleCheckComplete &&
+        restoreWorkspaceOwnerVerified
+
+    val harvestSettingsScopeKey = remember(activeWorkspaceId, account.userId) {
+        workspaceActionSettingsScopeKey(activeWorkspaceId, account.userId)
+    }
+    val savedHarvestActionSettings by repository
+        .observeWorkspaceActionSettings(harvestSettingsScopeKey)
+        .collectAsState(initial = null)
+    var harvestQuantityMode by rememberSaveable(harvestSettingsScopeKey) {
+        mutableStateOf(HarvestQuantityMode.PER_HIVE)
+    }
+    var savingHarvestQuantityMode by remember { mutableStateOf(false) }
+    var harvestQuantitySettingMessage by remember(harvestSettingsScopeKey) { mutableStateOf("") }
+
+    LaunchedEffect(
+        harvestSettingsScopeKey,
+        savedHarvestActionSettings?.updatedAt,
+        savedHarvestActionSettings?.harvestQuantityMode
+    ) {
+        savedHarvestActionSettings?.let {
+            harvestQuantityMode = HarvestQuantityMode.fromStorage(it.harvestQuantityMode)
+        }
+    }
+
+    val canEditHarvestQuantity = canEditHarvestQuantitySetting(
+        isPersonalScope = activeWorkspaceId.isNullOrBlank(),
+        role = actionSettingsWorkspaceRole,
+        roleVerified = actionSettingsRoleVerified,
+        workspaceReadOnly = activeWorkspaceReadOnly,
+        workspaceOwnerCommercialVerified = actionSettingsOwnerCommercialVerified
+    )
 
     var readyBeep by remember(preferences) { mutableStateOf(preferences.getBoolean("voice_ready_beep", true)) }
     var speakHiveNumber by remember(preferences) { mutableStateOf(preferences.getBoolean("speak_hive_number_on_scan", true)) }
@@ -147,6 +239,7 @@ internal fun SettingsScreen(
     var confirmResetApiaries by remember { mutableStateOf(false) }
     var resettingApiaries by remember { mutableStateOf(false) }
     var permissionRevision by remember { mutableIntStateOf(0) }
+    val resetCopy = resetConfirmationCopy(isTeamWorkspace = !activeWorkspaceId.isNullOrBlank())
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -256,14 +349,50 @@ internal fun SettingsScreen(
                 Text("Settings", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
 }
 
+            Card(onClick = onOpenMore, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text("More", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
+
+                    }
+                    Icon(Icons.Rounded.ChevronRight, contentDescription = "Open More", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
+                }
+            }
+
             SettingsSection("NFC & Voice behaviour", Icons.Rounded.Nfc) {
-                // Tag-management controls come first.
-                SettingsSwitchRow(
-                    title = "Fast tag assignment mode",
-                    checked = fastTagAssignmentMode,
-                    onCheckedChange = onFastTagAssignmentModeChange
-                )
-                if (fastTagAssignmentMode) {
+                // Fast assignment changes shared NFC assignments, so it is limited
+                // to writable workspace roles even though viewers may scan and verify.
+                if (nfcEntitled && nfcCanManage) {
+                    SettingsSwitchRow(
+                        title = "Fast tag assignment mode",
+                        checked = fastTagAssignmentMode,
+                        onCheckedChange = onFastTagAssignmentModeChange
+                    )
+                } else if (nfcEntitled) {
+                    Text(
+                        "NFC scanning and tag verification are available in this workspace. Your view-only role cannot assign, replace or remove tags.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            if (activeWorkspaceId.isNullOrBlank()) {
+                                "NFC scanning, tag assignment and fast assignment require BeeKeep Commercial. Your existing tag assignments remain saved."
+                            } else {
+                                "NFC is locked in this workspace until its owner has active BeeKeep Commercial access. Existing tag assignments remain saved."
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        if (activeWorkspaceId.isNullOrBlank()) {
+                            OutlinedButton(onClick = onOpenPlans, modifier = Modifier.fillMaxWidth()) {
+                                Text("VIEW COMMERCIAL PLAN")
+                            }
+                        }
+                    }
+                }
+                if (nfcEntitled && nfcCanManage && fastTagAssignmentMode) {
                     Text(
                         "TURN THIS SETTING OFF TO CONTINUE NORMAL OPERATION",
                         style = MaterialTheme.typography.bodySmall,
@@ -281,7 +410,7 @@ internal fun SettingsScreen(
 
                 // Voice controls stay together at the bottom of this section.
                 SettingsSwitchRow(
-                    title = "Auto-start voice after an NFC hive scan",
+                    title = "Auto-start voice recording after an NFC hive scan",
                     checked = autoVoiceEnabled,
                     onCheckedChange = onAutoVoiceEnabledChange
                 )
@@ -312,6 +441,159 @@ internal fun SettingsScreen(
                         preferences.edit { putBoolean("auto_move_hive_apiary", it) }
                     }
                 )
+            }
+
+            SettingsSection("Harvest quantity", Icons.Rounded.Settings) {
+                Text(
+                    if (activeWorkspaceId.isNullOrBlank()) {
+                        "Choose how quantities are interpreted when you apply a harvest to an apiary."
+                    } else {
+                        "This shared setting controls how harvest quantities are interpreted for every workspace member."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = harvestQuantityMode == HarvestQuantityMode.PER_HIVE,
+                        onClick = {
+                            if (canEditHarvestQuantity && !savingHarvestQuantityMode &&
+                                harvestQuantityMode != HarvestQuantityMode.PER_HIVE
+                            ) {
+                                scope.launch {
+                                    savingHarvestQuantityMode = true
+                                    harvestQuantitySettingMessage = ""
+                                    try {
+                                        repository.saveWorkspaceActionSettings(
+                                            scopeKey = harvestSettingsScopeKey,
+                                            workspaceId = activeWorkspaceId,
+                                            ownerUserId = account.userId,
+                                            harvestQuantityMode = HarvestQuantityMode.PER_HIVE,
+                                            updatedBy = account.userId.takeIf { account.signedIn }
+                                        )
+                                        harvestQuantityMode = HarvestQuantityMode.PER_HIVE
+                                        when (val result = cloud.syncNow()) {
+                                            CloudResult.Success -> harvestQuantitySettingMessage =
+                                                "Per hive saved and synced."
+                                            CloudResult.NotSignedIn -> harvestQuantitySettingMessage =
+                                                "Saved on this device. Sign in to sync this setting."
+                                            CloudResult.NotConfigured -> harvestQuantitySettingMessage =
+                                                "Saved on this device. Cloud sync is not configured."
+                                            is CloudResult.Failure -> harvestQuantitySettingMessage =
+                                                "Saved locally. Cloud confirmation is pending: ${result.message}"
+                                        }
+                                    } catch (cancelled: CancellationException) {
+                                        throw cancelled
+                                    } catch (error: Exception) {
+                                        harvestQuantitySettingMessage =
+                                            error.message ?: "Could not save the harvest setting."
+                                    } finally {
+                                        savingHarvestQuantityMode = false
+                                    }
+                                }
+                            }
+                        },
+                        enabled = canEditHarvestQuantity && !savingHarvestQuantityMode,
+                        label = { Text("Per hive") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    FilterChip(
+                        selected = harvestQuantityMode == HarvestQuantityMode.APIARY_TOTAL,
+                        onClick = {
+                            if (canEditHarvestQuantity && !savingHarvestQuantityMode &&
+                                harvestQuantityMode != HarvestQuantityMode.APIARY_TOTAL
+                            ) {
+                                scope.launch {
+                                    savingHarvestQuantityMode = true
+                                    harvestQuantitySettingMessage = ""
+                                    try {
+                                        repository.saveWorkspaceActionSettings(
+                                            scopeKey = harvestSettingsScopeKey,
+                                            workspaceId = activeWorkspaceId,
+                                            ownerUserId = account.userId,
+                                            harvestQuantityMode = HarvestQuantityMode.APIARY_TOTAL,
+                                            updatedBy = account.userId.takeIf { account.signedIn }
+                                        )
+                                        harvestQuantityMode = HarvestQuantityMode.APIARY_TOTAL
+                                        when (val result = cloud.syncNow()) {
+                                            CloudResult.Success -> harvestQuantitySettingMessage =
+                                                "Apiary total saved and synced."
+                                            CloudResult.NotSignedIn -> harvestQuantitySettingMessage =
+                                                "Saved on this device. Sign in to sync this setting."
+                                            CloudResult.NotConfigured -> harvestQuantitySettingMessage =
+                                                "Saved on this device. Cloud sync is not configured."
+                                            is CloudResult.Failure -> harvestQuantitySettingMessage =
+                                                "Saved locally. Cloud confirmation is pending: ${result.message}"
+                                        }
+                                    } catch (cancelled: CancellationException) {
+                                        throw cancelled
+                                    } catch (error: Exception) {
+                                        harvestQuantitySettingMessage =
+                                            error.message ?: "Could not save the harvest setting."
+                                    } finally {
+                                        savingHarvestQuantityMode = false
+                                    }
+                                }
+                            }
+                        },
+                        enabled = canEditHarvestQuantity && !savingHarvestQuantityMode,
+                        label = { Text("Apiary total") },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text(
+                    when (harvestQuantityMode) {
+                        HarvestQuantityMode.PER_HIVE ->
+                            "Amounts entered in a harvest log belong to that individual hive."
+                        HarvestQuantityMode.APIARY_TOTAL ->
+                            "When applying a harvest to an apiary, quantities are split as evenly as possible across eligible hives. Any remainder goes to the first hives in stable order."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (!activeWorkspaceId.isNullOrBlank() && !canEditHarvestQuantity) {
+                    Text(
+                        when {
+                            !actionSettingsRoleVerified ->
+                                "Checking workspace permissions. Only the Owner or Admin can change this setting."
+                            actionSettingsWorkspaceRole !in setOf("owner", "admin") ->
+                                "Only the workspace Owner or Admin can change this setting."
+                            !actionSettingsOwnerCommercialCheckComplete ->
+                                "The workspace Owner's Commercial entitlement could not be verified. This setting is read-only."
+                            !actionSettingsOwnerCommercialVerified ->
+                                "The workspace Owner needs an active Commercial plan to change this shared setting."
+                            else ->
+                                "Only the workspace Owner or Admin can change this setting."
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (savingHarvestQuantityMode) {
+                    Text("Saving harvest quantity setting…", color = MaterialTheme.colorScheme.primary)
+                }
+                if (savedHarvestActionSettings?.syncState == "pending" ||
+                    savedHarvestActionSettings?.syncState == "local"
+                ) {
+                    Text(
+                        savedHarvestActionSettings?.lastError
+                            ?: "Saved on this device; waiting for cloud confirmation.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (harvestQuantitySettingMessage.isNotBlank()) {
+                    Text(
+                        harvestQuantitySettingMessage,
+                        color = if (harvestQuantitySettingMessage.startsWith("Saved locally")) {
+                            MaterialTheme.colorScheme.error
+                        } else MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
             }
 
             SettingsSection("Inspection defaults", Icons.Rounded.Nfc) {
@@ -401,6 +683,21 @@ internal fun SettingsScreen(
             }
 
             SettingsSection("Data, backup & sync", Icons.Rounded.Cloud) {
+                Text(
+                    if (activeWorkspaceId.isNullOrBlank()) "Backup target: Personal data" else "Backup target: Active team workspace",
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    when {
+                        activeWorkspaceReadOnly -> "This workspace is view-only. You can export it, but restore and reset are disabled."
+                        activeWorkspaceId.isNullOrBlank() -> "Export and restore apply only to your personal data on this device."
+                        !restoreWorkspaceRoleCheckComplete -> "Checking workspace owner permissions for backup restore…"
+                        !restoreWorkspaceOwnerVerified -> "You can export this team workspace. Only its owner can restore a backup, using the owner's plan limits."
+                        else -> "Export and restore apply to this team workspace using the owner's plan limits. Personal records remain separate."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Text("BeeKeep Cloud", fontWeight = FontWeight.Bold)
@@ -458,14 +755,23 @@ internal fun SettingsScreen(
                     OutlinedButton(
                         onClick = { openBackupLauncher.launch(arrayOf("application/json", "text/*", "*/*")) },
                         modifier = Modifier.weight(1f),
-                        enabled = !busy
+                        enabled = !busy && canRestoreBackup
                     ) {
                         Icon(Icons.Rounded.Restore, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("RESTORE")
                     }
                 }
-if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.startsWith("Backup failed") || backupMessage.startsWith("Could not")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+if (!canRestoreBackup && !activeWorkspaceReadOnly && backupMessage.isBlank()) {
+                    Text(
+                        if (!quotaEnforcementReady) "Checking your BeeKeep plan before restoring a backup…"
+                        else if (!restoreWorkspaceRoleCheckComplete) "Checking workspace owner permissions…"
+                        else "Only the workspace owner can restore a backup into team data.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.startsWith("Backup failed") || backupMessage.startsWith("Could not")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
             SettingsSection("Permissions & troubleshooting", Icons.Rounded.Security) {
@@ -546,7 +852,8 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
             }
 
             Card(
-                onClick = { if (!resettingApiaries) confirmResetApiaries = true },
+                onClick = { if (!resettingApiaries && !activeWorkspaceReadOnly) confirmResetApiaries = true },
+                enabled = !resettingApiaries && !activeWorkspaceReadOnly,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(
@@ -556,7 +863,7 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                 Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Text(
-                            "Reset Apiaries",
+                            if (activeWorkspaceId.isNullOrBlank()) "Reset Apiaries" else "Reset Team Workspace",
                             fontWeight = FontWeight.ExtraBold,
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.error
@@ -571,15 +878,6 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                 }
             }
 
-            Card(onClick = onOpenMore, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
-                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text("More", fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
-
-                    }
-                    Icon(Icons.Rounded.ChevronRight, contentDescription = "Open More", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
-                }
-            }
             Spacer(Modifier.height(8.dp))
         }
     }
@@ -587,12 +885,12 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
     if (confirmResetApiaries) {
         AlertDialog(
             onDismissRequest = { if (!resettingApiaries) confirmResetApiaries = false },
-            title = { Text("Reset all apiaries?", fontWeight = FontWeight.ExtraBold) },
+            title = { Text(resetCopy.title, fontWeight = FontWeight.ExtraBold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("This permanently deletes every apiary and hive, along with inspections, notes, feedings, treatments, harvests, activity history, tasks and all NFC tag assignments.")
+                    Text(resetCopy.recordScope)
                     Text(
-                        "This cannot be undone. BeeKeep Cloud data for the signed-in account will also be cleared when cloud access is available.",
+                        resetCopy.cloudImpact,
                         color = MaterialTheme.colorScheme.error,
                         fontWeight = FontWeight.SemiBold
                     )
@@ -611,7 +909,7 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
             },
             confirmButton = {
                 Button(
-                    enabled = !resettingApiaries,
+                    enabled = !resettingApiaries && !activeWorkspaceReadOnly,
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                     onClick = {
                         if (resettingApiaries) return@Button
@@ -622,6 +920,8 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                                 cloud.stopRealtime()
                                 val cloudResult = cloud.resetWorkspace()
                                 repository.resetAllData()
+                                // Drafts are SharedPreferences-backed, not Room rows; clear them too.
+                                clearAllInspectionDrafts(context)
                                 preferences.edit {
                                     putBoolean("initial_setup_completed", false)
                                     putLong("last_successful_sync_at", 0L)
@@ -630,8 +930,8 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                                 confirmResetApiaries = false
                                 val cloudWarning = when (cloudResult) {
                                     CloudResult.Success, CloudResult.NotConfigured -> null
-                                    CloudResult.NotSignedIn -> "Local data was reset, but BeeKeep Cloud could not be cleared because you're signed out. Sign in to the same account before syncing."
-                                    is CloudResult.Failure -> "Local data was reset, but the cloud reset failed: ${cloudResult.message}. Reconnect and retry cloud sync."
+                                    CloudResult.NotSignedIn -> "Local ${resetCopy.localDataLabel} was reset, but ${resetCopy.cloudDataLabel} could not be cleared because you're signed out. Sign in to the same account before syncing."
+                                    is CloudResult.Failure -> "Local ${resetCopy.localDataLabel} was reset, but the cloud reset failed: ${cloudResult.message}. Reconnect and retry cloud sync."
                                 }
                                 if (account.signedIn) cloud.startRealtime()
                                 onResetApiaries(cloudWarning)
@@ -681,7 +981,7 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
             },
             confirmButton = {
                 Button(
-                    enabled = !busy,
+                    enabled = !busy && canRestoreBackup,
                     onClick = {
                         pendingBackupPreview = null
                         pendingBackupJson = null
@@ -689,7 +989,12 @@ if (backupMessage.isNotBlank()) Text(backupMessage, color = if (backupMessage.st
                             busy = true
                             backupMessage = "Restoring backup…"
                             try {
-                                val result = repository.restoreDataBackupJson(restoreJson)
+                                val result = repository.restoreDataBackupJson(
+                                    raw = restoreJson,
+                                    hiveLimit = hiveLimit,
+                                    apiaryLimit = apiaryLimit,
+                                    planName = planName
+                                )
                                 backupMessage = "Processed ${result.processedRecords} backup records. Newer local records were preserved."
                                 when (val syncResult = cloud.syncNow()) {
                                     CloudResult.Success -> {

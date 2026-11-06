@@ -4,19 +4,22 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.beekeep.app.cloud.CloudSyncScheduler
 import com.beekeep.app.data.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import com.beekeep.app.nfc.NfcUid
 import java.time.ZoneId
+import java.util.UUID
 import kotlin.math.roundToInt
 
 class BeeKeepViewModel(
     private val repo: LocalHiveRepository,
-    @Suppress("unused") private val appContext: Context
+    private val appContext: Context
 ) : ViewModel() {
     private val _hives = MutableStateFlow<List<Hive>>(emptyList())
     val hives: StateFlow<List<Hive>> = _hives
@@ -24,35 +27,104 @@ class BeeKeepViewModel(
     val deadHives: StateFlow<List<Hive>> = _deadHives
     private val _apiaries = MutableStateFlow<List<Apiary>>(emptyList())
     val apiaries: StateFlow<List<Apiary>> = _apiaries
+    // Expose only the per-apiary totals needed by the Apiaries screen. MutableStateFlow
+    // suppresses equal maps, so hive profile edits do not invalidate that screen.
+    private val _apiaryHiveCounts = MutableStateFlow(ApiaryHiveCounts(emptyMap()))
+    val apiaryHiveCounts: StateFlow<ApiaryHiveCounts> = _apiaryHiveCounts
     private val _selected = MutableStateFlow<Hive?>(null)
     val selected: StateFlow<Hive?> = _selected
     private val _inspections = MutableStateFlow<List<Inspection>>(emptyList())
     val inspections: StateFlow<List<Inspection>> = _inspections
     private val _feedings = MutableStateFlow<List<Feeding>>(emptyList())
     val feedings: StateFlow<List<Feeding>> = _feedings
+    private val _feedingsLoading = MutableStateFlow(false)
+    val feedingsLoading: StateFlow<Boolean> = _feedingsLoading
+    private val _feedingsError = MutableStateFlow<String?>(null)
+    val feedingsError: StateFlow<String?> = _feedingsError
     private val _treatments = MutableStateFlow<List<Treatment>>(emptyList())
     val treatments: StateFlow<List<Treatment>> = _treatments
+    private val _treatmentsLoading = MutableStateFlow(false)
+    val treatmentsLoading: StateFlow<Boolean> = _treatmentsLoading
+    private val _treatmentsError = MutableStateFlow<String?>(null)
+    val treatmentsError: StateFlow<String?> = _treatmentsError
     private val _harvests = MutableStateFlow<List<Harvest>>(emptyList())
     val harvests: StateFlow<List<Harvest>> = _harvests
+    private val _harvestsLoading = MutableStateFlow(false)
+    val harvestsLoading: StateFlow<Boolean> = _harvestsLoading
+    private val _harvestsError = MutableStateFlow<String?>(null)
+    val harvestsError: StateFlow<String?> = _harvestsError
     private val _events = MutableStateFlow<List<ActivityEvent>>(emptyList())
     val events: StateFlow<List<ActivityEvent>> = _events
     private val _ready = MutableStateFlow(false)
     val ready: StateFlow<Boolean> = _ready
-
+    val activeWorkspaceId: StateFlow<String?> = repo.activeWorkspaceId
+    val activeWorkspaceReadOnly: StateFlow<Boolean> = repo.activeWorkspaceReadOnly
+    val readOnlyWriteAttempt: StateFlow<Long> = repo.readOnlyWriteAttempt
     private var detailJob: Job? = null
     private var selectionRequestGeneration = 0L
+    @Volatile
+    private var activeQuotaLimits = BeeKeepQuotaLimits.forPlan(
+        BeeKeepEntitlements.currentPlan(appContext),
+        BeeKeepEntitlements.hiveLimit(appContext)
+    )
+
+    internal fun updateQuotaLimits(limits: BeeKeepQuotaLimits) {
+        activeQuotaLimits = limits
+        repo.updateQuotaLimits(limits)
+    }
+
+    /**
+     * Room/outbox is the durable save. Ask WorkManager to push it promptly without
+     * turning a successful local write into a failure if work scheduling is unavailable.
+     */
+    private fun requestCloudSync() {
+        runCatching { CloudSyncScheduler.runNow(appContext) }
+    }
+
+    private fun countHivesByApiary(hives: List<Hive>): ApiaryHiveCounts =
+        ApiaryHiveCounts(hives.groupingBy { it.apiary.lowercase(java.util.Locale.ROOT) }.eachCount())
 
     init {
+        repo.updateQuotaLimits(activeQuotaLimits)
         viewModelScope.launch {
             repo.initialize()
             // Hydrate active and inactive UID assignments before NFC auto-write is permitted.
             _hives.value = repo.observeHives().first()
+            _apiaryHiveCounts.value = countHivesByApiary(_hives.value)
             _deadHives.value = repo.observeDeadHives().first()
             _apiaries.value = repo.observeApiaries().first()
             _ready.value = true
-            launch { repo.observeHives().collect { _hives.value = it } }
+            launch {
+                repo.observeHives().collect { updatedHives ->
+                    _hives.value = updatedHives
+                    _apiaryHiveCounts.value = countHivesByApiary(updatedHives)
+                }
+            }
             launch { repo.observeDeadHives().collect { _deadHives.value = it } }
             launch { repo.observeApiaries().collect { _apiaries.value = it } }
+        }
+        // Clear any open detail pane when the active dataset changes; numeric local IDs
+        // can legitimately overlap between a personal DB and a team's DB.
+        viewModelScope.launch {
+            var previousWorkspaceId = repo.activeWorkspaceId.value
+            repo.activeWorkspaceId.collect { workspaceId ->
+                if (workspaceId != previousWorkspaceId) {
+                    previousWorkspaceId = workspaceId
+                    detailJob?.cancel()
+                    _selected.value = null
+                    _inspections.value = emptyList()
+                    _feedings.value = emptyList()
+                    _feedingsLoading.value = false
+                    _feedingsError.value = null
+                    _treatments.value = emptyList()
+                    _treatmentsLoading.value = false
+                    _treatmentsError.value = null
+                    _harvests.value = emptyList()
+                    _harvestsLoading.value = false
+                    _harvestsError.value = null
+                    _events.value = emptyList()
+                }
+            }
         }
     }
 
@@ -68,16 +140,79 @@ class BeeKeepViewModel(
             _selected.value = openedHive
             _inspections.value = emptyList()
             _feedings.value = emptyList()
+            _feedingsLoading.value = openedHive != null
+            _feedingsError.value = null
             _treatments.value = emptyList()
+            _treatmentsLoading.value = openedHive != null
+            _treatmentsError.value = null
             _harvests.value = emptyList()
+            _harvestsLoading.value = openedHive != null
+            _harvestsError.value = null
             _events.value = emptyList()
 
             if (openedHive != null) {
                 detailJob = launch {
+                    // Keep the open profile backed by Room instead of a one-time Hive snapshot.
+                    // This immediately reflects local edits and cloud changes applied by sync.
+                    launch {
+                        repo.observeHive(id).collect { updatedHive ->
+                            if (updatedHive != null && _selected.value?.id == id) {
+                                _selected.value = updatedHive
+                            }
+                        }
+                    }
                     launch { repo.observeInspections(id).collect { _inspections.value = it } }
-                    launch { repo.observeFeedings(id).collect { _feedings.value = it } }
-                    launch { repo.observeTreatments(id).collect { _treatments.value = it } }
-                    launch { repo.observeHarvests(id).collect { _harvests.value = it } }
+                    launch {
+                        repo.observeFeedings(id)
+                            .catch { failure ->
+                                if (_selected.value?.id == id) {
+                                    _feedingsError.value = failure.message?.takeIf { it.isNotBlank() }
+                                        ?: "Could not load feeding records."
+                                    _feedingsLoading.value = false
+                                }
+                            }
+                            .collect { records ->
+                                if (_selected.value?.id == id) {
+                                    _feedings.value = records
+                                    _feedingsError.value = null
+                                    _feedingsLoading.value = false
+                                }
+                            }
+                    }
+                    launch {
+                        repo.observeTreatments(id)
+                            .catch { failure ->
+                                if (_selected.value?.id == id) {
+                                    _treatmentsError.value = failure.message?.takeIf { it.isNotBlank() }
+                                        ?: "Could not load treatment records."
+                                    _treatmentsLoading.value = false
+                                }
+                            }
+                            .collect { records ->
+                                if (_selected.value?.id == id) {
+                                    _treatments.value = records
+                                    _treatmentsError.value = null
+                                    _treatmentsLoading.value = false
+                                }
+                            }
+                    }
+                    launch {
+                        repo.observeHarvests(id)
+                            .catch { failure ->
+                                if (_selected.value?.id == id) {
+                                    _harvestsError.value = failure.message?.takeIf { it.isNotBlank() }
+                                        ?: "Could not load harvest records."
+                                    _harvestsLoading.value = false
+                                }
+                            }
+                            .collect { records ->
+                                if (_selected.value?.id == id) {
+                                    _harvests.value = records
+                                    _harvestsError.value = null
+                                    _harvestsLoading.value = false
+                                }
+                            }
+                    }
                     launch { repo.observeEvents(id).collect { _events.value = it } }
                 }
             }
@@ -105,8 +240,14 @@ class BeeKeepViewModel(
         _selected.value = null
         _inspections.value = emptyList()
         _feedings.value = emptyList()
+        _feedingsLoading.value = false
+        _feedingsError.value = null
         _treatments.value = emptyList()
+        _treatmentsLoading.value = false
+        _treatmentsError.value = null
         _harvests.value = emptyList()
+        _harvestsLoading.value = false
+        _harvestsError.value = null
         _events.value = emptyList()
     }
 
@@ -127,8 +268,8 @@ class BeeKeepViewModel(
     ) {
         val cleanPrefix = hivePrefix.trim()
         val cleanApiaryNames = apiaryNames.map(String::trim)
-        if (cleanApiaryNames.isEmpty() || cleanApiaryNames.size > 50) {
-            onResult(false, "Choose between 1 and 50 apiaries.")
+        if (cleanApiaryNames.isEmpty()) {
+            onResult(false, "Create at least one apiary.")
             return
         }
         if (cleanApiaryNames.size != startingHiveNumbers.size ||
@@ -145,20 +286,29 @@ class BeeKeepViewModel(
             onResult(false, "Each apiary needs a unique name.")
             return
         }
+        val quotaLimits = activeQuotaLimits
+        val apiaryLimit = quotaLimits.apiaryLimit
+        if (apiaryLimit != Int.MAX_VALUE && _apiaries.value.size + cleanApiaryNames.size > apiaryLimit) {
+            onResult(false, BeeKeepEntitlements.apiaryLimitMessage(quotaLimits.plan))
+            return
+        }
         if (startingHiveNumbers.any { it !in 1..999_999 }) {
             onResult(false, "Starting numbers must be between 1 and 999,999.")
             return
         }
-        if (hiveCounts.any { it !in 0..5_000 } || hiveCounts.sum() > 5_000) {
-            onResult(false, "Choose between 0 and 5,000 hives per apiary, with no more than 5,000 total.")
+        if (hiveCounts.any { it !in 0..9_999 }) {
+            onResult(false, "Choose a hive count between 0 and 9,999 per apiary.")
             return
         }
-        if (allowExistingWorkspace && _apiaries.value.size + cleanApiaryNames.size > 50) {
-            onResult(false, "Your workspace can contain no more than 50 apiaries total.")
-            return
-        }
-        if (allowExistingWorkspace && _hives.value.size + _deadHives.value.size + hiveCounts.sum() > 5_000) {
-            onResult(false, "Your workspace can contain no more than 5,000 hives total.")
+        val lockedIds = BeeKeepEntitlements.lockedHiveIds(appContext)
+        val currentHiveCount = BeeKeepEntitlements.countHivesSubjectToFreeLimit(
+            (_hives.value + _deadHives.value).map { it.id },
+            lockedIds
+        )
+        val requestedHiveCount = hiveCounts.sum()
+        val limit = quotaLimits.hiveLimit
+        if (requestedHiveCount > 0 && currentHiveCount + requestedHiveCount > limit) {
+            onResult(false, BeeKeepEntitlements.hiveLimitMessage(quotaLimits.plan, limit))
             return
         }
         if (allowExistingWorkspace) {
@@ -186,6 +336,7 @@ class BeeKeepViewModel(
         }
 
         viewModelScope.launch {
+            val planAtCreation = quotaLimits.plan
             runCatching {
                 repo.createStarterSetup(
                     cleanApiaryNames,
@@ -193,7 +344,13 @@ class BeeKeepViewModel(
                     allowExistingWorkspace = allowExistingWorkspace
                 )
             }
-                .onSuccess { onResult(true, null) }
+                .onSuccess { createdHiveIds ->
+                    requestCloudSync()
+                    if (planAtCreation.isPaidSubscription) {
+                        BeeKeepEntitlements.rememberProCreatedHives(appContext, createdHiveIds)
+                    }
+                    onResult(true, null)
+                }
                 .onFailure { onResult(false, it.message ?: "Could not create the starter apiaries and hives.") }
         }
     }
@@ -201,7 +358,19 @@ class BeeKeepViewModel(
     fun createHive(number: String, apiary: String, queen: String, strength: Int, tagUid: String? = null, onResult: (Boolean, String?) -> Unit = { _, _ -> }) {
         val clean = number.trim(); if (clean.isBlank()) { onResult(false, "Enter a hive number."); return }
         val cleanApiary = apiary.trim().ifBlank { "Unassigned Yard" }
+        val quotaLimits = activeQuotaLimits
         viewModelScope.launch {
+            val planAtCreation = quotaLimits.plan
+            val lockedIds = BeeKeepEntitlements.lockedHiveIds(appContext)
+            val currentHiveCount = BeeKeepEntitlements.countHivesSubjectToFreeLimit(
+                (_hives.value + _deadHives.value).map { it.id },
+                lockedIds
+            )
+            val hiveLimit = quotaLimits.hiveLimit
+            if (currentHiveCount >= hiveLimit) {
+                onResult(false, BeeKeepEntitlements.hiveLimitMessage(planAtCreation, hiveLimit))
+                return@launch
+            }
             val duplicate = repo.findHiveByNumberAndApiary(clean, cleanApiary)
             if (duplicate != null) {
                 onResult(false, "Hive $clean already exists in $cleanApiary.")
@@ -212,9 +381,13 @@ class BeeKeepViewModel(
                 repo.saveHive(Hive(hiveId, clean, cleanApiary, queen, "", "", null, 3, strength.coerceIn(0, 10), 0.0, null))
                 hiveId
             }.onSuccess { hiveId ->
+                if (planAtCreation.isPaidSubscription) {
+                    BeeKeepEntitlements.rememberProCreatedHives(appContext, listOf(hiveId))
+                }
                 val tagError = tagUid?.takeIf { it.isNotBlank() }?.let { tag ->
                     runCatching { repo.assignNfcTag(hiveId, tag) }.exceptionOrNull()?.message?.let { "Hive created. $it" }
                 }
+                requestCloudSync()
                 onResult(true, tagError)
             }.onFailure { onResult(false, it.message ?: "Could not create the hive.") }
         }
@@ -229,6 +402,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching { repo.updateHiveLocation(hiveId, latitude, longitude) }
                 .onSuccess {
+                    requestCloudSync()
                     refreshSelectedHiveIfCurrent(hiveId)
                     onResult(null)
                 }
@@ -240,6 +414,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching {
                 repo.markHiveDead(hiveId)
+                requestCloudSync()
                 refreshSelectedHiveIfCurrent(hiveId)
             }.onSuccess { onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not mark the colony dead.") }
@@ -250,6 +425,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching {
                 repo.restoreHive(hiveId)
+                requestCloudSync()
                 refreshSelectedHiveIfCurrent(hiveId)
             }.onSuccess { onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not restore the colony.") }
@@ -260,6 +436,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching {
                 repo.deleteHivePermanently(hiveId)
+                requestCloudSync()
                 if (_selected.value?.id == hiveId) clearHive()
             }.onSuccess { onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not delete the hive.") }
@@ -276,6 +453,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching {
                 repo.assignNfcTag(hiveId, normalized, reassign)
+                requestCloudSync()
                 refreshSelectedHiveIfCurrent(hiveId)
             }.onSuccess { onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not assign the NFC tag.") }
@@ -294,6 +472,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching { repo.unassignNfcTag(hiveId) }
                 .onSuccess { removed ->
+                    if (removed) requestCloudSync()
                     refreshSelectedHiveIfCurrent(hiveId)
                     onResult(
                         removed,
@@ -310,6 +489,7 @@ class BeeKeepViewModel(
         val h = _selected.value ?: return
         viewModelScope.launch {
             repo.saveHive(h.copy(queenStatus = status, queenMarkColor = markColor, queenOrigin = origin, queenAgeMonths = ageMonths, queenTemperament = temperament.coerceIn(1, 5)))
+            requestCloudSync()
             refreshSelectedHiveIfCurrent(h.id)
         }
     }
@@ -323,7 +503,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching {
                 repo.recordBeeCountChange(hiveId, previousFrames, newFrames, changedAt)
-            }
+            }.onSuccess { requestCloudSync() }
         }
     }
 
@@ -351,6 +531,7 @@ class BeeKeepViewModel(
         )
         return runCatching {
             repo.saveInspection(normalized)
+            requestCloudSync()
             refreshSelectedHiveIfCurrent(h.id)
             true
         }.getOrElse { false }
@@ -362,7 +543,7 @@ class BeeKeepViewModel(
         val now = System.currentTimeMillis()
         viewModelScope.launch {
             runCatching { repo.saveFeeding(Feeding(IdGenerator.nextLong(), h.id, now, feedType, ratio, amount, unit, notes)) }
-                .onSuccess { onResult(true, null) }
+                .onSuccess { requestCloudSync(); onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not save feeding.") }
         }
     }
@@ -379,7 +560,7 @@ class BeeKeepViewModel(
                 val withdrawal = if (removal != null && withdrawalDays > 0) localPlusDays(removal, withdrawalDays.toLong()) else null
                 val treatment = Treatment(IdGenerator.nextLong(), h.id, now, treatmentType, product, now, removal, withdrawal, notes)
                 repo.saveTreatment(treatment)
-            }.onSuccess { onResult(true, null) }
+            }.onSuccess { requestCloudSync(); onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not save treatment.") }
         }
     }
@@ -390,17 +571,185 @@ class BeeKeepViewModel(
         val now = System.currentTimeMillis()
         viewModelScope.launch {
             runCatching { repo.saveHarvest(Harvest(IdGenerator.nextLong(), h.id, now, supers, wet, dry, unit, wax, propolis, notes)) }
-                .onSuccess { onResult(true, null) }
+                .onSuccess { requestCloudSync(); onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not save harvest.") }
+        }
+    }
+
+
+    private fun orderedActiveHiveIdsForApiary(apiaryName: String, hiveIds: List<Long>): List<Long> {
+        require(hiveIds.isNotEmpty()) { "Select at least one hive." }
+        require(hiveIds.distinct().size == hiveIds.size) { "The selected hive list contains duplicates." }
+
+        // Re-check plan limits in the ViewModel as well as the screen. This keeps
+        // bulk writes from bypassing the same per-hive access rule used by Hive Detail.
+        val quotaOrderedHives = (_hives.value + _deadHives.value)
+            .distinctBy { it.id }
+            .sortedWith(
+                compareBy<Hive> { it.isDead }
+                    .thenBy { it.number.toIntOrNull() ?: Int.MAX_VALUE }
+                    .thenBy { it.number.lowercase(java.util.Locale.ROOT) }
+                    .thenBy { it.apiary.lowercase(java.util.Locale.ROOT) }
+                    .thenBy { it.id }
+            )
+        val lockedIds = BeeKeepEntitlements.hiveIdsBeyondLimit(
+            quotaOrderedHives.map { it.id },
+            activeQuotaLimits.hiveLimit
+        )
+        require(hiveIds.none { it in lockedIds }) {
+            "One or more selected hives are locked by the current plan. Renew or upgrade the workspace plan to manage them."
+        }
+
+        val requested = hiveIds.toSet()
+        val ordered = _hives.value
+            .filter { it.id in requested && !it.isDead && it.apiary.equals(apiaryName, ignoreCase = true) }
+            .sortedWith(
+                compareBy<Hive> { it.number.toIntOrNull() ?: Int.MAX_VALUE }
+                    .thenBy { it.number.lowercase(java.util.Locale.ROOT) }
+                    .thenBy { it.id }
+            )
+            .map { it.id }
+        require(ordered.size == hiveIds.size) {
+            "One or more selected hives are no longer active in this apiary. Refresh and try again."
+        }
+        return ordered
+    }
+
+    fun saveFeedingToApiary(
+        apiaryId: Long,
+        apiaryName: String,
+        hiveIds: List<Long>,
+        feedType: String,
+        ratio: String,
+        amount: Double,
+        unit: String,
+        notes: String,
+        onResult: (Boolean, String?) -> Unit = { _, _ -> }
+    ) {
+        viewModelScope.launch {
+            runCatching {
+                val orderedHiveIds = orderedActiveHiveIdsForApiary(apiaryName, hiveIds)
+                val now = System.currentTimeMillis()
+                val batchId = UUID.randomUUID().toString()
+                val records = orderedHiveIds.map { hiveId ->
+                    Feeding(
+                        IdGenerator.nextLong(), hiveId, now, feedType, ratio, amount, unit, notes,
+                        apiaryId = apiaryId, batchId = batchId, occurredAt = now
+                    )
+                }
+                repo.saveFeedingBatch(apiaryId, apiaryName, orderedHiveIds, records)
+            }.onSuccess { count ->
+                requestCloudSync()
+                onResult(true, "Feeding logged for $count hives.")
+            }.onFailure {
+                onResult(false, it.message ?: "Could not apply feeding to this apiary.")
+            }
+        }
+    }
+
+    fun saveTreatmentToApiary(
+        apiaryId: Long,
+        apiaryName: String,
+        hiveIds: List<Long>,
+        treatmentType: String,
+        product: String,
+        durationDays: Int,
+        withdrawalDays: Int,
+        notes: String,
+        onResult: (Boolean, String?) -> Unit = { _, _ -> }
+    ) {
+        viewModelScope.launch {
+            runCatching {
+                require(durationDays >= 0) { "Removal days cannot be negative." }
+                require(withdrawalDays >= 0) { "Withdrawal days cannot be negative." }
+                val orderedHiveIds = orderedActiveHiveIdsForApiary(apiaryName, hiveIds)
+                val now = System.currentTimeMillis()
+                val removal = if (durationDays > 0) localPlusDays(now, durationDays.toLong()) else null
+                val withdrawal = if (removal != null && withdrawalDays > 0) {
+                    localPlusDays(removal, withdrawalDays.toLong())
+                } else null
+                val batchId = UUID.randomUUID().toString()
+                val records = orderedHiveIds.map { hiveId ->
+                    Treatment(
+                        IdGenerator.nextLong(), hiveId, now, treatmentType, product, now,
+                        removal, withdrawal, notes,
+                        apiaryId = apiaryId, batchId = batchId, occurredAt = now
+                    )
+                }
+                repo.saveTreatmentBatch(apiaryId, apiaryName, orderedHiveIds, records)
+            }.onSuccess { count ->
+                requestCloudSync()
+                onResult(true, "Treatment logged for $count hives.")
+            }.onFailure {
+                onResult(false, it.message ?: "Could not apply treatment to this apiary.")
+            }
+        }
+    }
+
+    fun saveHarvestToApiary(
+        apiaryId: Long,
+        apiaryName: String,
+        hiveIds: List<Long>,
+        supers: Int,
+        wet: Double,
+        dry: Double,
+        unit: String,
+        wax: Double,
+        propolis: Double,
+        notes: String,
+        quantityMode: HarvestQuantityMode,
+        onResult: (Boolean, String?) -> Unit = { _, _ -> }
+    ) {
+        viewModelScope.launch {
+            runCatching {
+                val orderedHiveIds = orderedActiveHiveIdsForApiary(apiaryName, hiveIds)
+                val allocations = if (quantityMode == HarvestQuantityMode.APIARY_TOTAL) {
+                    allocateApiaryHarvestQuantities(supers, wet, dry, wax, propolis, orderedHiveIds.size)
+                } else {
+                    List(orderedHiveIds.size) {
+                        HarvestQuantityAllocation(supers, wet, dry, wax, propolis)
+                    }
+                }
+                val now = System.currentTimeMillis()
+                val batchId = UUID.randomUUID().toString()
+                val records = orderedHiveIds.mapIndexed { index, hiveId ->
+                    val allocation = allocations[index]
+                    Harvest(
+                        IdGenerator.nextLong(), hiveId, now,
+                        allocation.supersPulled,
+                        allocation.wetHoneyWeight,
+                        allocation.dryHoneyWeight,
+                        unit,
+                        allocation.waxWeight,
+                        allocation.propolisWeight,
+                        notes,
+                        apiaryId = apiaryId,
+                        batchId = batchId,
+                        occurredAt = now
+                    )
+                }
+                repo.saveHarvestBatch(apiaryId, apiaryName, orderedHiveIds, records)
+            }.onSuccess { count ->
+                requestCloudSync()
+                onResult(true, "Harvest logged for $count hives.")
+            }.onFailure {
+                onResult(false, it.message ?: "Could not apply harvest to this apiary.")
+            }
         }
     }
 
     fun saveApiary(name: String, notes: String, lat: Double?, lon: Double?, forage: String, water: String, onResult: (Boolean, String?) -> Unit = { _, _ -> }) {
         val clean = name.trim()
         if (clean.isBlank()) { onResult(false, "Enter an apiary name."); return }
+        val quotaLimits = activeQuotaLimits
+        val apiaryLimit = quotaLimits.apiaryLimit
+        if (apiaryLimit != Int.MAX_VALUE && _apiaries.value.size >= apiaryLimit) {
+            onResult(false, BeeKeepEntitlements.apiaryLimitMessage(quotaLimits.plan))
+            return
+        }
         viewModelScope.launch {
             runCatching { repo.saveApiary(Apiary(IdGenerator.nextLong(), clean, notes, lat, lon, forage, water)) }
-                .onSuccess { onResult(true, null) }
+                .onSuccess { requestCloudSync(); onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not save apiary.") }
         }
     }
@@ -412,6 +761,7 @@ class BeeKeepViewModel(
             runCatching {
                 val hive = repo.getHive(hiveId) ?: throw IllegalArgumentException("Hive not found.")
                 repo.saveHive(hive.copy(apiary = target))
+                requestCloudSync()
                 refreshSelectedHiveIfCurrent(hiveId)
             }.onSuccess { onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not move the hive.") }
@@ -425,7 +775,7 @@ class BeeKeepViewModel(
             val existing = _apiaries.value.firstOrNull { it.id == id }
             if (existing == null) { onResult(false, "Apiary not found. Refresh and try again."); return@launch }
             runCatching { repo.saveApiary(Apiary(id, clean, notes, lat, lon, forage, water)) }
-                .onSuccess { onResult(true, null) }
+                .onSuccess { requestCloudSync(); onResult(true, null) }
                 .onFailure { onResult(false, it.message ?: "Could not update apiary.") }
         }
     }
@@ -435,6 +785,7 @@ class BeeKeepViewModel(
         viewModelScope.launch {
             runCatching { repo.deleteApiaryPermanently(id) }
                 .onSuccess {
+                    requestCloudSync()
                     if (deletedApiaryName != null &&
                         _selected.value?.apiary?.equals(deletedApiaryName, ignoreCase = true) == true
                     ) {

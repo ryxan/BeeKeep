@@ -66,15 +66,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.beekeep.app.data.IdGenerator
+import com.beekeep.app.data.InspectionFormDraftStore
+import com.beekeep.app.data.inspectionNoteDraftKey
+import com.beekeep.app.data.inspectionNoteDraftRecordedAtKey
+import com.beekeep.app.data.inspectionNoteDraftUpdatedAtKey
+import com.beekeep.app.data.inspectionNoteDraftPendingKey
+import com.beekeep.app.data.migrateLegacyInspectionNoteDraft
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
@@ -111,7 +119,115 @@ private fun formatBroodStoresGauge(value: Double): String {
     val whole = value.roundToInt()
     return if (value == whole.toDouble()) whole.toString() else String.format(Locale.US, "%.1f", value)
 }
-private const val INSPECTION_FORM_DRAFTS = "beekeep_inspection_form_drafts"
+private const val INSPECTION_FORM_DRAFTS = InspectionFormDraftStore.PREFERENCES_NAME
+
+/**
+ * Discard unfinished field-entry state when a hive is permanently removed.
+ * These values intentionally live outside Room so an inspection can survive
+ * navigation or process death, so deletion paths must clean them explicitly.
+ */
+internal fun clearInspectionDraftsForHives(
+    context: android.content.Context,
+    hiveIds: Collection<Long>
+) {
+    val validHiveIds = hiveIds.asSequence().filter { it > 0L }.distinct().toList()
+    if (validHiveIds.isEmpty()) return
+
+    // Batch a whole apiary's cleanup into one edit per preference store, instead
+    // of scheduling a full XML rewrite for every hive in a large yard.
+    val workspaceId = context.getSharedPreferences("beekeep_prefs", android.content.Context.MODE_PRIVATE)
+        .getString("active_team_workspace_id", "").orEmpty().trim().takeIf { it.isNotEmpty() }
+    context.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE).edit {
+        validHiveIds.forEach { hiveId ->
+            val hiveKey = inspectionNoteDraftKey(workspaceId, hiveId)
+            remove(hiveKey)
+            remove(inspectionNoteDraftRecordedAtKey(hiveKey))
+            remove(inspectionNoteDraftUpdatedAtKey(hiveKey))
+            remove(inspectionNoteDraftPendingKey(hiveKey))
+            if (workspaceId == null) {
+                remove("hive_$hiveId")
+                remove("hive_${hiveId}_recorded_at")
+            }
+        }
+    }
+    val formPrefs = context.getSharedPreferences(INSPECTION_FORM_DRAFTS, android.content.Context.MODE_PRIVATE)
+    validHiveIds.forEach { hiveId ->
+        // Publish a tombstone so the same unfinished form is discarded on other devices.
+        InspectionFormDraftStore.markDeleted(formPrefs, workspaceId, hiveId)
+    }
+    formPrefs.edit {
+        validHiveIds.forEach { hiveId ->
+            remove(InspectionFormDraftStore.beeCountHistoryStartKey(workspaceId, hiveId))
+            if (workspaceId == null) remove(InspectionFormDraftStore.legacyBeeCountHistoryStartKey(hiveId))
+        }
+    }
+    com.beekeep.app.cloud.CloudSyncScheduler.runNow(context)
+}
+
+internal fun clearInspectionDraftsForHive(context: android.content.Context, hiveId: Long) {
+    clearInspectionDraftsForHives(context, listOf(hiveId))
+}
+
+/** Clear all unfinished field-entry state after Reset Apiaries succeeds locally. */
+internal fun clearAllInspectionDrafts(context: android.content.Context) {
+    // Reset only the active workspace's note drafts. Other workspaces keep their local drafts.
+    val workspaceId = context.getSharedPreferences("beekeep_prefs", android.content.Context.MODE_PRIVATE)
+        .getString("active_team_workspace_id", "").orEmpty().trim().takeIf { it.isNotEmpty() }
+    val notePrefs = context.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
+    val scopePrefix = "${com.beekeep.app.data.inspectionNoteDraftScope(workspaceId)}_hive_"
+    val activeDraftIds = notePrefs.all.keys.asSequence()
+        .filter { it.startsWith(scopePrefix) }
+        .mapNotNull { it.removePrefix(scopePrefix).toLongOrNull() }
+        .filter { it > 0L }
+        .toSet()
+    val legacyPersonalIds = if (workspaceId == null) {
+        notePrefs.all.keys.asSequence()
+            .filter { it.startsWith("hive_") }
+            .mapNotNull { it.removePrefix("hive_").toLongOrNull() }
+            .filter { it > 0L }
+            .toSet()
+    } else emptySet()
+    notePrefs.edit {
+        (activeDraftIds + legacyPersonalIds).forEach { hiveId ->
+            val key = inspectionNoteDraftKey(workspaceId, hiveId)
+            remove(key)
+            remove(inspectionNoteDraftRecordedAtKey(key))
+            remove(inspectionNoteDraftUpdatedAtKey(key))
+            remove(inspectionNoteDraftPendingKey(key))
+            if (workspaceId == null) {
+                remove("hive_$hiveId")
+                remove("hive_${hiveId}_recorded_at")
+            }
+        }
+    }
+    // Clear only drafts in this workspace; keep other workspaces isolated on this device.
+    val formPrefs = context.getSharedPreferences(INSPECTION_FORM_DRAFTS, android.content.Context.MODE_PRIVATE)
+    val formPrefix = InspectionFormDraftStore.keyPrefix(workspaceId)
+    val activeFormIds = formPrefs.all.keys.asSequence()
+        .filter { it.startsWith(formPrefix) }
+        .mapNotNull { it.removePrefix(formPrefix).toLongOrNull() }
+        .filter { it > 0L }
+        .toSet()
+    val legacyFormIds = if (workspaceId == null) {
+        formPrefs.all.keys.asSequence()
+            .filter { it.startsWith("hive_") }
+            .mapNotNull { it.removePrefix("hive_").toLongOrNull() }
+            .filter { it > 0L }
+            .toSet()
+    } else emptySet()
+    (activeFormIds + legacyFormIds).forEach { hiveId ->
+        InspectionFormDraftStore.markDeleted(formPrefs, workspaceId, hiveId)
+    }
+    formPrefs.edit {
+        (activeFormIds + legacyFormIds).forEach { hiveId ->
+            remove(InspectionFormDraftStore.beeCountHistoryStartKey(workspaceId, hiveId))
+            if (workspaceId == null) remove(InspectionFormDraftStore.legacyBeeCountHistoryStartKey(hiveId))
+        }
+    }
+    if (activeFormIds.isNotEmpty() || legacyFormIds.isNotEmpty()) {
+        com.beekeep.app.cloud.CloudSyncScheduler.runNow(context)
+    }
+}
 
 private data class InspectionFormDraft(
     val strength: Int,
@@ -136,9 +252,11 @@ private data class InspectionFormDraft(
 
 private fun readInspectionFormDraft(
     prefs: android.content.SharedPreferences,
+    workspaceId: String?,
     hiveId: Long
 ): InspectionFormDraft? {
-    val raw = prefs.getString("hive_$hiveId", null) ?: return null
+    val raw = InspectionFormDraftStore.readRaw(prefs, workspaceId, hiveId) ?: return null
+    if (InspectionFormDraftStore.isDeleted(raw)) return null
     return runCatching {
         val json = JSONObject(raw)
         InspectionFormDraft(
@@ -156,7 +274,7 @@ private fun readInspectionFormDraft(
             supercedureCells = json.optInt("supercedureCells", 0),
             swarmCells = json.optInt("swarmCells", 0),
             diseaseFlags = json.optString("diseaseFlags", ""),
-            updatedAt = json.optLong("updatedAt", 0L),
+            updatedAt = json.optLong("updated_at", json.optLong("updatedAt", 0L)),
             latitude = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude") else null,
             longitude = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null,
             beeCountHalfSteps = if (json.has("beeCountHalfSteps") && !json.isNull("beeCountHalfSteps")) {
@@ -168,9 +286,10 @@ private fun readInspectionFormDraft(
 
 private fun saveInspectionFormDraft(
     prefs: android.content.SharedPreferences,
+    workspaceId: String?,
     hiveId: Long,
     draft: InspectionFormDraft
-) {
+): Boolean {
     val json = JSONObject()
         .put("strength", ColonyStrength.storedFromGrade(draft.strength))
         .put("queenStatus", draft.queenStatus)
@@ -186,11 +305,10 @@ private fun saveInspectionFormDraft(
         .put("supercedureCells", draft.supercedureCells.coerceAtLeast(0))
         .put("swarmCells", draft.swarmCells.coerceAtLeast(0))
         .put("diseaseFlags", draft.diseaseFlags)
-        .put("updatedAt", System.currentTimeMillis())
         .put("latitude", draft.latitude ?: JSONObject.NULL)
         .put("longitude", draft.longitude ?: JSONObject.NULL)
         .put("beeCountHalfSteps", draft.beeCountHalfSteps ?: JSONObject.NULL)
-    prefs.edit { putString("hive_$hiveId", json.toString()) }
+    return InspectionFormDraftStore.writeLocal(prefs, workspaceId, hiveId, json)
 }
 
 private fun inspectionNoteDatePrefix(timestamp: Long): String =
@@ -302,33 +420,54 @@ internal fun InspectionScreen(
     activity: ComponentActivity,
     locationController: LocationController,
     hive: Hive,
-    priorInspections: List<Inspection>,
-    beeCountHistory: List<ActivityEvent>,
+    viewModel: BeeKeepViewModel,
+    workspaceId: String?,
     defaultMiteSampleSize: Int,
     defaultStartingStrength: Int,
     rememberLastInspectionValues: Boolean,
     voiceReadyBeepEnabled: Boolean,
     autoStartVoice: Boolean,
     autoVoiceEnabled: Boolean,
+    isReadOnlyWorkspace: Boolean,
+    onViewOnlyAttempt: () -> Unit,
     onVoiceAutoStartConsumed: () -> Unit,
     onSaveHiveLocation: (Long, Double, Double, (String?) -> Unit) -> Unit,
     onRecordBeeCountChange: (Long, Double, Double) -> Unit,
     onBack: () -> Unit,
     onHome: () -> Unit,
     onSave: suspend (Inspection) -> Boolean,
+    onSaveNoteDraft: suspend (Long, String, Long?, Long) -> Long = { hiveId, draftNotes, recordedAt, updatedAt ->
+        queueInspectionNoteDraft(activity.applicationContext, hiveId, draftNotes, recordedAt, updatedAt)
+    },
     onSaved: () -> Unit
 ) {
+    val priorInspections by viewModel.inspections.collectAsStateWithLifecycle()
+    val activityEvents by viewModel.events.collectAsStateWithLifecycle()
+    val beeCountHistory = remember(activityEvents, hive.id) {
+        activityEvents.filter {
+            it.type == "bee_count_change" &&
+                it.hiveId == hive.id &&
+                it.detail.startsWith("Frames of bees changed from ")
+        }
+    }
     val haptic = LocalHapticFeedback.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val noteDraftPrefs = remember(context) {
         context.getSharedPreferences(INSPECTION_NOTE_DRAFTS, android.content.Context.MODE_PRIVATE)
     }
+    val cleanDraftWorkspaceId = workspaceId?.trim()?.takeIf { it.isNotEmpty() }
+    val noteDraftKey = remember(context, cleanDraftWorkspaceId, hive.id) {
+        inspectionNoteDraftKey(cleanDraftWorkspaceId, hive.id)
+    }
+    val legacyDraftNeedsSync = remember(noteDraftKey, hive.id, noteDraftPrefs) {
+        migrateLegacyInspectionNoteDraft(noteDraftPrefs, cleanDraftWorkspaceId, hive.id)
+    }
     val formDraftPrefs = remember(context) {
         context.getSharedPreferences(INSPECTION_FORM_DRAFTS, android.content.Context.MODE_PRIVATE)
     }
-    val noteDraftKey = remember(hive.id) { "hive_${hive.id}" }
-    val noteDraftTimestampKey = remember(hive.id) { "${noteDraftKey}_recorded_at" }
+    val noteDraftTimestampKey = remember(noteDraftKey) { inspectionNoteDraftRecordedAtKey(noteDraftKey) }
+    val noteDraftUpdatedAtKey = remember(noteDraftKey) { inspectionNoteDraftUpdatedAtKey(noteDraftKey) }
     // The inspection list may briefly still contain the previous hive while NFC
     // switches the selected hive. Never let another hive's latest inspection seed this form.
     val lastInspection = remember(hive.id, priorInspections) {
@@ -338,12 +477,32 @@ internal fun InspectionScreen(
             .maxByOrNull { it.createdAt }
     }
     // Load unfinished field values for this specific hive; if none exist, use the last saved inspection.
-    val formDraft = remember(hive.id) { readInspectionFormDraft(formDraftPrefs, hive.id) }
+    val formDraftKey = remember(cleanDraftWorkspaceId, hive.id) {
+        InspectionFormDraftStore.key(cleanDraftWorkspaceId, hive.id)
+    }
+    var formDraft by remember(hive.id, cleanDraftWorkspaceId) {
+        mutableStateOf(readInspectionFormDraft(formDraftPrefs, cleanDraftWorkspaceId, hive.id))
+    }
+    val currentFormDraftForListener = rememberUpdatedState(formDraft)
+    DisposableEffect(formDraftPrefs, formDraftKey, formDraft?.updatedAt) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, changedKey ->
+            if (changedKey == formDraftKey &&
+                !InspectionFormDraftStore.isPending(sharedPreferences, cleanDraftWorkspaceId, hive.id)
+            ) {
+                val incoming = readInspectionFormDraft(sharedPreferences, cleanDraftWorkspaceId, hive.id)
+                if (incoming?.updatedAt != currentFormDraftForListener.value?.updatedAt) {
+                    formDraft = incoming
+                }
+            }
+        }
+        formDraftPrefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { formDraftPrefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
     val formStateKey = formDraft?.updatedAt ?: 0L
-    val hasSavedNoteDraft = remember(hive.id) { noteDraftPrefs.contains(noteDraftKey) }
-    val savedNoteDraft = remember(hive.id) { noteDraftPrefs.getString(noteDraftKey, "").orEmpty() }
+    val hasSavedNoteDraft = remember(noteDraftKey, hive.id) { noteDraftPrefs.contains(noteDraftKey) }
+    val savedNoteDraft = remember(noteDraftKey, hive.id) { noteDraftPrefs.getString(noteDraftKey, "").orEmpty() }
     // A stored empty string means the beekeeper deliberately cleared the notes; don't restore older text.
-    val startingNotes = remember(hive.id, hasSavedNoteDraft, savedNoteDraft, lastInspection?.id, lastInspection?.notes) {
+    val startingNotes = remember(noteDraftKey, hive.id, hasSavedNoteDraft, savedNoteDraft, lastInspection?.id, lastInspection?.notes) {
         val loadedNotes = if (hasSavedNoteDraft) savedNoteDraft else lastInspection?.notes.orEmpty()
         if (loadedNotes.isBlank() || hasInlineInspectionNoteDate(loadedNotes)) {
             loadedNotes
@@ -357,7 +516,7 @@ internal fun InspectionScreen(
         }
     }
 
-    var strength by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var strength by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableIntStateOf(
             ColonyStrength.gradeFromStored(
                 formDraft?.strength
@@ -374,23 +533,30 @@ internal fun InspectionScreen(
             ?: previousFrames?.let { (it * 2.0).roundToInt() }
             ?: 1).coerceIn(1, 20)
     }
-    val beeCountHistoryStartKey = remember(hive.id) { "bee_count_history_start_${hive.id}" }
+    val beeCountHistoryStartKey = remember(cleanDraftWorkspaceId, hive.id) {
+        InspectionFormDraftStore.beeCountHistoryStartKey(cleanDraftWorkspaceId, hive.id)
+    }
+    val legacyBeeCountHistoryStartKey = remember(hive.id) {
+        InspectionFormDraftStore.legacyBeeCountHistoryStartKey(hive.id)
+    }
     val savedBeeCountHistoryStart = formDraftPrefs.getInt(
         beeCountHistoryStartKey,
-        initialBeeCountHalfSteps
+        if (cleanDraftWorkspaceId == null) {
+            formDraftPrefs.getInt(legacyBeeCountHistoryStartKey, initialBeeCountHalfSteps)
+        } else initialBeeCountHalfSteps
     ).coerceIn(1, 20)
-    var beeCountHalfSteps by rememberSaveable(hive.id, formStateKey) {
+    var beeCountHalfSteps by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey) {
         mutableIntStateOf(initialBeeCountHalfSteps)
     }
-    var beeCountHistoryStartHalfSteps by rememberSaveable(hive.id, formStateKey) {
+    var beeCountHistoryStartHalfSteps by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey) {
         mutableIntStateOf(savedBeeCountHistoryStart)
     }
     // Hold the latest values in per-hive state objects so lifecycle/disposal callbacks
     // can finalize safely even if an NFC scan switches the displayed hive.
-    val latestBeeCountForHistory = remember(hive.id, formStateKey) {
+    val latestBeeCountForHistory = remember(hive.id, cleanDraftWorkspaceId, formStateKey) {
         mutableIntStateOf(beeCountHalfSteps)
     }
-    val latestBeeCountStartForHistory = remember(hive.id, formStateKey) {
+    val latestBeeCountStartForHistory = remember(hive.id, cleanDraftWorkspaceId, formStateKey) {
         mutableIntStateOf(beeCountHistoryStartHalfSteps)
     }
     val latestBeeCountRecorder = rememberUpdatedState(onRecordBeeCountChange)
@@ -398,7 +564,7 @@ internal fun InspectionScreen(
         latestBeeCountForHistory.intValue = beeCountHalfSteps
         latestBeeCountStartForHistory.intValue = beeCountHistoryStartHalfSteps
     }
-    val finalizeBeeCountHistory = remember(hive.id, formStateKey) {
+    val finalizeBeeCountHistory = remember(hive.id, cleanDraftWorkspaceId, formStateKey) {
         {
             val startingValue = latestBeeCountStartForHistory.intValue
             val finalValue = latestBeeCountForHistory.intValue
@@ -417,62 +583,113 @@ internal fun InspectionScreen(
             }
         }
     }
-    var queen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var queen by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.queenStatus ?: (if (rememberLastInspectionValues) lastInspection?.queenStatus else null) ?: hive.queenStatus)
     }
-    var mites by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var mites by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableIntStateOf(formDraft?.miteCount ?: (if (rememberLastInspectionValues) lastInspection?.miteCount else null) ?: 0)
     }
-    var sample by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var sample by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableIntStateOf(formDraft?.sampleSize ?: (if (rememberLastInspectionValues) lastInspection?.sampleSize else null) ?: defaultMiteSampleSize.coerceIn(1, 10000))
     }
-    var notes by rememberSaveable(hive.id) { mutableStateOf(startingNotes) }
-    var noteSaveStatus by rememberSaveable(hive.id) {
-        mutableStateOf(if (startingNotes.isBlank()) "" else if (hasSavedNoteDraft) "Auto-saved note restored" else "Saved notes loaded")
+    var notes by rememberSaveable(noteDraftKey, hive.id) { mutableStateOf(startingNotes) }
+    var noteRevision by rememberSaveable(noteDraftKey, hive.id) {
+        mutableLongStateOf(noteDraftPrefs.getLong(noteDraftUpdatedAtKey, 0L))
     }
-    var eggs by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    val noteDraftPendingKey = remember(noteDraftKey) { inspectionNoteDraftPendingKey(noteDraftKey) }
+    var needsCloudSave by rememberSaveable(noteDraftKey, hive.id) {
+        mutableStateOf(legacyDraftNeedsSync || noteDraftPrefs.getBoolean(noteDraftPendingKey, false))
+    }
+    var noteSaveStatus by rememberSaveable(noteDraftKey, hive.id) {
+        mutableStateOf(
+            when {
+                legacyDraftNeedsSync -> "Restored local note - syncing to workspace"
+                startingNotes.isBlank() -> ""
+                hasSavedNoteDraft -> "Saved draft restored"
+                else -> "Saved notes loaded"
+            }
+        )
+    }
+    // Cloud pulls write drafts to the same workspace-scoped preference file.
+    // Observe those writes so an already-open inspection refreshes without reopening the hive.
+    DisposableEffect(noteDraftPrefs, noteDraftKey, noteDraftUpdatedAtKey) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, changedKey ->
+            if (changedKey == noteDraftKey || changedKey == noteDraftUpdatedAtKey ||
+                changedKey == noteDraftPendingKey
+            ) {
+                scope.launch {
+                    val incomingExists = noteDraftPrefs.contains(noteDraftKey)
+                    val incoming = noteDraftPrefs.getString(noteDraftKey, "").orEmpty()
+                    val incomingRevision = noteDraftPrefs.getLong(noteDraftUpdatedAtKey, 0L)
+                    val localQueuePending = noteDraftPrefs.getBoolean(noteDraftPendingKey, false)
+                    if (needsCloudSave && !localQueuePending && incomingExists &&
+                        incoming == notes && incomingRevision >= noteRevision
+                    ) {
+                        noteRevision = incomingRevision
+                        needsCloudSave = false
+                        noteSaveStatus = if (incoming.isBlank()) "" else "Saved locally - cloud sync queued"
+                    } else if (!needsCloudSave && !incomingExists) {
+                        // A cloud tombstone (or workspace reset) removes the draft keys.
+                        // Clear the open editor too, without turning that deletion into a new cloud write.
+                        notes = ""
+                        noteRevision = 0L
+                        noteSaveStatus = ""
+                    } else if (!needsCloudSave && incomingRevision >= noteRevision &&
+                        (incomingRevision > noteRevision || incoming != notes)
+                    ) {
+                        notes = incoming
+                        noteRevision = incomingRevision
+                        noteSaveStatus = if (incoming.isBlank()) "" else "Updated from another device"
+                    }
+                }
+            }
+        }
+        noteDraftPrefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { noteDraftPrefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+    var eggs by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.eggs ?: (if (rememberLastInspectionValues) lastInspection?.eggs else null) ?: 0.0))
     }
-    var openBrood by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var openBrood by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.openBrood ?: (if (rememberLastInspectionValues) lastInspection?.openBrood else null) ?: 0.0))
     }
-    var cappedBrood by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var cappedBrood by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.cappedBrood ?: (if (rememberLastInspectionValues) lastInspection?.cappedBrood else null) ?: 0.0))
     }
-    var honey by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var honey by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.honeyStores ?: (if (rememberLastInspectionValues) lastInspection?.honeyStores else null) ?: 0.0))
     }
-    var pollen by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var pollen by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.pollen ?: (if (rememberLastInspectionValues) lastInspection?.pollen else null) ?: 0.0))
     }
-    var emptyComb by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var emptyComb by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableDoubleStateOf(normalizeBroodStoresGauge(formDraft?.emptyDrawnComb ?: (if (rememberLastInspectionValues) lastInspection?.emptyDrawnComb else null) ?: 0.0))
     }
-    var emergency by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var emergency by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableIntStateOf(formDraft?.emergencyCells ?: (if (rememberLastInspectionValues) lastInspection?.emergencyCells else null) ?: 0)
     }
-    var supercedure by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var supercedure by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableIntStateOf(formDraft?.supercedureCells ?: (if (rememberLastInspectionValues) lastInspection?.supercedureCells else null) ?: 0)
     }
-    var swarm by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var swarm by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableIntStateOf(formDraft?.swarmCells ?: (if (rememberLastInspectionValues) lastInspection?.swarmCells else null) ?: 0)
     }
-    var diseasesCsv by rememberSaveable(hive.id, formStateKey, lastInspection?.id) {
+    var diseasesCsv by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey, lastInspection?.id) {
         mutableStateOf(formDraft?.diseaseFlags ?: (if (rememberLastInspectionValues) lastInspection?.diseaseFlags else null).orEmpty())
     }
-    var lat by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.latitude) }
-    var lon by rememberSaveable(hive.id, formStateKey) { mutableStateOf(formDraft?.longitude) }
-    var locationStatus by rememberSaveable(hive.id) { mutableStateOf("No GPS captured") }
+    var lat by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey) { mutableStateOf(formDraft?.latitude) }
+    var lon by rememberSaveable(hive.id, cleanDraftWorkspaceId, formStateKey) { mutableStateOf(formDraft?.longitude) }
+    var locationStatus by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf("No GPS captured") }
     var pendingGpsHiveId by rememberSaveable { mutableStateOf<Long?>(null) }
-    var voiceStatus by rememberSaveable(hive.id) { mutableStateOf("") }
-    var voiceListeningRequested by rememberSaveable(hive.id) { mutableStateOf(false) }
-    var voicePartialText by rememberSaveable(hive.id) { mutableStateOf("") }
-    var saving by rememberSaveable(hive.id) { mutableStateOf(false) }
-    var saveError by rememberSaveable(hive.id) { mutableStateOf("") }
+    var voiceStatus by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf("") }
+    var voiceListeningRequested by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf(false) }
+    var voicePartialText by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf("") }
+    var saving by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf(false) }
+    var saveError by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf("") }
     // This mutable state object is captured directly by onDispose so a successful-save
     // transition is visible immediately, even if the parent removes this screen right away.
-    val discardSavedFormDraftOnDispose = remember(hive.id) { mutableStateOf(false) }
-    var showBeeCountHistory by rememberSaveable(hive.id) { mutableStateOf(false) }
+    val discardSavedFormDraftOnDispose = remember(hive.id, cleanDraftWorkspaceId) { mutableStateOf(false) }
+    var showBeeCountHistory by rememberSaveable(hive.id, cleanDraftWorkspaceId) { mutableStateOf(false) }
 
     val currentFormDraft = InspectionFormDraft(
         strength = strength,
@@ -494,41 +711,70 @@ internal fun InspectionScreen(
         longitude = lon,
         beeCountHalfSteps = beeCountHalfSteps
     )
+    // A form opened with no user edits must not publish default fields over another
+    // device's unfinished draft. The baseline resets only when a new remote draft revision
+    // is loaded; user changes leave this baseline in place and become syncable edits.
+    val inspectionFormBaseline = remember(hive.id, cleanDraftWorkspaceId, formStateKey) {
+        currentFormDraft
+    }
+    val hasInspectionFormEdits = currentFormDraft != inspectionFormBaseline
+    val latestHasInspectionFormEdits = rememberUpdatedState(hasInspectionFormEdits)
     // Keep a separate latest-draft state per hive. A single rememberUpdatedState
     // here was shared while the screen stayed open during NFC cycling, allowing the
     // next hive's values to be written under the previous hive's key on disposal.
-    val latestFormDraft = remember(hive.id) { mutableStateOf(currentFormDraft) }
+    val latestFormDraft = remember(hive.id, cleanDraftWorkspaceId) { mutableStateOf(currentFormDraft) }
     androidx.compose.runtime.SideEffect {
         latestFormDraft.value = currentFormDraft
     }
 
     androidx.compose.runtime.LaunchedEffect(
-        hive.id, strength, beeCountHalfSteps, queen, mites, sample, eggs, openBrood, cappedBrood,
+        hive.id, cleanDraftWorkspaceId, isReadOnlyWorkspace, strength, beeCountHalfSteps, queen, mites, sample, eggs, openBrood, cappedBrood,
         honey, pollen, emptyComb, emergency, supercedure, swarm, diseasesCsv, lat, lon
     ) {
-        saveInspectionFormDraft(formDraftPrefs, hive.id, currentFormDraft)
+        if (isReadOnlyWorkspace || discardSavedFormDraftOnDispose.value || !hasInspectionFormEdits) return@LaunchedEffect
+        val changed = saveInspectionFormDraft(formDraftPrefs, cleanDraftWorkspaceId, hive.id, currentFormDraft)
+        if (changed) {
+            delay(600)
+            if (!isReadOnlyWorkspace && !discardSavedFormDraftOnDispose.value) {
+                com.beekeep.app.cloud.CloudSyncScheduler.runNow(context)
+            }
+        }
     }
-    androidx.compose.runtime.LaunchedEffect(hive.id, beeCountHistoryStartHalfSteps) {
+    androidx.compose.runtime.LaunchedEffect(cleanDraftWorkspaceId, hive.id, beeCountHistoryStartHalfSteps) {
         formDraftPrefs.edit {
             putInt(beeCountHistoryStartKey, beeCountHistoryStartHalfSteps)
         }
     }
 
-    DisposableEffect(hive.id, formStateKey) {
+    val latestFinalizeBeeCountHistory = rememberUpdatedState(finalizeBeeCountHistory)
+    DisposableEffect(hive.id, cleanDraftWorkspaceId, isReadOnlyWorkspace) {
         val hiveIdForDraft = hive.id
         val formDraftForThisHive = latestFormDraft
-        val finalizeThisHiveBeeCount = finalizeBeeCountHistory
+        val finalizeThisHiveBeeCount = latestFinalizeBeeCountHistory
+        val formDraftEditsForThisHive = latestHasInspectionFormEdits
+        val historyStartKeyForThisHive = beeCountHistoryStartKey
+        val legacyHistoryStartKeyForThisHive = legacyBeeCountHistoryStartKey
         onDispose {
             if (discardSavedFormDraftOnDispose.value) {
-                formDraftPrefs.edit { remove("hive_${hiveIdForDraft}") }
-            } else {
-                saveInspectionFormDraft(formDraftPrefs, hiveIdForDraft, formDraftForThisHive.value)
+                formDraftPrefs.edit {
+                    remove(historyStartKeyForThisHive)
+                    if (cleanDraftWorkspaceId == null) remove(legacyHistoryStartKeyForThisHive)
+                }
+            } else if (!isReadOnlyWorkspace && formDraftEditsForThisHive.value) {
+                if (saveInspectionFormDraft(formDraftPrefs, cleanDraftWorkspaceId, hiveIdForDraft, formDraftForThisHive.value)) {
+                    com.beekeep.app.cloud.CloudSyncScheduler.runNow(context)
+                }
             }
-            finalizeThisHiveBeeCount()
+            if (!isReadOnlyWorkspace) finalizeThisHiveBeeCount.value()
         }
     }
 
     fun captureAndSaveHiveGps(targetHiveId: Long, latitude: Double, longitude: Double) {
+        if (isReadOnlyWorkspace) {
+            locationStatus = "View-only access"
+            onViewOnlyAttempt()
+            return
+        }
         val coordinates = "${"%.5f".format(Locale.US, latitude)}, ${"%.5f".format(Locale.US, longitude)}"
         if (hive.id == targetHiveId) {
             lat = latitude
@@ -590,15 +836,28 @@ internal fun InspectionScreen(
     val voiceBlocked by rememberUpdatedState(saving)
     val appendRecognizedSpeech by rememberUpdatedState<(String) -> Unit>({ spokenText ->
         val cleanSpokenText = spokenText.trim()
-        if (cleanSpokenText.isNotBlank()) {
+        if (cleanSpokenText.isNotBlank() && isReadOnlyWorkspace) {
+            voiceStatus = "View-only workspace • notes cannot be edited"
+            noteSaveStatus = "View-only workspace"
+        } else if (cleanSpokenText.isNotBlank()) {
             val recordedAt = System.currentTimeMillis()
             val datedSpokenText = "${inspectionNoteDatePrefix(recordedAt)}$cleanSpokenText"
             val updatedNotes = if (latestNotes.isBlank()) datedSpokenText else "${latestNotes.trimEnd()}\n$datedSpokenText"
             notes = updatedNotes
+            val nextRevision = maxOf(
+                System.currentTimeMillis(),
+                noteRevision + 1L,
+                noteDraftPrefs.getLong(noteDraftUpdatedAtKey, 0L) + 1L
+            )
+            noteRevision = nextRevision
+            needsCloudSave = !isReadOnlyWorkspace
             noteDraftPrefs.edit {
                 putString(noteDraftKey, updatedNotes)
+                putLong(noteDraftUpdatedAtKey, nextRevision)
+                putLong(noteDraftTimestampKey, recordedAt)
+                putBoolean(noteDraftPendingKey, true)
             }
-            noteSaveStatus = "Note auto-saved"
+            noteSaveStatus = if (isReadOnlyWorkspace) "View-only workspace" else "Saved locally"
             voicePartialText = ""
             voiceStatus = "Saved • continuing to listen"
         }
@@ -738,15 +997,38 @@ internal fun InspectionScreen(
         onDispose { voiceLifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    androidx.compose.runtime.LaunchedEffect(hive.id, notes) {
-        // Debounce edits so a longer note is stored when the user pauses typing.
+    androidx.compose.runtime.LaunchedEffect(
+        hive.id, noteDraftKey, notes, noteRevision, needsCloudSave, isReadOnlyWorkspace
+    ) {
         delay(400)
-        // Store blank too: it records an intentional manual clear rather than reviving old notes later.
+        val capturedRevision = noteRevision
+        val capturedNotes = notes
+        val recordedAt = noteDraftPrefs.getLong(noteDraftTimestampKey, 0L)
+            .takeIf { it > 0L && capturedNotes.isNotBlank() }
         noteDraftPrefs.edit {
-            putString(noteDraftKey, notes)
-            if (notes.isBlank()) remove(noteDraftTimestampKey)
+            putString(noteDraftKey, capturedNotes)
+            putLong(noteDraftUpdatedAtKey, capturedRevision)
+            if (needsCloudSave && !isReadOnlyWorkspace) putBoolean(noteDraftPendingKey, true)
+            if (recordedAt != null) putLong(noteDraftTimestampKey, recordedAt)
+            else remove(noteDraftTimestampKey)
         }
-        noteSaveStatus = if (notes.isBlank()) "" else "Note auto-saved"
+        if (needsCloudSave && !isReadOnlyWorkspace) {
+            try {
+                val queuedRevision = onSaveNoteDraft(hive.id, capturedNotes, recordedAt, capturedRevision)
+                if (noteRevision == capturedRevision) {
+                    noteRevision = queuedRevision
+                    needsCloudSave = false
+                    noteSaveStatus = "Saved locally - cloud sync queued"
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                noteSaveStatus = "Saved locally - sync pending"
+                com.beekeep.app.cloud.CloudSyncScheduler.runNow(context)
+            }
+        } else if (capturedNotes.isNotBlank() && noteSaveStatus.isBlank()) {
+            noteSaveStatus = if (isReadOnlyWorkspace) "View-only workspace" else "Saved on device"
+        }
     }
 
     BackHandler { onBack() }
@@ -841,7 +1123,10 @@ internal fun InspectionScreen(
                             }
                             Button(
                                 onClick = {
-                                    if (!saving) {
+                                    if (isReadOnlyWorkspace) {
+                                        saveError = ""
+                                        onViewOnlyAttempt()
+                                    } else if (!saving) {
                                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                         saving = true
                                         saveError = ""
@@ -857,17 +1142,40 @@ internal fun InspectionScreen(
                                             try {
                                                 val saved = onSave(inspection)
                                                 if (saved) {
-                                                    // Clear only after durable save succeeds; keep the independent note draft.
+                                                    // Flush the current note buffer before leaving the inspection screen.
+                                                    try {
+                                                        val revision = maxOf(
+                                                            System.currentTimeMillis(),
+                                                            noteRevision + 1L,
+                                                            noteDraftPrefs.getLong(noteDraftUpdatedAtKey, 0L) + 1L
+                                                        )
+                                                        val recordedAt = noteDraftPrefs.getLong(noteDraftTimestampKey, 0L)
+                                                            .takeIf { it > 0L && notes.isNotBlank() }
+                                                        noteRevision = onSaveNoteDraft(hive.id, notes.trim(), recordedAt, revision)
+                                                        needsCloudSave = false
+                                                    } catch (_: Exception) {
+                                                        noteSaveStatus = "Inspection saved - note sync pending"
+                                                    }
+                                                    // Publish a draft tombstone only after the completed inspection is durable.
+                                                    // Other devices then drop these unfinished fields instead of restoring stale values.
                                                     discardSavedFormDraftOnDispose.value = true
-                                                    formDraftPrefs.edit { remove("hive_${hive.id}") }
+                                                    InspectionFormDraftStore.markDeleted(formDraftPrefs, cleanDraftWorkspaceId, hive.id)
+                                                    formDraftPrefs.edit { remove(beeCountHistoryStartKey) }
+                                                    com.beekeep.app.cloud.CloudSyncScheduler.runNow(context)
                                                     onSaved()
+                                                } else if (isReadOnlyWorkspace) {
+                                                    onViewOnlyAttempt()
                                                 } else {
                                                     saveError = "Could not save inspection. Your field screen is still open; try again."
                                                 }
                                             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                                 throw cancelled
                                             } catch (error: Exception) {
-                                                saveError = error.message ?: "Could not save the inspection. Please try again."
+                                                if (isReadOnlyWorkspace || error.message?.contains("view-only", ignoreCase = true) == true) {
+                                                    onViewOnlyAttempt()
+                                                } else {
+                                                    saveError = error.message ?: "Could not save the inspection. Please try again."
+                                                }
                                             } finally {
                                                 saving = false
                                             }
@@ -905,32 +1213,6 @@ internal fun InspectionScreen(
                 }
             }
             item {
-                SectionHeader("QUEEN")
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    for (option in listOf("Laying", "Queenless", "Virgin")) {
-                        FilterChip(
-                            selected = queen == option,
-                            onClick = {
-                                queen = option
-                                haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
-                            },
-                            label = { Text(option) },
-                            colors = androidx.compose.material3.FilterChipDefaults.filterChipColors(
-                                containerColor = MaterialTheme.colorScheme.surface,
-                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                selectedContainerColor = Color(0xFFD97706),
-                                selectedLabelColor = Color.White
-                            ),
-                            border = BorderStroke(
-                                1.dp,
-                                if (queen == option) Color(0xFFD97706) else MaterialTheme.colorScheme.outline
-                            )
-                        )
-                    }
-                }
-            }
-
-            item {
                 Card(
                     shape = RoundedCornerShape(24.dp),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
@@ -946,19 +1228,31 @@ internal fun InspectionScreen(
                         OutlinedTextField(
                             value = notes,
                             onValueChange = {
-                                val updatedNotes = addDateToNewInspectionNoteLines(notes, it)
-                                notes = updatedNotes
-                                noteDraftPrefs.edit {
-                                    putString(noteDraftKey, updatedNotes)
-                                    if (updatedNotes.isBlank()) {
-                                        remove(noteDraftTimestampKey)
-                                    } else if (!noteDraftPrefs.contains(noteDraftTimestampKey)) {
-                                        putLong(noteDraftTimestampKey, System.currentTimeMillis())
+                                if (!isReadOnlyWorkspace) {
+                                    val updatedNotes = addDateToNewInspectionNoteLines(notes, it)
+                                    notes = updatedNotes
+                                    val nextRevision = maxOf(
+                                        System.currentTimeMillis(),
+                                        noteRevision + 1L,
+                                        noteDraftPrefs.getLong(noteDraftUpdatedAtKey, 0L) + 1L
+                                    )
+                                    noteRevision = nextRevision
+                                    needsCloudSave = true
+                                    noteDraftPrefs.edit {
+                                        putString(noteDraftKey, updatedNotes)
+                                        putLong(noteDraftUpdatedAtKey, nextRevision)
+                                        putBoolean(noteDraftPendingKey, true)
+                                        if (updatedNotes.isBlank()) {
+                                            remove(noteDraftTimestampKey)
+                                        } else if (!noteDraftPrefs.contains(noteDraftTimestampKey)) {
+                                            putLong(noteDraftTimestampKey, System.currentTimeMillis())
+                                        }
                                     }
+                                    noteSaveStatus = "Saving note..."
                                 }
-                                noteSaveStatus = if (updatedNotes.isBlank()) "" else "Saving note…"
                             },
                             modifier = Modifier.fillMaxWidth().height(124.dp),
+                            enabled = !isReadOnlyWorkspace,
                             label = { Text("What did you see?") }
                         )
                         if (noteSaveStatus.isNotBlank()) {
@@ -1078,14 +1372,95 @@ internal fun InspectionScreen(
             }
 
             item {
-                SectionHeader("QUEEN CELLS")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    CompactCounter("Emergency", emergency, 0..20, haptic, Modifier.weight(1f)) { emergency = it }
-                    CompactCounter("Supercedure", supercedure, 0..20, haptic, Modifier.weight(1f)) { supercedure = it }
+                SectionHeader("QUEEN STATUS")
+                Card(
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            "Queen condition",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            "Choose the best match for this inspection.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            for (option in listOf("Laying", "Queenless", "Virgin")) {
+                                FilterChip(
+                                    selected = queen == option,
+                                    onClick = {
+                                        queen = option
+                                        haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    label = { Text(option, maxLines = 1, softWrap = false) },
+                                    colors = androidx.compose.material3.FilterChipDefaults.filterChipColors(
+                                        containerColor = MaterialTheme.colorScheme.surface,
+                                        labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        selectedContainerColor = Color(0xFFD97706),
+                                        selectedLabelColor = Color.White
+                                    ),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (queen == option) Color(0xFFD97706) else MaterialTheme.colorScheme.outline
+                                    )
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(2.dp))
+                        Box(
+                            Modifier.fillMaxWidth()
+                                .height(1.dp)
+                                .background(MaterialTheme.colorScheme.outlineVariant)
+                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                "Queen cells observed",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                "Count each type seen. Leave a count at zero when none are present.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        CompactCounter(
+                            "Emergency cells",
+                            emergency,
+                            0..20,
+                            haptic,
+                            Modifier.fillMaxWidth()
+                        ) { emergency = it }
+                        CompactCounter(
+                            "Supersedure cells",
+                            supercedure,
+                            0..20,
+                            haptic,
+                            Modifier.fillMaxWidth()
+                        ) { supercedure = it }
+                        CompactCounter(
+                            "Swarm cells",
+                            swarm,
+                            0..20,
+                            haptic,
+                            Modifier.fillMaxWidth()
+                        ) { swarm = it }
+                    }
                 }
-            }
-            item {
-                CompactCounter("Swarm", swarm, 0..20, haptic, Modifier.fillMaxWidth()) { swarm = it }
             }
 
             item {
